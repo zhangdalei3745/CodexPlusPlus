@@ -393,6 +393,8 @@ dependencies = [
  "async-trait",
  "codex-plus-core",
  "codex-plus-data",
+ "directories",
+ "serde_json",
  "tokio",
 ]
 

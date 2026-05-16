@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
+use crate::user_scripts::UserScriptManager;
 
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -28,11 +29,14 @@ impl BridgeContext {
     }
 
     pub fn core(runtime: Arc<dyn BridgeRuntimeService>) -> Self {
-        Self::new(
-            Arc::new(CoreSettingsService::default()),
-            runtime,
-            Arc::new(UnavailableDataService),
-        )
+        Self::core_with_data(runtime, Arc::new(UnavailableDataService))
+    }
+
+    pub fn core_with_data(
+        runtime: Arc<dyn BridgeRuntimeService>,
+        data: Arc<dyn BridgeDataService>,
+    ) -> Self {
+        Self::new(Arc::new(CoreSettingsService::default()), runtime, data)
     }
 }
 
@@ -179,6 +183,7 @@ impl BridgeSettingsService for CoreSettingsService {
 pub struct CoreRuntimeService {
     debug_port: u16,
     status_store: StatusStore,
+    user_scripts: Option<UserScriptManager>,
 }
 
 impl CoreRuntimeService {
@@ -186,28 +191,51 @@ impl CoreRuntimeService {
         Self {
             debug_port,
             status_store,
+            user_scripts: None,
         }
+    }
+
+    pub fn with_user_scripts(mut self, user_scripts: UserScriptManager) -> Self {
+        self.user_scripts = Some(user_scripts);
+        self
     }
 }
 
 #[async_trait]
 impl BridgeRuntimeService for CoreRuntimeService {
     async fn user_script_inventory(&self) -> anyhow::Result<Value> {
-        Ok(empty_user_script_inventory())
+        match &self.user_scripts {
+            Some(user_scripts) => user_scripts.inventory(),
+            None => Ok(empty_user_script_inventory()),
+        }
     }
 
     async fn set_user_scripts_enabled(&self, enabled: bool) -> anyhow::Result<Value> {
-        let mut inventory = empty_user_script_inventory();
-        inventory["enabled"] = json!(enabled);
-        Ok(inventory)
+        match &self.user_scripts {
+            Some(user_scripts) => {
+                user_scripts.set_global_enabled(enabled)?;
+                user_scripts.inventory()
+            }
+            None => {
+                let mut inventory = empty_user_script_inventory();
+                inventory["enabled"] = json!(enabled);
+                Ok(inventory)
+            }
+        }
     }
 
-    async fn set_user_script_enabled(&self, _key: String, _enabled: bool) -> anyhow::Result<Value> {
-        Ok(empty_user_script_inventory())
+    async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
+        match &self.user_scripts {
+            Some(user_scripts) => {
+                user_scripts.set_script_enabled(&key, enabled)?;
+                user_scripts.inventory()
+            }
+            None => Ok(empty_user_script_inventory()),
+        }
     }
 
     async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
-        Ok(empty_user_script_inventory())
+        self.user_script_inventory().await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {

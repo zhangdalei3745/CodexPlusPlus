@@ -106,7 +106,21 @@ pub trait LaunchHooks: Send + Sync {
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
     async fn launch_codex(&self, app_dir: &Path, debug_port: u16) -> anyhow::Result<CodexLaunch>;
+    async fn bridge_context(
+        &self,
+        _debug_port: u16,
+    ) -> anyhow::Result<Option<crate::routes::BridgeContext>> {
+        Ok(None)
+    }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
+    async fn inject_bridge(
+        &self,
+        debug_port: u16,
+        helper_port: u16,
+        _ctx: crate::routes::BridgeContext,
+    ) -> anyhow::Result<()> {
+        self.inject(debug_port, helper_port).await
+    }
     async fn write_status(&self, status: &str);
     async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
@@ -154,7 +168,11 @@ where
         let launch = hooks.launch_codex(&app_dir, debug_port).await?;
         launched = Some(launch.clone());
 
-        hooks.inject(debug_port, helper_port).await?;
+        if let Some(ctx) = hooks.bridge_context(debug_port).await? {
+            hooks.inject_bridge(debug_port, helper_port, ctx).await?;
+        } else {
+            hooks.inject(debug_port, helper_port).await?;
+        }
 
         let status = launch_status(
             "running",

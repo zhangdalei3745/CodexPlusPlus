@@ -1,12 +1,17 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use codex_plus_core::launcher::{
+    CodexLaunch, LaunchHooks, LaunchOptions, ProcessWaitStrategy, launch_and_inject_with_hooks,
+};
 use codex_plus_core::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
 use codex_plus_core::routes::{
     BridgeContext, BridgeDataService, BridgeRuntimeService, BridgeSettingsService,
-    handle_bridge_request,
+    CoreRuntimeService, handle_bridge_request,
 };
 use codex_plus_core::settings::BackendSettings;
+use codex_plus_core::status::StatusStore;
+use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -212,6 +217,109 @@ async fn data_routes_forward_payloads_to_data_service() {
     );
 }
 
+#[tokio::test]
+async fn bridge_context_core_with_data_uses_injected_data_service() {
+    let ctx = BridgeContext::core_with_data(
+        Arc::new(CoreRuntimeService::new(9229, StatusStore::default())),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(
+        ctx,
+        "/delete",
+        json!({"session_id": "s1", "title": "First"}),
+    )
+    .await;
+
+    assert_eq!(result["status"], "local_deleted");
+    assert_eq!(result["undo_token"], "undo-s1");
+    assert_ne!(
+        result["message"],
+        "Delete service is not wired in core launcher hooks"
+    );
+}
+
+#[tokio::test]
+async fn user_script_manager_scans_and_persists_python_inventory_shape() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::write(builtin_dir.join("demo.js"), "window.demo = true;").unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("a.js"), "window.a = true;").unwrap();
+    std::fs::write(user_dir.join("ignore.txt"), "not js").unwrap();
+    let manager = UserScriptManager::new(
+        builtin_dir.clone(),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+
+    let listed = manager.inventory().unwrap();
+    manager.set_global_enabled(false).unwrap();
+    let disabled = manager.inventory().unwrap();
+    manager.set_script_enabled("user:a.js", false).unwrap();
+    let script_disabled = manager.inventory().unwrap();
+
+    assert_eq!(listed["enabled"], true);
+    assert_eq!(
+        listed["builtin_dir"].as_str().unwrap(),
+        builtin_dir.to_string_lossy()
+    );
+    assert_eq!(
+        listed["user_dir"].as_str().unwrap(),
+        user_dir.to_string_lossy()
+    );
+    assert_eq!(listed["scripts"][0]["key"], "builtin:demo.js");
+    assert_eq!(listed["scripts"][0]["source"], "builtin");
+    assert_eq!(listed["scripts"][0]["enabled"], true);
+    assert_eq!(listed["scripts"][0]["status"], "not_loaded");
+    assert_eq!(listed["scripts"][0]["error"], "");
+    assert_eq!(listed["scripts"][1]["key"], "user:a.js");
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["scripts"][0]["status"], "disabled");
+    assert_eq!(script_disabled["scripts"][1]["enabled"], false);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &std::fs::read_to_string(temp.path().join("user_scripts.json")).unwrap()
+        )
+        .unwrap(),
+        json!({"enabled": false, "scripts": {"user:a.js": false}})
+    );
+}
+
+#[tokio::test]
+async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = ContextHooks {
+        events: events.clone(),
+    };
+
+    launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store: StatusStore::new(temp.path().join("latest-status.json")),
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "bridge-context:9229",
+            "inject-bridge:9229:57321",
+            "status:running",
+        ]
+    );
+}
+
 fn test_context() -> BridgeContext {
     BridgeContext::new(
         Arc::new(FakeSettings::default()),
@@ -390,4 +498,90 @@ impl BridgeDataService for FakeData {
                 .collect::<Vec<_>>()
         }))
     }
+}
+
+#[derive(Clone)]
+struct ContextHooks {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl ContextHooks {
+    fn event(&self, event: impl Into<String>) {
+        self.events.lock().unwrap().push(event.into());
+    }
+}
+
+#[async_trait(?Send)]
+impl LaunchHooks for ContextHooks {
+    fn resolve_app_dir(
+        &self,
+        app_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        app_dir
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("missing app dir"))
+    }
+
+    fn select_debug_port(&self, requested: u16) -> u16 {
+        requested
+    }
+
+    fn select_helper_port(&self, requested: u16) -> u16 {
+        requested
+    }
+
+    async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
+        Ok(BackendSettings::default())
+    }
+
+    async fn run_provider_sync(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start_helper(&self, _helper_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn launch_codex(
+        &self,
+        _app_dir: &std::path::Path,
+        _debug_port: u16,
+    ) -> anyhow::Result<CodexLaunch> {
+        Ok(CodexLaunch::Process {
+            command: vec!["codex".to_string()],
+            wait_strategy: ProcessWaitStrategy::TrackedChild,
+            macos_cleanup_policy: None,
+        })
+    }
+
+    async fn bridge_context(&self, debug_port: u16) -> anyhow::Result<Option<BridgeContext>> {
+        self.event(format!("bridge-context:{debug_port}"));
+        Ok(Some(test_context()))
+    }
+
+    async fn inject(&self, _debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
+        anyhow::bail!("legacy inject should not run when bridge context is supplied")
+    }
+
+    async fn inject_bridge(
+        &self,
+        debug_port: u16,
+        helper_port: u16,
+        _ctx: BridgeContext,
+    ) -> anyhow::Result<()> {
+        self.event(format!("inject-bridge:{debug_port}:{helper_port}"));
+        Ok(())
+    }
+
+    async fn write_status(&self, status: &str) {
+        self.event(format!("status:{status}"));
+    }
+
+    async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown_helper(&self, _helper_port: u16) {}
+
+    async fn terminate_codex(&self, _launch: &CodexLaunch) {}
 }
