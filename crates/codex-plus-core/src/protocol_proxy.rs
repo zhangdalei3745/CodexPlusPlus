@@ -650,11 +650,23 @@ pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
+    open_models_proxy_request_with_settings(settings, original_user_agent).await
+}
+
+pub async fn open_models_proxy_request_with_settings(
+    settings: crate::settings::BackendSettings,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
     validate_upstream(&relay)?;
 
     if relay.protocol == RelayProtocol::Joycode {
-        let endpoint = format!("{}/api/saas/models/v2/modelList", relay.base_url.trim().trim_end_matches('/'));
+        let base = if relay.base_url.trim().is_empty() {
+            "http://joycode-api-saas.jd.com"
+        } else {
+            relay.base_url.trim()
+        };
+        let endpoint = format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'));
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.models_request",
             json!({
@@ -686,7 +698,11 @@ pub async fn open_models_proxy_request(
                 let mut openai_models = Vec::new();
                 if let Some(models) = models {
                     for m in models {
-                        if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
+                        let model_id = m.get("chatApiModel")
+                            .and_then(Value::as_str)
+                            .or_else(|| m.get("label").and_then(Value::as_str))
+                            .filter(|s| !s.trim().is_empty());
+                        if let Some(model_id) = model_id {
                             openai_models.push(serde_json::json!({
                                 "id": model_id,
                                 "object": "model",
