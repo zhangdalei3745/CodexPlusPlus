@@ -257,7 +257,7 @@ type CodexContextEntries = {
   plugins: CodexContextEntry[];
 };
 
-type RelayProtocol = "responses" | "chatCompletions";
+type RelayProtocol = "responses" | "chatCompletions" | "joycode";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 const PROTOCOL_PROXY_BASE_URL = "http://127.0.0.1:57321/v1";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
@@ -4173,12 +4173,12 @@ function RelayProfileEditor({
                 placeholder={t("填写中转服务 Base URL")}
               />
             </Field>
-            <Field className="relay-field-key" label="Key">
+            <Field className="relay-field-key" label={profile.protocol === "joycode" ? "ptKey" : t("Key")}>
               <Input
                 type="password"
                 value={profile.apiKey}
                 onChange={(event) => updateDraft({ apiKey: event.currentTarget.value })}
-                placeholder={t("输入中转服务的 API Key")}
+                placeholder={profile.protocol === "joycode" ? t("输入 Joycode 的 ptKey") : t("输入中转服务的 API Key")}
               />
             </Field>
             <Field className="relay-field-protocol" label={t("上游协议")}>
@@ -4196,6 +4196,13 @@ function RelayProfileEditor({
                   type="button"
                 >
                   Chat Completions
+                </button>
+                <button
+                  className={`protocol-option ${profile.protocol === "joycode" ? "active" : ""}`}
+                  onClick={() => updateDraft({ protocol: "joycode" })}
+                  type="button"
+                >
+                  Joycode API
                 </button>
               </div>
             </Field>
@@ -4294,7 +4301,7 @@ function RelayProfileEditor({
           </Field>
         ) : null}
       </div>
-      {showApiFields && profile.protocol === "chatCompletions" ? (
+      {showApiFields && (profile.protocol === "chatCompletions" || profile.protocol === "joycode") ? (
         <div className="hint-line relay-protocol-hint">
           <MessageCircle className="h-4 w-4" />
           <span>{t("此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。")}</span>
@@ -6077,7 +6084,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: profile.apiKey || "",
-    protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
+    protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : (profile.protocol === "joycode" ? "joycode" : "responses"),
     relayMode,
     officialMixApiKey,
     testModel: profile.testModel || "",
@@ -6123,6 +6130,7 @@ function activeRelayProfile(settings: BackendSettings): RelayProfile {
 }
 
 function relayProtocolLabel(protocol: RelayProtocol): string {
+  if (protocol === "joycode") return "Joycode API";
   return protocol === "chatCompletions" ? t("Chat Completions 转 Responses") : "Responses API";
 }
 
@@ -6270,7 +6278,7 @@ function buildRelayConfigToml(
   profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol">,
   options: { includeBearerToken: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+  const baseUrl = (profile.protocol === "chatCompletions" || profile.protocol === "joycode") ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
   const rootLines = [
     profile.model.trim() ? `model = "${tomlString(profile.model.trim())}"` : null,
@@ -6373,7 +6381,7 @@ function applyRelayProfilePatchToFiles(
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
   if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
+    const baseUrlForConfig = (next.protocol === "chatCompletions" || next.protocol === "joycode") ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig);
     next.configContents = removeRootTomlKey(next.configContents, CHAT_UPSTREAM_BASE_URL_KEY);
   }

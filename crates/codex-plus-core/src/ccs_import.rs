@@ -255,6 +255,7 @@ fn build_config_toml(base_url: &str, api_key: &str, protocol: RelayProtocol) -> 
     let wire_api = match protocol {
         RelayProtocol::Responses => "responses",
         RelayProtocol::ChatCompletions => "chat",
+        RelayProtocol::Joycode => "responses",
     };
     [
         "model_provider = \"CodexPlusPlus\"".to_string(),

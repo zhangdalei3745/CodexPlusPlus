@@ -287,7 +287,8 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
-    pub response: reqwest::Response,
+    pub response: Option<reqwest::Response>,
+    pub custom_body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -303,6 +304,18 @@ impl UpstreamProxyResponse {
 
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status_code)
+    }
+
+    pub async fn bytes(&mut self) -> anyhow::Result<Vec<u8>> {
+        if let Some(body) = &self.custom_body {
+            Ok(body.clone())
+        } else if let Some(resp) = self.response.take() {
+            let body_bytes = resp.bytes().await?.to_vec();
+            self.custom_body = Some(body_bytes.clone());
+            Ok(body_bytes)
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -538,6 +551,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 ))?,
                 &endpoint,
                 relay.api_key.trim(),
+                relay.protocol,
                 is_stream,
                 &upstream_body,
             ),
@@ -610,7 +624,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 is_stream: is_stream || content_type.contains("text/event-stream"),
                 content_type,
                 wire_api,
-                response: upstream,
+                response: Some(upstream),
+                custom_body: None,
             });
         }
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -637,6 +652,73 @@ pub async fn open_models_proxy_request(
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
     validate_upstream(&relay)?;
+
+    if relay.protocol == RelayProtocol::Joycode {
+        let endpoint = format!("{}/api/saas/models/v2/modelList", relay.base_url.trim().trim_end_matches('/'));
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.models_request",
+            json!({
+                "relayId": relay.id,
+                "relayName": relay.name,
+                "endpoint": endpoint,
+                "wireApi": UpstreamWireApi::ChatCompletions
+            }),
+        );
+        let client = crate::http_client::proxied_client(&effective_user_agent(
+            &relay.user_agent,
+            original_user_agent,
+        ))?;
+        let upstream = client
+            .post(&endpoint)
+            .header("ptKey", relay.api_key.trim())
+            .header("loginType", "N_PIN_PC")
+            .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        
+        let status_code = upstream.status().as_u16();
+        let mut custom_body = None;
+        if (200..300).contains(&status_code) {
+            if let Ok(res_json) = upstream.json::<Value>().await {
+                let models = res_json.get("data").and_then(Value::as_array);
+                let mut openai_models = Vec::new();
+                if let Some(models) = models {
+                    for m in models {
+                        if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
+                            openai_models.push(serde_json::json!({
+                                "id": model_id,
+                                "object": "model",
+                                "created": 1719736000,
+                                "owned_by": "jd"
+                            }));
+                        }
+                    }
+                }
+                openai_models.push(serde_json::json!({
+                    "id": "gpt-5",
+                    "object": "model",
+                    "created": 1719736000,
+                    "owned_by": "openai"
+                }));
+                let result_json = serde_json::json!({
+                    "object": "list",
+                    "data": openai_models
+                });
+                custom_body = Some(serde_json::to_vec(&result_json)?);
+            }
+        }
+        
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: false,
+            content_type: "application/json; charset=utf-8".to_string(),
+            wire_api: UpstreamWireApi::ChatCompletions,
+            response: None,
+            custom_body,
+        });
+    }
 
     let endpoint = models_url(&relay.base_url);
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -670,7 +752,8 @@ pub async fn open_models_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::Responses,
-        response: upstream,
+        response: Some(upstream),
+        custom_body: None,
     })
 }
 
@@ -680,31 +763,54 @@ pub async fn open_chat_completions_proxy_request(
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
-    if relay.protocol != RelayProtocol::ChatCompletions {
+    if relay.protocol != RelayProtocol::ChatCompletions && relay.protocol != RelayProtocol::Joycode {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
     }
-    if relay.base_url.trim().is_empty() {
+    if relay.protocol != RelayProtocol::Joycode && relay.base_url.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
     }
     if relay.api_key.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Key 不能为空");
     }
 
-    let request_json: Value = serde_json::from_str(body)?;
+    let mut request_json: Value = serde_json::from_str(body)?;
+    if relay.protocol == RelayProtocol::Joycode {
+        if let Some(m) = request_json.get_mut("model") {
+            if m.as_str().unwrap_or("").trim().is_empty() {
+                *m = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+            }
+        } else {
+            request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+        }
+    }
+
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = crate::http_client::proxied_client(&effective_user_agent(
+    
+    let mut request_builder = crate::http_client::proxied_client(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
     ))?
-    .post(chat_completions_url(&relay.base_url))
-    .bearer_auth(relay.api_key.trim())
-    .header(reqwest::header::CONTENT_TYPE, "application/json")
-    .json(&request_json)
-    .send()
-    .await?;
+    .post(chat_completions_url_for_relay(&relay));
+    
+    if relay.protocol == RelayProtocol::Joycode {
+        request_builder = request_builder
+            .header("ptKey", relay.api_key.trim())
+            .header("loginType", "N_PIN_PC")
+            .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
+    } else {
+        request_builder = request_builder
+            .bearer_auth(relay.api_key.trim())
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+    }
+
+    let upstream = request_builder
+        .json(&request_json)
+        .send()
+        .await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -718,7 +824,8 @@ pub async fn open_chat_completions_proxy_request(
         is_stream: is_stream || content_type.contains("text/event-stream"),
         content_type,
         wire_api: UpstreamWireApi::ChatCompletions,
-        response: upstream,
+        response: Some(upstream),
+        custom_body: None,
     })
 }
 
@@ -745,6 +852,26 @@ fn upstream_request_parts(
             responses_to_chat_completions(request_json)?,
             UpstreamWireApi::ChatCompletions,
         )),
+        RelayProtocol::Joycode => {
+            let base = if relay.base_url.trim().is_empty() {
+                "http://joycode-api-saas.jd.com"
+            } else {
+                relay.base_url.trim()
+            };
+            let mut req_body = responses_to_chat_completions(request_json)?;
+            if let Some(m) = req_body.get_mut("model") {
+                if m.as_str().unwrap_or("").trim().is_empty() {
+                    *m = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+                }
+            } else {
+                req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+            }
+            Ok((
+                format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/')),
+                req_body,
+                UpstreamWireApi::ChatCompletions,
+            ))
+        }
     }
 }
 
@@ -752,13 +879,22 @@ fn upstream_request_builder(
     client: reqwest::Client,
     endpoint: &str,
     api_key: &str,
+    protocol: RelayProtocol,
     is_stream: bool,
     upstream_body: &Value,
 ) -> reqwest::RequestBuilder {
-    let mut builder = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let mut builder = client.post(endpoint);
+    if protocol == RelayProtocol::Joycode {
+        builder = builder
+            .header("ptKey", api_key)
+            .header("loginType", "N_PIN_PC")
+            .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
+    } else {
+        builder = builder
+            .bearer_auth(api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+    }
     if is_stream {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -768,7 +904,7 @@ fn upstream_request_builder(
 }
 
 fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()> {
-    if relay.base_url.trim().is_empty() {
+    if relay.protocol != RelayProtocol::Joycode && relay.base_url.trim().is_empty() {
         anyhow::bail!("上游 Base URL 不能为空");
     }
     if relay.api_key.trim().is_empty() {
@@ -803,12 +939,12 @@ fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option
 
 pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyHttpResponse> {
     let request_json: Value = serde_json::from_str(body)?;
-    let upstream = open_responses_proxy_request(body, None).await?;
+    let mut upstream = open_responses_proxy_request(body, None).await?;
     let status_code = upstream.status_code;
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
-    let upstream_body = upstream.response.bytes().await?;
+    let upstream_body = upstream.bytes().await?;
 
     if !(200..300).contains(&status_code) {
         let error =
@@ -848,6 +984,19 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         content_type: "application/json; charset=utf-8".to_string(),
         body: serde_json::to_vec(&response_json)?,
     })
+}
+
+pub fn chat_completions_url_for_relay(relay: &crate::settings::RelayProfile) -> String {
+    if relay.protocol == RelayProtocol::Joycode {
+        let base = if relay.base_url.trim().is_empty() {
+            "http://joycode-api-saas.jd.com"
+        } else {
+            relay.base_url.trim()
+        };
+        format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+    } else {
+        chat_completions_url(&relay.base_url)
+    }
 }
 
 pub fn chat_completions_url(base_url: &str) -> String {

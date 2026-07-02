@@ -9,7 +9,7 @@
 
 export type PresetCategory = "official" | "aggregator" | "third_party" | "cn_official";
 
-export type RelayProtocol = "responses" | "chatCompletions";
+export type RelayProtocol = "responses" | "chatCompletions" | "joycode";
 
 export interface ProviderPreset {
   id: string;
@@ -76,6 +76,16 @@ export const PRESETS: ProviderPreset[] = [
     protocol: "chatCompletions",
     model: "kimi-k2.6",
     modelList: ["kimi-k2.6"],
+  },
+  {
+    id: "joycode",
+    name: "Joycode (JD)",
+    websiteUrl: "http://joycode.jd.com",
+    category: "cn_official",
+    baseUrl: "http://joycode-api-saas.jd.com",
+    protocol: "joycode",
+    model: "Kimi-K2.6",
+    modelList: ["Kimi-K2.6", "gpt-5"],
   },
   {
     id: "bailian",

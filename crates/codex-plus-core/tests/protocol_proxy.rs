@@ -1,8 +1,8 @@
 use codex_plus_core::protocol_proxy::{
     ChatSseToResponsesConverter, chat_completion_to_response,
-    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
-    chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path, is_models_proxy_path,
-    is_responses_proxy_path, models_url, open_chat_completions_proxy_request,
+    chat_completion_to_response_with_request, chat_completions_url, chat_completions_url_for_relay,
+    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path,
+    is_models_proxy_path, is_responses_proxy_path, models_url, open_chat_completions_proxy_request,
     open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings, responses_error_from_upstream,
     responses_to_chat_completions, send_upstream_request_with_header_timeout,
@@ -10,7 +10,7 @@ use codex_plus_core::protocol_proxy::{
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayProfile,
+    RelayMode, RelayProfile, RelayProtocol,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -1366,16 +1366,16 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
         format!("http://{second_addr}/v1"),
     );
 
-    let result = open_responses_proxy_request_with_settings(
+    let mut result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
         settings,
     )
     .await
     .unwrap();
-    let body = result.response.bytes().await.unwrap();
+    let body = result.bytes().await.unwrap();
 
     assert_eq!(result.status_code, 200);
-    assert_eq!(body.as_ref(), br#"{"id":"resp_1","object":"response"}"#);
+    assert_eq!(body.as_slice(), br#"{"id":"resp_1","object":"response"}"#);
     first_server.await.unwrap();
     second_server.await.unwrap();
 }
@@ -1676,4 +1676,82 @@ fn spawn_chat_server() -> ChatServer {
         ChatRequest { user_agent }
     });
     ChatServer { base_url, handle }
+}
+
+#[tokio::test]
+async fn joycode_protocol_sends_custom_headers_and_path() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 4096];
+        let bytes = stream.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+        
+        // Verify path
+        assert!(request.contains("POST /api/saas/openai/v2/chat/completions"));
+        // Verify headers
+        let request_lower = request.to_lowercase();
+        assert!(request_lower.contains("ptkey: sk-joytest"));
+        assert!(request_lower.contains("logintype: n_pin_pc"));
+        assert!(request_lower.contains("x-ms-client-request-id:"));
+
+        let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            id: "joycode-profile".to_string(),
+            name: "Joycode Test".to_string(),
+            model: "Kimi-K2.6".to_string(),
+            base_url: format!("http://{addr}"),
+            upstream_base_url: format!("http://{addr}"),
+            api_key: "sk-joytest".to_string(),
+            protocol: RelayProtocol::Joycode,
+            relay_mode: RelayMode::PureApi,
+            ..Default::default()
+        }],
+        active_relay_id: "joycode-profile".to_string(),
+        relay_profiles_enabled: true,
+        ..Default::default()
+    };
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"Kimi-K2.6","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    let body = result.bytes().await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("chatcmpl-"));
+    server.await.unwrap();
+}
+
+#[test]
+fn joycode_defaults_and_fallbacks() {
+    let profile_empty = RelayProfile {
+        id: "joycode-empty".to_string(),
+        name: "Joycode Empty".to_string(),
+        model: "".to_string(),
+        base_url: "".to_string(),
+        api_key: "sk-test".to_string(),
+        protocol: RelayProtocol::Joycode,
+        ..Default::default()
+    };
+    
+    // Check URL fallback
+    let url = chat_completions_url_for_relay(&profile_empty);
+    assert_eq!(url, "http://joycode-api-saas.jd.com/api/saas/openai/v2/chat/completions");
 }

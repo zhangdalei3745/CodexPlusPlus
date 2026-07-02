@@ -1128,7 +1128,7 @@ async fn handle_models_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let upstream = match crate::protocol_proxy::open_models_proxy_request(request_user_agent).await
+    let mut upstream = match crate::protocol_proxy::open_models_proxy_request(request_user_agent).await
     {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -1160,7 +1160,7 @@ async fn handle_models_proxy_connection(
     } else {
         upstream.content_type.clone()
     };
-    let body = upstream.response.bytes().await?.to_vec();
+    let body = upstream.bytes().await?;
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(
         if is_success {
@@ -1185,7 +1185,7 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request(
+    let mut upstream = match crate::protocol_proxy::open_responses_proxy_request(
         request_body,
         request_user_agent,
     )
@@ -1217,7 +1217,7 @@ async fn handle_protocol_proxy_connection(
     if !upstream.is_success() {
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
-        let upstream_body = upstream.response.bytes().await?.to_vec();
+        let upstream_body = upstream.bytes().await?;
         let error = crate::protocol_proxy::responses_error_from_upstream(
             upstream.status_code,
             &upstream_content_type,
@@ -1238,7 +1238,7 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-            let mut bytes_stream = upstream.response.bytes_stream();
+            let mut bytes_stream = upstream.response.unwrap().bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 if let Ok(bytes) = chunk {
                     stream.write_all(&bytes).await?;
@@ -1260,7 +1260,7 @@ async fn handle_protocol_proxy_connection(
             .as_ref()
             .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
             .unwrap_or_default();
-        let mut bytes_stream = upstream.response.bytes_stream();
+        let mut bytes_stream = upstream.response.unwrap().bytes_stream();
         let mut stream_failed = false;
         while let Some(chunk) = bytes_stream.next().await {
             match chunk {
@@ -1299,7 +1299,7 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let upstream_body = upstream.response.bytes().await?;
+    let upstream_body = upstream.bytes().await?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         write_http_response(
             stream,
@@ -1348,7 +1348,7 @@ async fn handle_chat_completions_proxy_connection(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request(
+    let mut upstream = match crate::protocol_proxy::open_chat_completions_proxy_request(
         request_body,
         request_user_agent,
     )
@@ -1386,7 +1386,7 @@ async fn handle_chat_completions_proxy_connection(
     };
     if upstream.is_stream && is_success {
         write_http_stream_headers(stream, &status, &content_type).await?;
-        let mut bytes_stream = upstream.response.bytes_stream();
+        let mut bytes_stream = upstream.response.unwrap().bytes_stream();
         while let Some(chunk) = bytes_stream.next().await {
             stream.write_all(&chunk?).await?;
         }
@@ -1400,7 +1400,7 @@ async fn handle_chat_completions_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let body = upstream.response.bytes().await?.to_vec();
+    let body = upstream.bytes().await?;
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(
         if is_success {
