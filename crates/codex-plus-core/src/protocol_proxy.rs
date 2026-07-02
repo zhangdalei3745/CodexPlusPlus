@@ -2186,6 +2186,7 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
                 }
             }
             "input_image" => {
+                // 支持 image_url 格式
                 if let Some(image_url) = part.get("image_url") {
                     let image_url = if image_url.is_object() {
                         image_url.clone()
@@ -2193,6 +2194,21 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
                         json!({ "url": image_url.as_str().unwrap_or_default() })
                     };
                     chat_parts.push(json!({ "type": "image_url", "image_url": image_url }));
+                    has_non_text_part = true;
+                }
+                // 支持 file_id 格式（保留 file_id 和 detail 字段）
+                else if let Some(file_id) = part.get("file_id").and_then(Value::as_str) {
+                    let mut image_part = json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("file_id://{}", file_id)
+                        }
+                    });
+                    // 如果有 detail 字段，保留它
+                    if let Some(detail) = part.get("detail") {
+                        image_part["image_url"]["detail"] = detail.clone();
+                    }
+                    chat_parts.push(image_part);
                     has_non_text_part = true;
                 }
             }
@@ -3727,6 +3743,7 @@ fn copy_response_request_fields(response: &mut Value, original_request: Option<&
     };
     for key in [
         "instructions",
+        "input",
         "max_output_tokens",
         "parallel_tool_calls",
         "previous_response_id",
