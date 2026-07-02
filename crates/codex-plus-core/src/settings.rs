@@ -412,7 +412,11 @@ impl BackendSettings {
                     self.relay_base_url.clone()
                 },
                 api_key: self.relay_api_key.clone(),
-                protocol: RelayProtocol::Responses,
+                protocol: if self.relay_base_url.contains("jd.com") || self.relay_base_url.contains("joycode") {
+                    RelayProtocol::Joycode
+                } else {
+                    RelayProtocol::Responses
+                },
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 test_model: String::new(),
@@ -457,7 +461,11 @@ impl BackendSettings {
                 self.relay_base_url.clone()
             },
             api_key: self.relay_api_key.clone(),
-            protocol: RelayProtocol::Responses,
+            protocol: if self.relay_base_url.contains("jd.com") || self.relay_base_url.contains("joycode") {
+                RelayProtocol::Joycode
+            } else {
+                RelayProtocol::Responses
+            },
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             test_model: String::new(),

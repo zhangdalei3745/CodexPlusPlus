@@ -686,10 +686,11 @@ pub async fn open_models_proxy_request_with_settings(
             .header("loginType", "N_PIN_PC")
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip")
             .json(&serde_json::json!({}))
             .send()
             .await?;
-        
+
         let status_code = upstream.status().as_u16();
         let mut custom_body = None;
         if (200..300).contains(&status_code) {
@@ -703,12 +704,19 @@ pub async fn open_models_proxy_request_with_settings(
                             .or_else(|| m.get("label").and_then(Value::as_str))
                             .filter(|s| !s.trim().is_empty());
                         if let Some(model_id) = model_id {
-                            openai_models.push(serde_json::json!({
+                            let max_tokens = m.get("maxTotalTokens")
+                                .and_then(Value::as_u64)
+                                .or_else(|| m.get("respMaxTokens").and_then(Value::as_u64));
+                            let mut model_obj = serde_json::json!({
                                 "id": model_id,
                                 "object": "model",
                                 "created": 1719736000,
                                 "owned_by": "jd"
-                            }));
+                            });
+                            if let Some(max_tokens) = max_tokens {
+                                model_obj["max_context_length"] = json!(max_tokens);
+                            }
+                            openai_models.push(model_obj);
                         }
                     }
                 }
@@ -724,8 +732,18 @@ pub async fn open_models_proxy_request_with_settings(
                 });
                 custom_body = Some(serde_json::to_vec(&result_json)?);
             }
+        } else {
+            let error_body = upstream.text().await.unwrap_or_default();
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.models_request.error",
+                json!({
+                    "relayId": relay.id,
+                    "statusCode": status_code,
+                    "errorBody": error_body,
+                }),
+            );
         }
-        
+
         return Ok(UpstreamProxyResponse {
             status_code,
             is_stream: false,
