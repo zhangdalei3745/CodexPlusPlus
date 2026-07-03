@@ -686,7 +686,6 @@ pub async fn open_models_proxy_request_with_settings(
             .header("loginType", "N_PIN_PC")
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
-            .header(reqwest::header::ACCEPT_ENCODING, "gzip")
             .json(&serde_json::json!({}))
             .send()
             .await?;
