@@ -915,10 +915,6 @@ fn upstream_request_parts(
             let model_name = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
             if is_anthropic_model(model_name) {
                 let anthropic_req = openai_to_anthropic_request(req_body);
-                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
-                    use std::io::Write;
-                    let _ = writeln!(file, "=== REQUEST ===\n{}", serde_json::to_string_pretty(&anthropic_req).unwrap_or_default());
-                }
                 Ok((
                     format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/')),
                     anthropic_req,
@@ -4423,10 +4419,6 @@ impl Default for AnthropicToOpenAiSseTranslator {
 
 impl AnthropicToOpenAiSseTranslator {
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
-            use std::io::Write;
-            let _ = writeln!(file, "=== INCOMING BYTES ===\n{}", String::from_utf8_lossy(bytes));
-        }
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
         let mut output = String::new();
         
@@ -4466,7 +4458,28 @@ impl AnthropicToOpenAiSseTranslator {
                     if let Some(event_type) = anthropic_val.get("type").and_then(Value::as_str) {
                         match event_type {
                             "content_block_delta" => {
-                                if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+                                let delta_type = anthropic_val.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str).unwrap_or("");
+                                if delta_type == "thinking_delta" {
+                                    // Anthropic thinking block → OpenAI reasoning_content
+                                    if let Some(thinking) = anthropic_val.get("delta").and_then(|d| d.get("thinking")).and_then(Value::as_str) {
+                                        let openai_chunk = serde_json::json!({
+                                            "id": "chatcmpl-anthropic",
+                                            "object": "chat.completion.chunk",
+                                            "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                            "model": "claude",
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "reasoning_content": thinking
+                                                    }
+                                                }
+                                            ]
+                                        });
+                                        output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                    }
+                                } else if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+                                    // Anthropic text block → OpenAI content
                                     let openai_chunk = serde_json::json!({
                                         "id": "chatcmpl-anthropic",
                                         "object": "chat.completion.chunk",
@@ -4481,10 +4494,6 @@ impl AnthropicToOpenAiSseTranslator {
                                             }
                                         ]
                                     });
-                                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
-                                        use std::io::Write;
-                                        let _ = writeln!(file, "=== OUTGOING CHUNK ===\n{}", openai_chunk.to_string());
-                                    }
                                     output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
                                 }
                             }
@@ -4502,10 +4511,6 @@ impl AnthropicToOpenAiSseTranslator {
                                         }
                                     ]
                                 });
-                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
-                                    use std::io::Write;
-                                    let _ = writeln!(file, "=== OUTGOING CHUNK (finish) ===\n{}", openai_chunk.to_string());
-                                }
                                 output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
                             }
                             "message_stop" => {
@@ -4519,10 +4524,6 @@ impl AnthropicToOpenAiSseTranslator {
                                         "type": "anthropic_error"
                                     }
                                 });
-                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
-                                    use std::io::Write;
-                                    let _ = writeln!(file, "=== OUTGOING ERROR ===\n{}", openai_error.to_string());
-                                }
                                 output.push_str(&format!("data: {}\n\n", openai_error.to_string()));
                             }
                             _ => {}
