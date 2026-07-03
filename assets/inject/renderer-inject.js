@@ -1422,7 +1422,14 @@
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
       const promise = Promise.resolve().then(async () => {
-        const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
+        let url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
+        if (!url) {
+          const scripts = Array.from(document.scripts || []).map((script) => script.src).filter(Boolean);
+          const mainScript = scripts.find((src) => src.includes("app-initial~app-main~") || src.includes("webview/assets/"));
+          if (mainScript) {
+            url = mainScript;
+          }
+        }
         if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
         return await import(url);
       }).catch((error) => {
