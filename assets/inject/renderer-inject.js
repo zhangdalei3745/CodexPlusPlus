@@ -1424,13 +1424,24 @@
       const promise = Promise.resolve().then(async () => {
         let url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
         if (!url) {
-          const scripts = Array.from(document.scripts || []).map((script) => script.src).filter(Boolean);
-          const mainScript = scripts.find((src) => src.includes("app-initial~app-main~") || src.includes("webview/assets/"));
+          const allUrls = [
+            ...Array.from(document.scripts || []).map((script) => script.src),
+            ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
+            ...performance.getEntriesByType("resource").map((entry) => entry.name),
+          ].filter(Boolean);
+          const mainScript = allUrls.find((src) => src.includes("app-initial~app-main~") || src.includes("webview/assets/"));
           if (mainScript) {
             url = mainScript;
           }
         }
-        if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
+        if (!url) {
+          const allUrls = [
+            ...Array.from(document.scripts || []).map((script) => script.src),
+            ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
+            ...performance.getEntriesByType("resource").map((entry) => entry.name),
+          ].filter(Boolean);
+          throw new Error(`未找到 Codex App asset: ${namePart}. URLs: ${JSON.stringify(allUrls)}`);
+        }
         return await import(url);
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
@@ -4835,10 +4846,28 @@
     });
   }
 
+  function patchStatsigClientInstance(obj) {
+    if (obj && typeof obj.getDynamicConfig === "function" && !obj.__codexPlusModelWhitelistPatched) {
+      const originalGetDynamicConfig = obj.getDynamicConfig.bind(obj);
+      obj.getDynamicConfig = (name, options) => {
+        const result = originalGetDynamicConfig(name, options);
+        return patchStatsigModelDynamicConfig(result);
+      };
+      obj.__codexPlusModelWhitelistPatched = true;
+      try {
+        patchStatsigModelDynamicConfig(obj.getDynamicConfig("107580212", { disableExposureLog: true }));
+      } catch {
+      }
+      return true;
+    }
+    return false;
+  }
+
   function patchObjectGraphForModels(root, visited, depth = 0) {
     if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
     visited.add(root);
     let changed = patchModelContainer(root);
+    if (patchStatsigClientInstance(root)) changed = true;
     if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
     for (const key of Object.keys(root)) {
       if (key === "ownerDocument" || key === "parentElement" || key === "parentNode" || key === "children" || key === "childNodes") continue;
