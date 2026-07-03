@@ -904,7 +904,7 @@ fn upstream_request_parts(
             if let Some(m) = req_body.get_mut("model") {
                 if let Some(m_str) = m.as_str() {
                     let trimmed = m_str.trim();
-                    if !is_joycode_model_registered(trimmed) {
+                    if !trimmed.ends_with("-hq") {
                         let hq_version = format!("{}-hq", trimmed);
                         if is_joycode_model_registered(&hq_version) {
                             *m = Value::String(hq_version);
