@@ -241,7 +241,18 @@ pub fn stop_launcher_processes() {
 }
 
 #[cfg(not(windows))]
-pub fn stop_launcher_processes() {}
+pub fn stop_launcher_processes() {
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-x")
+        .arg("CodexPlusPlus")
+        .status();
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-x")
+        .arg("codex-plus-plus")
+        .status();
+}
 
 #[cfg(windows)]
 pub fn stop_launcher_processes_and_wait() {
@@ -264,7 +275,10 @@ pub fn stop_launcher_processes_and_wait() {
 }
 
 #[cfg(not(windows))]
-pub fn stop_launcher_processes_and_wait() {}
+pub fn stop_launcher_processes_and_wait() {
+    stop_launcher_processes();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
 
 #[cfg(windows)]
 pub fn stop_codex_processes() {
@@ -274,7 +288,18 @@ pub fn stop_codex_processes() {
 }
 
 #[cfg(not(windows))]
-pub fn stop_codex_processes() {}
+pub fn stop_codex_processes() {
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-x")
+        .arg("Codex")
+        .status();
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-x")
+        .arg("codex")
+        .status();
+}
 
 #[cfg(windows)]
 pub fn stop_codex_processes_and_wait() {
@@ -286,7 +311,10 @@ pub fn stop_codex_processes_and_wait() {
 }
 
 #[cfg(not(windows))]
-pub fn stop_codex_processes_and_wait() {}
+pub fn stop_codex_processes_and_wait() {
+    stop_codex_processes();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
 
 #[cfg(windows)]
 fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_ms: u64) {
