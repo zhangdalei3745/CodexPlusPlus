@@ -535,6 +535,24 @@ pub async fn fetch_relay_profile_model_ids(
             for m in models {
                 if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
                     model_ids.push(model_id.to_string());
+                    let mut is_anthropic = false;
+                    if let Some(ext_json) = m.get("extJson") {
+                        if let Some(adapter) = ext_json.get("adapterType").and_then(Value::as_str) {
+                            is_anthropic = adapter == "anthropic";
+                        }
+                    }
+                    if !is_anthropic {
+                        if let Some(ext_str) = m.get("ext").and_then(Value::as_str) {
+                            if let Ok(ext_val) = serde_json::from_str::<Value>(ext_str) {
+                                if let Some(adapter) = ext_val.get("adapterType").and_then(Value::as_str) {
+                                    is_anthropic = adapter == "anthropic";
+                                }
+                            }
+                        }
+                    }
+                    if is_anthropic {
+                        crate::protocol_proxy::register_anthropic_model(model_id.to_string());
+                    }
                 }
             }
         }

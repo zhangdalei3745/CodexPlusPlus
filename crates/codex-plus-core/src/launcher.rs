@@ -1260,14 +1260,26 @@ async fn handle_protocol_proxy_connection(
             .as_ref()
             .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
             .unwrap_or_default();
+        let mut anthropic_translator = if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeAnthropic {
+            Some(crate::protocol_proxy::AnthropicToOpenAiSseTranslator::default())
+        } else {
+            None
+        };
         let mut bytes_stream = upstream.response.unwrap().bytes_stream();
         let mut stream_failed = false;
         while let Some(chunk) = bytes_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
+                    let openai_bytes = if let Some(ref mut translator) = anthropic_translator {
+                        translator.push_bytes(&bytes)
+                    } else {
+                        bytes.to_vec()
+                    };
+                    if !openai_bytes.is_empty() {
+                        let converted = converter.push_bytes(&openai_bytes);
+                        if !converted.is_empty() {
+                            stream.write_all(&converted).await?;
+                        }
                     }
                 }
                 Err(error) => {

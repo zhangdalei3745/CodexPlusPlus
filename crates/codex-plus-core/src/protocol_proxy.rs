@@ -295,6 +295,7 @@ pub struct UpstreamProxyResponse {
 pub enum UpstreamWireApi {
     Responses,
     ChatCompletions,
+    JoycodeAnthropic,
 }
 
 impl UpstreamProxyResponse {
@@ -899,11 +900,33 @@ fn upstream_request_parts(
             } else {
                 req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
             }
-            Ok((
-                format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/')),
-                req_body,
-                UpstreamWireApi::ChatCompletions,
-            ))
+            if let Some(m) = req_body.get_mut("model") {
+                if let Some(m_str) = m.as_str() {
+                    let trimmed = m_str.trim();
+                    if trimmed.to_lowercase().contains("claude") && !trimmed.ends_with("-hq") {
+                        *m = Value::String(format!("{}-hq", trimmed));
+                    }
+                }
+            }
+            let model_name = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
+            if is_anthropic_model(model_name) {
+                let anthropic_req = openai_to_anthropic_request(req_body);
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
+                    use std::io::Write;
+                    let _ = writeln!(file, "=== REQUEST ===\n{}", serde_json::to_string_pretty(&anthropic_req).unwrap_or_default());
+                }
+                Ok((
+                    format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/')),
+                    anthropic_req,
+                    UpstreamWireApi::JoycodeAnthropic,
+                ))
+            } else {
+                Ok((
+                    format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/')),
+                    req_body,
+                    UpstreamWireApi::ChatCompletions,
+                ))
+            }
         }
     }
 }
@@ -928,7 +951,7 @@ fn upstream_request_builder(
             .bearer_auth(api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
     }
-    if is_stream {
+    if is_stream && protocol != RelayProtocol::Joycode {
         builder = builder
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache");
@@ -1003,14 +1026,26 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 
     if is_stream {
         let text = String::from_utf8_lossy(&upstream_body);
+        let openai_text = if wire_api == UpstreamWireApi::JoycodeAnthropic {
+            let mut translator = AnthropicToOpenAiSseTranslator::default();
+            let openai_bytes = translator.push_bytes(text.as_bytes());
+            String::from_utf8_lossy(&openai_bytes).into_owned()
+        } else {
+            text.into_owned()
+        };
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: chat_sse_to_responses_sse_with_request(&text, &request_json).into_bytes(),
+            body: chat_sse_to_responses_sse_with_request(&openai_text, &request_json).into_bytes(),
         });
     }
 
-    let chat_json: Value = serde_json::from_slice(&upstream_body)?;
+    let raw_json: Value = serde_json::from_slice(&upstream_body)?;
+    let chat_json = if wire_api == UpstreamWireApi::JoycodeAnthropic {
+        anthropic_to_openai_response(raw_json)
+    } else {
+        raw_json
+    };
     let response_json = chat_completion_to_response_with_request(chat_json, &request_json)?;
     Ok(ProxyHttpResponse {
         status: "200 OK".to_string(),
@@ -2370,11 +2405,16 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
             "input_image" => {
                 // 支持 image_url 格式
                 if let Some(image_url) = part.get("image_url") {
-                    let image_url = if image_url.is_object() {
+                    let mut image_url = if image_url.is_object() {
                         image_url.clone()
                     } else {
                         json!({ "url": image_url.as_str().unwrap_or_default() })
                     };
+                    if let Some(url_val) = image_url.get_mut("url") {
+                        if let Some(url_str) = url_val.as_str() {
+                            *url_val = Value::String(clean_and_convert_image_url(url_str));
+                        }
+                    }
                     chat_parts.push(json!({ "type": "image_url", "image_url": image_url }));
                     has_non_text_part = true;
                 }
@@ -4152,3 +4192,302 @@ fn is_openai_o_series(model: &str) -> bool {
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
 }
+
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+static ANTHROPIC_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub fn register_anthropic_model(model_id: String) {
+    let mutex = ANTHROPIC_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.insert(model_id);
+    }
+}
+
+pub fn is_anthropic_model(model_id: &str) -> bool {
+    let mutex = ANTHROPIC_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(guard) = mutex.lock() {
+        if guard.contains(model_id) {
+            return true;
+        }
+    }
+    model_id.to_lowercase().contains("claude")
+}
+
+pub fn clean_and_convert_image_url(url_str: &str) -> String {
+    let url_str = url_str.trim();
+    if let Some(stripped) = url_str.strip_prefix("data:") {
+        if let Some((media_type, rest)) = stripped.split_once(";base64,") {
+            let cleaned_data: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+            return format!("data:{};base64,{}", media_type, cleaned_data);
+        }
+    }
+    url_str.to_string()
+}
+
+pub fn openai_to_anthropic_request(body: Value) -> Value {
+    let mut anthropic_body = serde_json::json!({});
+    
+    if let Some(model) = body.get("model") {
+        anthropic_body["model"] = model.clone();
+    }
+    
+    let mut system_text = String::new();
+    let mut messages = Vec::new();
+    if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
+        for msg in msgs {
+            if let Some(role) = msg.get("role").and_then(Value::as_str) {
+                if role == "system" {
+                    if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                        if !system_text.is_empty() {
+                            system_text.push_str("\n");
+                        }
+                        system_text.push_str(content);
+                    }
+                } else {
+                    let mut new_msg = msg.clone();
+                    if let Some(content) = msg.get("content") {
+                        if let Some(arr) = content.as_array() {
+                            let mut new_arr = Vec::new();
+                            for item in arr {
+                                if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+                                    if item_type == "image_url" {
+                                        if let Some(image_url_obj) = item.get("image_url") {
+                                            if let Some(url_str) = image_url_obj.get("url").and_then(Value::as_str) {
+                                                let cleaned_url = clean_and_convert_image_url(url_str);
+                                                if let Some(stripped) = cleaned_url.strip_prefix("data:") {
+                                                    if let Some((media_type, rest)) = stripped.split_once(";base64,") {
+                                                        new_arr.push(serde_json::json!({
+                                                            "type": "image",
+                                                            "source": {
+                                                                "type": "base64",
+                                                                "media_type": media_type,
+                                                                "data": rest
+                                                            }
+                                                        }));
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if item_type == "text" {
+                                        new_arr.push(item.clone());
+                                        continue;
+                                    }
+                                }
+                                new_arr.push(item.clone());
+                            }
+                            new_msg["content"] = Value::Array(new_arr);
+                        } else if let Some(content_str) = content.as_str() {
+                            new_msg["content"] = Value::String(content_str.to_string());
+                        }
+                    }
+                    messages.push(new_msg);
+                }
+            }
+        }
+    }
+    if !system_text.is_empty() {
+        anthropic_body["system"] = Value::String(system_text);
+    }
+    anthropic_body["messages"] = Value::Array(messages);
+    
+    let max_tokens = body.get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(4000);
+    anthropic_body["max_tokens"] = Value::Number(serde_json::Number::from(max_tokens));
+    
+    for key in ["temperature", "top_p", "stream"] {
+        if let Some(val) = body.get(key) {
+            anthropic_body[key] = val.clone();
+        }
+    }
+    
+    anthropic_body
+}
+
+pub fn anthropic_to_openai_response(body: Value) -> Value {
+    if let Some(error) = body.get("error") {
+        return serde_json::json!({
+            "error": {
+                "message": error.get("message").and_then(Value::as_str).unwrap_or("Unknown Anthropic error"),
+                "type": error.get("type").and_then(Value::as_str).unwrap_or("anthropic_error"),
+                "code": error.get("code").and_then(Value::as_str)
+            }
+        });
+    }
+
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    
+    let mut text_content = String::new();
+    if let Some(content_array) = body.get("content").and_then(Value::as_array) {
+        for block in content_array {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    text_content.push_str(text);
+                }
+            }
+        }
+    }
+    
+    let mut prompt_tokens = 0;
+    let mut completion_tokens = 0;
+    if let Some(usage) = body.get("usage") {
+        prompt_tokens = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+        completion_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    }
+    
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_content
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    })
+}
+
+pub struct AnthropicToOpenAiSseTranslator {
+    buffer: String,
+}
+
+impl Default for AnthropicToOpenAiSseTranslator {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+        }
+    }
+}
+
+impl AnthropicToOpenAiSseTranslator {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
+            use std::io::Write;
+            let _ = writeln!(file, "=== INCOMING BYTES ===\n{}", String::from_utf8_lossy(bytes));
+        }
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        let mut output = String::new();
+        
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            
+            for line in block.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                
+                let mut rest = if let Some(stripped) = line.strip_prefix("data:") {
+                    stripped.trim()
+                } else {
+                    line
+                };
+                
+                let mut is_json_data = false;
+                if let Some(stripped) = rest.strip_prefix("data:") {
+                    rest = stripped.trim();
+                    is_json_data = true;
+                }
+                
+                if rest == "[DONE]" {
+                    output.push_str("data: [DONE]\n\n");
+                    continue;
+                }
+                
+                if is_json_data {
+                    let Ok(anthropic_val) = serde_json::from_str::<Value>(rest) else {
+                        continue;
+                    };
+                    
+                    if let Some(event_type) = anthropic_val.get("type").and_then(Value::as_str) {
+                        match event_type {
+                            "content_block_delta" => {
+                                if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+                                    let openai_chunk = serde_json::json!({
+                                        "id": "chatcmpl-anthropic",
+                                        "object": "chat.completion.chunk",
+                                        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                        "model": "claude",
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": text
+                                                }
+                                            }
+                                        ]
+                                    });
+                                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
+                                        use std::io::Write;
+                                        let _ = writeln!(file, "=== OUTGOING CHUNK ===\n{}", openai_chunk.to_string());
+                                    }
+                                    output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                }
+                            }
+                            "message_delta" => {
+                                let openai_chunk = serde_json::json!({
+                                    "id": "chatcmpl-anthropic",
+                                    "object": "chat.completion.chunk",
+                                    "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                    "model": "claude",
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {},
+                                            "finish_reason": "stop"
+                                        }
+                                    ]
+                                });
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
+                                    use std::io::Write;
+                                    let _ = writeln!(file, "=== OUTGOING CHUNK (finish) ===\n{}", openai_chunk.to_string());
+                                }
+                                output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                            }
+                            "message_stop" => {
+                                output.push_str("data: [DONE]\n\n");
+                            }
+                            "error" => {
+                                let error_msg = anthropic_val.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("Unknown Anthropic error");
+                                let openai_error = serde_json::json!({
+                                    "error": {
+                                        "message": error_msg,
+                                        "type": "anthropic_error"
+                                    }
+                                });
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/Users/zhangdalei1/.codex-session-delete/debug_claude.log") {
+                                    use std::io::Write;
+                                    let _ = writeln!(file, "=== OUTGOING ERROR ===\n{}", openai_error.to_string());
+                                }
+                                output.push_str(&format!("data: {}\n\n", openai_error.to_string()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        output.into_bytes()
+    }
+}
+
