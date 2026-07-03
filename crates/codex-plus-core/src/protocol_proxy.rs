@@ -887,6 +887,7 @@ fn upstream_request_parts(
             UpstreamWireApi::ChatCompletions,
         )),
         RelayProtocol::Joycode => {
+            init_model_lists_from_profile(relay);
             let base = if relay.base_url.trim().is_empty() {
                 "http://joycode-api-saas.jd.com"
             } else {
