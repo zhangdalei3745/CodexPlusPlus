@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::settings::{RelayProfile, SettingsStore};
+use crate::settings::{RelayProfile, RelayProtocol, SettingsStore};
 use serde_json::{Value, json};
 
 const BASE_URL_ENV_KEYS: &[&str] = &[
@@ -505,6 +505,47 @@ fn responses_api_status(status: &str, endpoint: &str, message: &str) -> Value {
 pub async fn fetch_relay_profile_model_ids(
     profile: &RelayProfile,
 ) -> anyhow::Result<(Vec<String>, String)> {
+    if profile.protocol == RelayProtocol::Joycode {
+        let base = if profile.base_url.trim().is_empty() {
+            "http://joycode-api-saas.jd.com"
+        } else {
+            profile.base_url.trim()
+        };
+        let endpoint = format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'));
+        let client = crate::http_client::proxied_client(&profile.user_agent)?;
+        let upstream = client
+            .post(&endpoint)
+            .header("ptKey", profile.api_key.trim())
+            .header("loginType", "N_PIN_PC")
+            .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        
+        let status_code = upstream.status().as_u16();
+        if !(200..300).contains(&status_code) {
+            anyhow::bail!("HTTP {}", status_code);
+        }
+        
+        let res_json = upstream.json::<Value>().await?;
+        let models = res_json.get("data").and_then(Value::as_array);
+        let mut model_ids = Vec::new();
+        if let Some(models) = models {
+            for m in models {
+                if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
+                    model_ids.push(model_id.to_string());
+                }
+            }
+        }
+        model_ids.push("gpt-5".to_string());
+        
+        if model_ids.is_empty() {
+            anyhow::bail!("上游没有返回可用模型");
+        }
+        return Ok((model_ids, endpoint));
+    }
+
     let source = ModelSource {
         source_id: format!("relay-profile:{}", profile.id),
         source_type: "relay_profile".to_string(),
