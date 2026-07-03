@@ -903,8 +903,11 @@ fn upstream_request_parts(
             if let Some(m) = req_body.get_mut("model") {
                 if let Some(m_str) = m.as_str() {
                     let trimmed = m_str.trim();
-                    if trimmed.to_lowercase().contains("claude") && !trimmed.ends_with("-hq") {
-                        *m = Value::String(format!("{}-hq", trimmed));
+                    if !is_joycode_model_registered(trimmed) {
+                        let hq_version = format!("{}-hq", trimmed);
+                        if is_joycode_model_registered(&hq_version) {
+                            *m = Value::String(hq_version);
+                        }
                     }
                 }
             }
@@ -4198,6 +4201,23 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static ANTHROPIC_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static JOYCODE_MODEL_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub fn register_joycode_model(model_id: String) {
+    let mutex = JOYCODE_MODEL_IDS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.insert(model_id);
+    }
+}
+
+pub fn is_joycode_model_registered(model_id: &str) -> bool {
+    let mutex = JOYCODE_MODEL_IDS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(guard) = mutex.lock() {
+        guard.contains(model_id)
+    } else {
+        false
+    }
+}
 
 pub fn register_anthropic_model(model_id: String) {
     let mutex = ANTHROPIC_MODELS.get_or_init(|| Mutex::new(HashSet::new()));

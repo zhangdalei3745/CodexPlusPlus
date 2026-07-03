@@ -535,6 +535,7 @@ pub async fn fetch_relay_profile_model_ids(
             for m in models {
                 if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
                     model_ids.push(model_id.to_string());
+                    crate::protocol_proxy::register_joycode_model(model_id.to_string());
                     let mut is_anthropic = false;
                     if let Some(ext_json) = m.get("extJson") {
                         if let Some(adapter) = ext_json.get("adapterType").and_then(Value::as_str) {
