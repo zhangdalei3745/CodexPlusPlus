@@ -540,6 +540,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             &common_config,
             settings.computer_use_guard_enabled,
         )?;
+        crate::protocol_proxy::init_model_lists_from_profile(&profile);
         Ok(())
     }
 

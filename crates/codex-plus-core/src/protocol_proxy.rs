@@ -4219,6 +4219,30 @@ pub fn is_joycode_model_registered(model_id: &str) -> bool {
     }
 }
 
+pub fn init_model_lists_from_profile(profile: &crate::settings::RelayProfile) {
+    let list_str = &profile.model_list;
+    let model = &profile.model;
+    
+    let mut models = Vec::new();
+    for part in list_str.split(['\r', '\n', ',']) {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            models.push(trimmed.to_string());
+        }
+    }
+    let trimmed_model = model.trim();
+    if !trimmed_model.is_empty() {
+        models.push(trimmed_model.to_string());
+    }
+    
+    for m in models {
+        register_joycode_model(m.clone());
+        if m.to_lowercase().contains("claude") {
+            register_anthropic_model(m);
+        }
+    }
+}
+
 pub fn register_anthropic_model(model_id: String) {
     let mutex = ANTHROPIC_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut guard) = mutex.lock() {
