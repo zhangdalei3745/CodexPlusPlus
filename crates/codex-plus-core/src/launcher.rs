@@ -1233,6 +1233,20 @@ async fn handle_protocol_proxy_connection(
             &status,
             remote_addr_text,
         );
+        // 记录上游错误 body 到诊断日志，便于后续排查
+        let body_preview = String::from_utf8_lossy(
+            &upstream_body[..upstream_body.len().min(1024)]
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.upstream_error_body",
+            serde_json::json!({
+                "statusCode": upstream.status_code,
+                "contentType": upstream_content_type,
+                "bodyLength": upstream_body.len(),
+                "bodyPreview": body_preview.to_string(),
+                "path": path
+            }),
+        );
         stream.shutdown().await?;
         return Ok(());
     }

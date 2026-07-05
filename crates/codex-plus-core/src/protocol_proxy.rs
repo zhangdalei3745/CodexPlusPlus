@@ -16,6 +16,10 @@ pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+/// 对 502/503/429 等临时错误的最大重试次数
+const TRANSIENT_ERROR_MAX_RETRIES: u32 = 3;
+/// 首次重试的退避基数（秒）
+const TRANSIENT_ERROR_BACKOFF_BASE_SECS: u64 = 5;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -620,6 +624,115 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .unwrap_or("")
             .to_string();
         if (200..300).contains(&status_code) || !has_more_candidates {
+            // 对临时性错误（502/503/429/504）进行指数退避重试
+            if !has_more_candidates && is_transient_upstream_error(status_code) {
+                // 消费掉 response body 用于日志，然后重试
+                let error_body_bytes = upstream.bytes().await.unwrap_or_default();
+                let error_body_preview = String::from_utf8_lossy(
+                    &error_body_bytes[..error_body_bytes.len().min(512)]
+                ).to_string();
+                let mut last_status = status_code;
+                for retry in 1..=TRANSIENT_ERROR_MAX_RETRIES {
+                    let backoff = Duration::from_secs(
+                        TRANSIENT_ERROR_BACKOFF_BASE_SECS * (1u64 << (retry - 1))
+                    );
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.transient_error_retry",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "endpoint": endpoint,
+                            "wireApi": wire_api,
+                            "statusCode": last_status,
+                            "errorBodyPreview": error_body_preview,
+                            "retry": retry,
+                            "maxRetries": TRANSIENT_ERROR_MAX_RETRIES,
+                            "backoffSeconds": backoff.as_secs()
+                        }),
+                    );
+                    tokio::time::sleep(backoff).await;
+                    // 重新构建请求（upstream_body 和 endpoint 在此作用域内可用）
+                    let retry_result = send_upstream_request_for_responses(
+                        upstream_request_builder(
+                            crate::http_client::proxied_client(&effective_user_agent(
+                                &relay.user_agent,
+                                original_user_agent,
+                            ))?,
+                            &endpoint,
+                            relay.api_key.trim(),
+                            relay.protocol,
+                            is_stream,
+                            &upstream_body,
+                        ),
+                        is_stream,
+                    )
+                    .await;
+                    match retry_result {
+                        Ok(retry_upstream) => {
+                            let retry_status = retry_upstream.status().as_u16();
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "protocol_proxy.transient_error_retry_result",
+                                json!({
+                                    "relayId": relay.id,
+                                    "endpoint": endpoint,
+                                    "retry": retry,
+                                    "statusCode": retry_status,
+                                    "recovered": (200..300).contains(&retry_status)
+                                }),
+                            );
+                            if (200..300).contains(&retry_status) {
+                                let retry_ct = retry_upstream
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                return Ok(UpstreamProxyResponse {
+                                    status_code: retry_status,
+                                    is_stream: is_stream || retry_ct.contains("text/event-stream"),
+                                    content_type: retry_ct,
+                                    wire_api,
+                                    response: Some(retry_upstream),
+                                    custom_body: None,
+                                });
+                            }
+                            // 更新 last_status 以继续重试
+                            last_status = retry_status;
+                            if !is_transient_upstream_error(retry_status) {
+                                // 非临时错误，停止重试，返回此错误
+                                let final_ct = retry_upstream
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                return Ok(UpstreamProxyResponse {
+                                    status_code: retry_status,
+                                    is_stream: is_stream || final_ct.contains("text/event-stream"),
+                                    content_type: final_ct,
+                                    wire_api,
+                                    response: Some(retry_upstream),
+                                    custom_body: None,
+                                });
+                            }
+                            // 还是临时错误，消费body后继续
+                            let _ = retry_upstream.bytes().await;
+                        }
+                        Err(_) => {
+                            // 网络错误，继续重试
+                        }
+                    }
+                }
+                // 所有重试都失败了，用原始的 error body 构造响应
+                return Ok(UpstreamProxyResponse {
+                    status_code: last_status,
+                    is_stream: false,
+                    content_type: "application/json".to_string(),
+                    wire_api,
+                    response: None,
+                    custom_body: Some(error_body_bytes.to_vec()),
+                });
+            }
             return Ok(UpstreamProxyResponse {
                 status_code,
                 is_stream: is_stream || content_type.contains("text/event-stream"),
@@ -869,6 +982,11 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     } else {
         UPSTREAM_HEADER_TIMEOUT
     }
+}
+
+/// 判断 HTTP 状态码是否为临时性错误（值得重试）
+fn is_transient_upstream_error(status_code: u16) -> bool {
+    matches!(status_code, 429 | 502 | 503 | 504)
 }
 
 fn upstream_request_parts(
@@ -4270,63 +4388,159 @@ pub fn clean_and_convert_image_url(url_str: &str) -> String {
 
 pub fn openai_to_anthropic_request(body: Value) -> Value {
     let mut anthropic_body = serde_json::json!({});
-    
+
     if let Some(model) = body.get("model") {
         anthropic_body["model"] = model.clone();
     }
-    
+
     let mut system_text = String::new();
-    let mut messages = Vec::new();
+    let mut messages: Vec<Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
         for msg in msgs {
-            if let Some(role) = msg.get("role").and_then(Value::as_str) {
-                if role == "system" {
-                    if let Some(content) = msg.get("content").and_then(Value::as_str) {
-                        if !system_text.is_empty() {
-                            system_text.push_str("\n");
+            let role = match msg.get("role").and_then(Value::as_str) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            if role == "system" {
+                if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                    if !system_text.is_empty() {
+                        system_text.push_str("\n");
+                    }
+                    system_text.push_str(content);
+                }
+            } else if role == "assistant" {
+                // Convert assistant messages: handle tool_calls -> tool_use content blocks
+                let mut content_blocks: Vec<Value> = Vec::new();
+
+                // Preserve text content
+                if let Some(content) = msg.get("content") {
+                    if let Some(text) = content.as_str() {
+                        if !text.is_empty() {
+                            content_blocks.push(json!({"type": "text", "text": text}));
                         }
-                        system_text.push_str(content);
+                    } else if let Some(arr) = content.as_array() {
+                        for item in arr {
+                            if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+                                if item_type == "text" {
+                                    content_blocks.push(item.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Convert tool_calls to Anthropic tool_use blocks
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tool_calls {
+                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        if let Some(func) = tc.get("function") {
+                            let name = func.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                            let input: Value = func.get("arguments")
+                                .and_then(Value::as_str)
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or_else(|| json!({}));
+                            content_blocks.push(json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input
+                            }));
+                        }
+                    }
+                }
+
+                if !content_blocks.is_empty() {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": content_blocks
+                    }));
+                } else {
+                    messages.push(json!({"role": "assistant", "content": ""}));
+                }
+            } else if role == "tool" {
+                // Convert role:"tool" -> role:"user" with tool_result content block
+                let tool_call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
+                let content_str = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                let tool_result_block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content_str
+                });
+
+                // Merge consecutive tool results into a single user message
+                let should_merge = messages.last()
+                    .and_then(|m| m.get("role"))
+                    .and_then(Value::as_str)
+               .map(|r| r == "user")
+                    .unwrap_or(false)
+                    && messages.last()
+                        .and_then(|m| m.get("content"))
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str)
+                        .map(|t| t == "tool_result")
+                        .unwrap_or(false);
+
+                if should_merge {
+                    if let Some(last_msg) = messages.last_mut() {
+                        if let Some(arr) = last_msg.get_mut("content").and_then(Value::as_array_mut) {
+                            arr.push(tool_result_block);
+                        }
                     }
                 } else {
-                    let mut new_msg = msg.clone();
-                    if let Some(content) = msg.get("content") {
-                        if let Some(arr) = content.as_array() {
-                            let mut new_arr = Vec::new();
-                            for item in arr {
-                                if let Some(item_type) = item.get("type").and_then(Value::as_str) {
-                                    if item_type == "image_url" {
-                                        if let Some(image_url_obj) = item.get("image_url") {
-                                            if let Some(url_str) = image_url_obj.get("url").and_then(Value::as_str) {
-                                                let cleaned_url = clean_and_convert_image_url(url_str);
-                                                if let Some(stripped) = cleaned_url.strip_prefix("data:") {
-                                                    if let Some((media_type, rest)) = stripped.split_once(";base64,") {
-                                                        new_arr.push(serde_json::json!({
-                                                            "type": "image",
-                                                            "source": {
-                                                                "type": "base64",
-                                                                "media_type": media_type,
-                                                                "data": rest
-                                                            }
-                                                        }));
-                                                        continue;
-                                                    }
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [tool_result_block]
+                    }));
+                }
+            } else if role == "user" {
+                // User messages: convert image_url format
+                let mut new_msg = msg.clone();
+                if let Some(content) = msg.get("content") {
+                    if let Some(arr) = content.as_array() {
+                        let mut new_arr = Vec::new();
+                        for item in arr {
+                            if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+                                if item_type == "image_url" {
+                                    if let Some(image_url_obj) = item.get("image_url") {
+                                        if let Some(url_str) = image_url_obj.get("url").and_then(Value::as_str) {
+                                            let cleaned_url = clean_and_convert_image_url(url_str);
+                                            if let Some(stripped) = cleaned_url.strip_prefix("data:") {
+                                                if let Some((media_type, rest)) = stripped.split_once(";base64,") {
+                                                    new_arr.push(serde_json::json!({
+                                                        "type": "image",
+                                                        "source": {
+                                                            "type": "base64",
+                                                            "media_type": media_type,
+                                                            "data": rest
+                                                        }
+                                                    }));
+                                                    continue;
                                                 }
                                             }
                                         }
-                                    } else if item_type == "text" {
-                                        new_arr.push(item.clone());
-                                        continue;
                                     }
+                                } else if item_type == "text" {
+                                    new_arr.push(item.clone());
+                                    continue;
                                 }
-                                new_arr.push(item.clone());
                             }
-                            new_msg["content"] = Value::Array(new_arr);
-                        } else if let Some(content_str) = content.as_str() {
-                            new_msg["content"] = Value::String(content_str.to_string());
+                            new_arr.push(item.clone());
                         }
+                        new_msg["content"] = Value::Array(new_arr);
+                    } else if let Some(content_str) = content.as_str() {
+                        new_msg["content"] = Value::String(content_str.to_string());
                     }
-                    messages.push(new_msg);
                 }
+                // Remove OpenAI-specific fields that Anthropic doesn't recognize
+                if let Some(obj) = new_msg.as_object_mut() {
+                    obj.remove("name");
+                }
+                messages.push(new_msg);
+            } else {
+                messages.push(msg.clone());
             }
         }
     }
@@ -4334,19 +4548,41 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
         anthropic_body["system"] = Value::String(system_text);
     }
     anthropic_body["messages"] = Value::Array(messages);
-    
+
+    // Convert tools: OpenAI function format -> Anthropic tool format
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let mut anthropic_tools: Vec<Value> = Vec::new();
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) == Some("function") {
+                if let Some(func) = tool.get("function") {
+                    let name = func.get("name").cloned().unwrap_or(json!(""));
+                    let description = func.get("description").cloned().unwrap_or(json!(""));
+                    let input_schema = func.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}}));
+                    anthropic_tools.push(json!({
+                        "name": name,
+                        "description": description,
+                        "input_schema": input_schema
+                    }));
+                }
+            }
+        }
+        if !anthropic_tools.is_empty() {
+            anthropic_body["tools"] = Value::Array(anthropic_tools);
+        }
+    }
+
     let max_tokens = body.get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(4000);
     anthropic_body["max_tokens"] = Value::Number(serde_json::Number::from(max_tokens));
-    
+
     for key in ["temperature", "top_p", "stream"] {
         if let Some(val) = body.get(key) {
             anthropic_body[key] = val.clone();
         }
     }
-    
+
     anthropic_body
 }
 
