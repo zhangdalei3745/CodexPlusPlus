@@ -157,14 +157,36 @@ pub async fn install_bridge(
     }
 
     session.drain_binding_queue().await?;
+
+    let (writer, mut reader) = session.socket.split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let handler = session.handler.clone().context("handler is missing")?;
+
     tokio::spawn(async move {
-        loop {
-            if session.drain_binding_queue().await.is_err() {
-                break;
-            }
-            match session.next_message().await {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+        while let Some(message) = reader.next().await {
+            let message = match message {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if value.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled") {
+                let handler = handler.clone();
+                let writer = writer.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_concurrent_binding_call(value, handler, writer).await {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "bridge.concurrent_call_error",
+                            json!({ "error": err.to_string() }),
+                        );
+                    }
+                });
             }
         }
     });
@@ -545,4 +567,163 @@ fn extract_string_field(input: &str, field: &str) -> Option<String> {
 
 fn next_message_id() -> u64 {
     NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+async fn handle_concurrent_binding_call<W>(
+    message: Value,
+    handler: BridgeHandler,
+    writer: Arc<tokio::sync::Mutex<W>>,
+) -> anyhow::Result<()>
+where
+    W: futures_util::Sink<Message> + Unpin + Send + 'static,
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    let Some(payload_text) = message
+        .get("params")
+        .and_then(|params| params.get("payload"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+
+    let parsed: Value = match serde_json::from_str(payload_text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(request_id) = extract_string_field(payload_text, "id") {
+                reject_bridge_request_concurrent(&request_id, &format!("failed to parse bridge payload: {error}"), &*writer).await?;
+            }
+            return Ok(());
+        }
+    };
+
+    let Some(request_id) = parsed.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let path = parsed
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
+
+    match handler(path, payload).await {
+        Ok(result) => {
+            resolve_bridge_request_concurrent(request_id, &result, &*writer).await?;
+        }
+        Err(error) => {
+            reject_bridge_request_concurrent(request_id, &error.to_string(), &*writer).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_bridge_request_concurrent<W>(
+    request_id: &str,
+    result: &Value,
+    writer: &tokio::sync::Mutex<W>,
+) -> anyhow::Result<()>
+where
+    W: futures_util::Sink<Message> + Unpin + Send + 'static,
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    let expression = resolve_bridge_expression(request_id, result)?;
+    let message_id = next_message_id();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "bridge.resolve_start",
+        json!({
+            "request_id": request_id,
+            "message_id": message_id,
+            "result_status": result.get("status").and_then(Value::as_str).unwrap_or("")
+        }),
+    );
+    let mut guard = writer.lock().await;
+    let sent = guard
+        .send(Message::Text(
+            json!({
+                "id": message_id,
+                "method": "Runtime.evaluate",
+                "params": runtime_evaluate_params(&expression),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+    match &sent {
+        Ok(_) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.resolve_ok",
+                json!({
+                    "request_id": request_id,
+                    "message_id": message_id
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.resolve_failed",
+                json!({
+                    "request_id": request_id,
+                    "message_id": message_id,
+                    "message": error.to_string()
+                }),
+            );
+        }
+    }
+    sent.map_err(|e| anyhow::anyhow!(e))
+}
+
+async fn reject_bridge_request_concurrent<W>(
+    request_id: &str,
+    message: &str,
+    writer: &tokio::sync::Mutex<W>,
+) -> anyhow::Result<()>
+where
+    W: futures_util::Sink<Message> + Unpin + Send + 'static,
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    let expression = reject_bridge_expression(request_id, message)?;
+    let message_id = next_message_id();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "bridge.reject_start",
+        json!({
+            "request_id": request_id,
+            "message_id": message_id,
+            "message": message
+        }),
+    );
+    let mut guard = writer.lock().await;
+    let sent = guard
+        .send(Message::Text(
+            json!({
+                "id": message_id,
+                "method": "Runtime.evaluate",
+                "params": runtime_evaluate_params(&expression),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+    match &sent {
+        Ok(_) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.reject_ok",
+                json!({
+                    "request_id": request_id,
+                    "message_id": message_id
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.reject_failed",
+                json!({
+                    "request_id": request_id,
+                    "message_id": message_id,
+                    "error": error.to_string()
+                }),
+            );
+        }
+    }
+    sent.map_err(|e| anyhow::anyhow!(e))
 }

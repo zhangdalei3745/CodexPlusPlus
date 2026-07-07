@@ -666,6 +666,13 @@ pub fn normalize_codex_extra_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+struct SettingsCacheEntry {
+    mtime: std::time::SystemTime,
+    settings: BackendSettings,
+}
+
+static SETTINGS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<SettingsCacheEntry>>> = std::sync::OnceLock::new();
+
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
     path: PathBuf,
@@ -683,20 +690,38 @@ impl SettingsStore {
     }
 
     pub fn load(&self) -> anyhow::Result<BackendSettings> {
-        let contents = match fs::read_to_string(&self.path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BackendSettings::default());
-            }
+        let current_mtime = match fs::metadata(&self.path).and_then(|m| m.modified()) {
+            Ok(mtime) => Some(mtime),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("failed to read settings {}", self.path.display()));
+                    .with_context(|| format!("failed to read metadata {}", self.path.display()));
             }
         };
 
-        Ok(normalize_settings_config_sections(
-            serde_json::from_str(&contents).unwrap_or_default(),
-        ))
+        if let Some(mtime) = current_mtime {
+            let cache = SETTINGS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+            let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = guard.as_ref() {
+                if entry.mtime == mtime {
+                    return Ok(entry.settings.clone());
+                }
+            }
+
+            let contents = fs::read_to_string(&self.path).with_context(|| {
+                format!("failed to read settings {}", self.path.display())
+            })?;
+            let settings = normalize_settings_config_sections(
+                serde_json::from_str(&contents).unwrap_or_default(),
+            );
+            *guard = Some(SettingsCacheEntry {
+                mtime,
+                settings: settings.clone(),
+            });
+            Ok(settings)
+        } else {
+            Ok(BackendSettings::default())
+        }
     }
 
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {

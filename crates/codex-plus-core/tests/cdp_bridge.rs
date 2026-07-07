@@ -1703,3 +1703,72 @@ fn noop_handler() -> bridge::BridgeHandler {
             as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
     })
 }
+
+#[tokio::test]
+async fn install_bridge_processes_calls_concurrently() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "req-1",
+                        "path": "slow",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "req-2",
+                        "path": "fast",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let first_resolved = recv_json(&mut socket).await;
+        assert_eq!(first_resolved["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&first_resolved, "req-2");
+
+        let second_resolved = recv_json(&mut socket).await;
+        assert_eq!(second_resolved["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&second_resolved, "req-1");
+
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = Arc::new(|path: String, _payload: serde_json::Value| {
+        Box::pin(async move {
+            if path == "slow" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(json!({ "status": "ok", "id": "req-1" }))
+            } else {
+                Ok(json!({ "status": "ok", "id": "req-2" }))
+            }
+        }) as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    let _ = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]).await.unwrap();
+    
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
