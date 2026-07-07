@@ -671,7 +671,7 @@ struct SettingsCacheEntry {
     settings: BackendSettings,
 }
 
-static SETTINGS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<SettingsCacheEntry>>> = std::sync::OnceLock::new();
+static SETTINGS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SettingsCacheEntry>>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
@@ -700,9 +700,9 @@ impl SettingsStore {
         };
 
         if let Some(mtime) = current_mtime {
-            let cache = SETTINGS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+            let cache = SETTINGS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(entry) = guard.as_ref() {
+            if let Some(entry) = guard.get(&self.path) {
                 if entry.mtime == mtime {
                     return Ok(entry.settings.clone());
                 }
@@ -714,7 +714,7 @@ impl SettingsStore {
             let settings = normalize_settings_config_sections(
                 serde_json::from_str(&contents).unwrap_or_default(),
             );
-            *guard = Some(SettingsCacheEntry {
+            guard.insert(self.path.clone(), SettingsCacheEntry {
                 mtime,
                 settings: settings.clone(),
             });
