@@ -511,7 +511,13 @@ pub async fn test_relay_profile(
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => format!("{base_url}/responses"),
         RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
-        RelayProtocol::Joycode => format!("{base_url}/api/saas/openai/v2/chat/completions"),
+        RelayProtocol::Joycode => {
+            if base_url.starts_with("https://") {
+                crate::protocol_proxy::sign_joycode_gateway_url(base_url, "chat_completions")
+            } else {
+                format!("{base_url}/api/saas/openai/v2/chat/completions")
+            }
+        }
     };
     let test_model = model.trim();
     if test_model.is_empty() {
@@ -521,10 +527,13 @@ pub async fn test_relay_profile(
     let payload = relay_profile_test_payload(profile.protocol, test_model);
     let mut request_builder = client.post(&endpoint);
     if profile.protocol == RelayProtocol::Joycode {
+        let resolved_key = crate::protocol_proxy::get_latest_ptkey(api_key);
         request_builder = request_builder
-            .header("ptKey", api_key)
-            .header("loginType", "N_PIN_PC")
+            .header("ptKey", &resolved_key)
+            .header("loginType", crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header("client", "JoyCodeIDE")
+            .header("clientVersion", "3.8.61")
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
     } else {
         request_builder = request_builder
@@ -583,12 +592,21 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
             "input": "hi",
             "max_output_tokens": 16
         }),
-        RelayProtocol::ChatCompletions | RelayProtocol::Joycode => serde_json::json!({
+        RelayProtocol::ChatCompletions => serde_json::json!({
             "model": model,
             "messages": [
                 { "role": "user", "content": "hi" }
             ],
             "max_tokens": 16
+        }),
+        RelayProtocol::Joycode => serde_json::json!({
+            "model": model,
+            "messages": [
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+            "client": "JoyCodeIDE",
+            "clientVersion": "3.8.61"
         }),
     }
 }

@@ -1755,3 +1755,89 @@ fn joycode_defaults_and_fallbacks() {
     let url = chat_completions_url_for_relay(&profile_empty);
     assert_eq!(url, "http://joycode-api-saas.jd.com/api/saas/openai/v2/chat/completions");
 }
+
+#[test]
+fn responses_request_prunes_historical_base64_media() {
+    let large_base64 = format!("data:image/png;base64,{}", "A".repeat(2000));
+    
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-4o",
+        "input": [
+            // Turn 1 User: has a large base64 image (history)
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Describe this image" },
+                    {
+                        "type": "input_image",
+                        "image_url": {
+                            "url": large_base64
+                        }
+                    }
+                ]
+            },
+            // Turn 1 Assistant (history)
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "It is a picture of a cat." }
+                ]
+            },
+            // Turn 2 User: has another large base64 image (this is the latest query, MUST be kept!)
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "What about this one?" },
+                    {
+                        "type": "input_image",
+                        "image_url": {
+                            "url": large_base64
+                        }
+                    }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+
+    // Verify first message (history) has its base64 image stripped and replaced/pruned
+    let msg1_content = messages[0].get("content").unwrap().as_array().unwrap();
+    assert_eq!(msg1_content.len(), 1);
+    assert_eq!(msg1_content[0].get("text").unwrap().as_str().unwrap(), "Describe this image");
+
+    // Verify second message (history assistant) remains correct
+    assert_eq!(messages[1].get("content").unwrap().as_str().unwrap(), "It is a picture of a cat.");
+
+    // Verify third message (latest user query) preserves the base64 media data!
+    let msg3_content = messages[2].get("content").unwrap().as_array().unwrap();
+    assert_eq!(msg3_content.len(), 2);
+    assert_eq!(msg3_content[0].get("text").unwrap().as_str().unwrap(), "What about this one?");
+    let img_part = msg3_content[1].get("image_url").unwrap();
+    assert_eq!(img_part.get("url").unwrap().as_str().unwrap(), &large_base64);
+}
+
+#[test]
+fn test_fragmented_json_unauthorized_error_intercept() {
+    use codex_plus_core::protocol_proxy::ChatSseToResponsesConverter;
+    let mut converter = ChatSseToResponsesConverter::default();
+    
+    // Fragment 1: Incomplete JSON error
+    let chunk1 = b" {\"code\": 401, \"data\": {\"loginUrl\": \"https://joycode.jd.com/portal/login\", \"other\": \"";
+    let out1 = converter.push_bytes(chunk1);
+    assert!(out1.is_empty(), "Incomplete JSON should return empty bytes");
+    
+    // Fragment 2: Rest of JSON error
+    let chunk2 = b"value\"}}";
+    let out2 = converter.push_bytes(chunk2);
+    assert!(!out2.is_empty(), "Complete JSON should return failure response bytes");
+    
+    let response_str = String::from_utf8(out2).unwrap();
+    assert!(response_str.contains("Joycode 认证已失效，请访问 https://joycode.jd.com/portal/login 并重新登录。"));
+}
+

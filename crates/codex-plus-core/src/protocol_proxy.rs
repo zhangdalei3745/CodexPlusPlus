@@ -153,7 +153,8 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
         append_responses_input(input, &mut messages);
     }
     normalize_chat_messages(&mut messages);
-    let messages = collapse_system_messages_to_head(messages);
+    let mut messages = collapse_system_messages_to_head(messages);
+    prune_historical_base64_media(&mut messages);
     result["messages"] = json!(messages);
 
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -221,6 +222,48 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     Ok(result)
 }
 
+fn prune_historical_base64_media(messages: &mut [Value]) {
+    if messages.len() <= 1 {
+        return;
+    }
+    let history_len = messages.len() - 1;
+    for message in &mut messages[..history_len] {
+        if let Some(content) = message.get_mut("content") {
+            prune_base64_from_content(content);
+        }
+    }
+}
+
+fn prune_base64_from_content(content: &mut Value) {
+    match content {
+        Value::Array(parts) => {
+            let mut new_parts = Vec::new();
+            let mut removed_any_media = false;
+            for part in parts.iter() {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                if part_type == "image_url" {
+                    if let Some(image_url) = part.get("image_url") {
+                        if let Some(url_str) = image_url.get("url").and_then(Value::as_str) {
+                            if url_str.starts_with("data:") && url_str.len() > 1024 {
+                                removed_any_media = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                new_parts.push(part.clone());
+            }
+
+            if new_parts.is_empty() && removed_any_media {
+                new_parts.push(json!({ "type": "text", "text": "[已上传的图片/视频附件]" }));
+            }
+
+            *content = Value::Array(new_parts);
+        }
+        _ => {}
+    }
+}
+
 pub fn chat_completion_to_response(body: Value) -> anyhow::Result<Value> {
     chat_completion_to_response_with_context(body, &CodexToolContext::default(), None)
 }
@@ -262,12 +305,33 @@ fn chat_completion_to_response_with_context(
         tool_context,
     ));
 
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let conversation_id = original_request
+        .and_then(|req| conversation_id_from_responses_request(req))
+        .unwrap_or_default();
+
+    if let Some(usage) = body.get("usage").filter(|v| !v.is_null()) {
+        if let (Some(prompt), Some(completion), Some(total)) = (
+            usage.get("prompt_tokens").and_then(Value::as_u64),
+            usage.get("completion_tokens").and_then(Value::as_u64),
+            usage.get("total_tokens").and_then(Value::as_u64),
+        ) {
+            set_latest_usage(LatestUsageInfo {
+                model: model.to_string(),
+                prompt_tokens: prompt as u32,
+                completion_tokens: completion as u32,
+                total_tokens: total as u32,
+                conversation_id,
+            });
+        }
+    }
+
     let mut response = json!({
         "id": response_id,
         "object": "response",
         "created_at": body.get("created").and_then(Value::as_u64).unwrap_or(0),
         "status": response_status(choice.get("finish_reason").and_then(Value::as_str)),
-        "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
+        "model": model,
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
@@ -392,6 +456,40 @@ impl ChatSseToResponsesConverter {
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
+
+        let starts_with_brace = self.buffer.trim_start().starts_with('{');
+        if starts_with_brace {
+            if let Ok(value) = serde_json::from_str::<Value>(self.buffer.trim_start()) {
+                let trimmed_buf_str = self.buffer.trim_start().to_string();
+                self.buffer.clear();
+                if let Some(login_url) = value.get("data").and_then(|d| d.get("loginUrl")).and_then(Value::as_str) {
+                    return self.fail(
+                        format!("Joycode 认证已失效，请访问 {} 并重新登录。", login_url),
+                        Some("unauthorized".to_string()),
+                    );
+                }
+                if let Some(code) = value.get("code").and_then(Value::as_i64) {
+                    if code == 401 {
+                        return self.fail(
+                            "Joycode 认证已失效，请重新登录。".to_string(),
+                            Some("unauthorized".to_string()),
+                        );
+                    }
+                }
+                let msg = value.get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        value.get("msg")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| trimmed_buf_str)
+                    });
+                return self.fail(msg, Some("upstream_error".to_string()));
+            }
+            return Vec::new();
+        }
+
         let mut output = String::new();
         while let Some(block) = take_sse_block(&mut self.buffer) {
             if block.trim().is_empty() {
@@ -794,10 +892,11 @@ pub async fn open_models_proxy_request_with_settings(
             &relay.user_agent,
             original_user_agent,
         ))?;
+        let resolved_key = get_latest_ptkey(relay.api_key.trim());
         let upstream = client
             .post(&endpoint)
-            .header("ptKey", relay.api_key.trim())
-            .header("loginType", "N_PIN_PC")
+            .header("ptKey", &resolved_key)
+            .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
             .json(&serde_json::json!({}))
@@ -943,9 +1042,10 @@ pub async fn open_chat_completions_proxy_request(
     .post(chat_completions_url_for_relay(&relay));
     
     if relay.protocol == RelayProtocol::Joycode {
+        let resolved_key = get_latest_ptkey(relay.api_key.trim());
         request_builder = request_builder
-            .header("ptKey", relay.api_key.trim())
-            .header("loginType", "N_PIN_PC")
+            .header("ptKey", &resolved_key)
+            .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
     } else {
@@ -1032,15 +1132,29 @@ fn upstream_request_parts(
             }
             let model_name = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
             if is_anthropic_model(model_name) {
-                let anthropic_req = openai_to_anthropic_request(req_body);
+                let mut anthropic_req = openai_to_anthropic_request(req_body);
+                anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
+                anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
+                let endpoint = if base.starts_with("https://") {
+                    sign_joycode_gateway_url(base, "anthropic_completions")
+                } else {
+                    format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/'))
+                };
                 Ok((
-                    format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/')),
+                    endpoint,
                     anthropic_req,
                     UpstreamWireApi::JoycodeAnthropic,
                 ))
             } else {
+                req_body["client"] = Value::String("JoyCodeIDE".to_string());
+                req_body["clientVersion"] = Value::String("3.8.61".to_string());
+                let endpoint = if base.starts_with("https://") {
+                    sign_joycode_gateway_url(base, "chat_completions")
+                } else {
+                    format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+                };
                 Ok((
-                    format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/')),
+                    endpoint,
                     req_body,
                     UpstreamWireApi::ChatCompletions,
                 ))
@@ -1059,10 +1173,13 @@ fn upstream_request_builder(
 ) -> reqwest::RequestBuilder {
     let mut builder = client.post(endpoint);
     if protocol == RelayProtocol::Joycode {
+        let resolved_key = get_latest_ptkey(api_key);
         builder = builder
-            .header("ptKey", api_key)
-            .header("loginType", "N_PIN_PC")
+            .header("ptKey", &resolved_key)
+            .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header("client", "JoyCodeIDE")
+            .header("clientVersion", "3.8.61")
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
     } else {
         builder = builder
@@ -1179,7 +1296,11 @@ pub fn chat_completions_url_for_relay(relay: &crate::settings::RelayProfile) -> 
         } else {
             relay.base_url.trim()
         };
-        format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+        if base.starts_with("https://") {
+            sign_joycode_gateway_url(base, "chat_completions")
+        } else {
+            format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+        }
     } else {
         chat_completions_url(&relay.base_url)
     }
@@ -1351,6 +1472,7 @@ struct ChatSseState {
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
     original_request: Option<Value>,
+    conversation_id: String,
 }
 
 impl Default for ChatSseState {
@@ -1371,15 +1493,20 @@ impl Default for ChatSseState {
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             original_request: None,
+            conversation_id: String::new(),
         }
     }
 }
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
+        let model = original_request.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let conversation_id = conversation_id_from_responses_request(original_request).unwrap_or_default();
         Self {
             tool_context: build_codex_tool_context(original_request.get("tools")),
             original_request: Some(original_request.clone()),
+            model,
+            conversation_id,
             ..Self::default()
         }
     }
@@ -1400,6 +1527,19 @@ impl ChatSseState {
 
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
             self.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+            if let (Some(prompt), Some(completion), Some(total)) = (
+                usage.get("prompt_tokens").and_then(Value::as_u64),
+                usage.get("completion_tokens").and_then(Value::as_u64),
+                usage.get("total_tokens").and_then(Value::as_u64),
+            ) {
+                set_latest_usage(LatestUsageInfo {
+                    model: self.model.clone(),
+                    prompt_tokens: prompt as u32,
+                    completion_tokens: completion as u32,
+                    total_tokens: total as u32,
+                    conversation_id: self.conversation_id.clone(),
+                });
+            }
         }
 
         let Some(choice) = chunk
@@ -4772,4 +4912,272 @@ impl AnthropicToOpenAiSseTranslator {
         output.into_bytes()
     }
 }
+
+pub struct LatestUsageInfo {
+    pub model: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub conversation_id: String,
+}
+
+static LATEST_USAGE: std::sync::OnceLock<std::sync::Mutex<Option<LatestUsageInfo>>> = std::sync::OnceLock::new();
+
+pub fn set_latest_usage(info: LatestUsageInfo) {
+    let mutex = LATEST_USAGE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(info);
+    }
+}
+
+pub fn get_model_context_limit(model: &str) -> u32 {
+    let model_lower = model.to_lowercase();
+    if model_lower.contains("sonnet") || model_lower.contains("haiku") || model_lower.contains("opus") || model_lower.contains("claude-3") {
+        200_000
+    } else if model_lower.contains("deepseek") {
+        64_000
+    } else if model_lower.contains("gemini") {
+        1_000_000
+    } else {
+        128_000
+    }
+}
+
+pub fn get_latest_usage_json() -> serde_json::Value {
+    let mutex = LATEST_USAGE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = mutex.lock() {
+        if let Some(info) = &*guard {
+            serde_json::json!({
+                "status": "ok",
+                "model": info.model,
+                "prompt_tokens": info.prompt_tokens,
+                "completion_tokens": info.completion_tokens,
+                "total_tokens": info.total_tokens,
+                "context_limit": get_model_context_limit(&info.model),
+                "conversation_id": info.conversation_id,
+            })
+        } else {
+            serde_json::json!({
+                "status": "none"
+            })
+        }
+    } else {
+        serde_json::json!({
+            "status": "error",
+            "message": "failed to lock latest usage mutex"
+        })
+    }
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block_key = [0u8; 64];
+    if key.len() > 64 {
+        let hash = Sha256::digest(key);
+        block_key[..32].copy_from_slice(&hash);
+    } else {
+        block_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= block_key[i];
+        opad[i] ^= block_key[i];
+    }
+
+    let mut inner_hasher = Sha256::new();
+    inner_hasher.update(&ipad);
+    inner_hasher.update(message);
+    let inner_hash = inner_hasher.finalize();
+
+    let mut outer_hasher = Sha256::new();
+    outer_hasher.update(&opad);
+    outer_hasher.update(&inner_hash);
+    
+    let result = outer_hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+pub fn sign_joycode_gateway_url(base_url: &str, function_id: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let string_to_sign = format!("joycode_ide&{}&{}", function_id, t);
+    let key = b"0691a3f0b37b4a85aeb63ad0fc7db3ed";
+    let sign_bytes = hmac_sha256(key, string_to_sign.as_bytes());
+    
+    let mut sign = String::with_capacity(64);
+    for byte in sign_bytes {
+        sign.push_str(&format!("{:02x}", byte));
+    }
+
+    format!(
+        "{}/api?appid=joycode_ide&functionId={}&t={}&sign={}",
+        base_url, function_id, t, sign
+    )
+}
+
+struct KeyCandidate {
+    key: String,
+    timestamp: String,
+}
+
+fn parse_ptkey_timestamp(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() >= 3 {
+        let last_part = parts[2];
+        if let Some(idx) = last_part.find("202") {
+            let time_str = &last_part[idx..];
+            if time_str.len() >= 14 {
+                return Some(time_str[0..14].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn get_ptkey_from_jetbrains_xml(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let marker = "name=\"userToken\" value=\"";
+    if let Some(idx) = content.find(marker) {
+        let val_start = idx + marker.len();
+        if let Some(val_end) = content[val_start..].find('"') {
+            let full_val = &content[val_start..val_start + val_end];
+            if let Some(eq_idx) = full_val.find('=') {
+                let key = full_val[eq_idx + 1..].trim().to_string();
+                if !key.is_empty() {
+                    return Some(key);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_jetbrains_options_xml_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        let jetbrains_dir = home.join("Library/Application Support/JetBrains");
+        if jetbrains_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(jetbrains_dir) {
+                for entry in entries.flatten() {
+                    let options_dir = entry.path().join("options");
+                    if options_dir.exists() {
+                        if let Ok(xml_entries) = std::fs::read_dir(options_dir) {
+                            for xml_entry in xml_entries.flatten() {
+                                let filename = xml_entry.file_name().to_string_lossy().to_string();
+                                if filename.contains("JoyCoderSettings") && filename.ends_with(".xml") {
+                                    paths.push(xml_entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) {
+        let jetbrains_dir = appdata.join("JetBrains");
+        if jetbrains_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(jetbrains_dir) {
+                for entry in entries.flatten() {
+                    let options_dir = entry.path().join("options");
+                    if options_dir.exists() {
+                        if let Ok(xml_entries) = std::fs::read_dir(options_dir) {
+                            for xml_entry in xml_entries.flatten() {
+                                let filename = xml_entry.file_name().to_string_lossy().to_string();
+                                if filename.contains("JoyCoderSettings") && filename.ends_with(".xml") {
+                                    paths.push(xml_entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+pub fn get_logintype_for_ptkey(ptkey: &str) -> &'static str {
+    if ptkey.starts_with("BJ.") {
+        "ERP"
+    } else {
+        "N_PIN_PC"
+    }
+}
+
+pub fn get_latest_ptkey(fallback: &str) -> String {
+    use std::path::PathBuf;
+
+    let mut candidates: Vec<KeyCandidate> = Vec::new();
+
+    let mut add_candidate = |key: String| {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            let ts = parse_ptkey_timestamp(&trimmed).unwrap_or_else(|| "00000000000000".to_string());
+            candidates.push(KeyCandidate { key: trimmed, timestamp: ts });
+        }
+    };
+
+    // 1. Check JetBrains XML paths
+    for xml_path in get_jetbrains_options_xml_paths() {
+        if let Some(key) = get_ptkey_from_jetbrains_xml(&xml_path) {
+            add_candidate(key);
+        }
+    }
+
+    // 2. Check VS Code state.vscdb paths
+    let mut vscdb_paths = Vec::new();
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        vscdb_paths.push(home.join("Library/Application Support/Code/User/globalStorage/state.vscdb"));
+        vscdb_paths.push(home.join("Library/Application Support/JoyCode/User/globalStorage/state.vscdb"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        vscdb_paths.push(appdata.join("Code/User/globalStorage/state.vscdb"));
+        vscdb_paths.push(appdata.join("JoyCode/User/globalStorage/state.vscdb"));
+    }
+
+    for db_path in vscdb_paths {
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                if let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = 'JoyCoder.joycoder-fe'") {
+                    if let Ok(mut rows) = stmt.query([]) {
+                        if let Ok(Some(row)) = rows.next() {
+                            if let Ok(value_str) = row.get::<_, String>(0) {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value_str) {
+                                    if let Some(ptkey) = parsed.get("jdhLoginInfo").and_then(|info| info.get("ptKey")).and_then(serde_json::Value::as_str) {
+                                        add_candidate(ptkey.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also parse fallback key
+    add_candidate(fallback.to_string());
+
+    candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    if let Some(newest) = candidates.first() {
+        newest.key.clone()
+    } else {
+        fallback.to_string()
+    }
+}
+
+
+
+
 

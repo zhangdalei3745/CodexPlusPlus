@@ -511,15 +511,25 @@ pub async fn fetch_relay_profile_model_ids(
         } else {
             profile.base_url.trim()
         };
-        let endpoint = format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'));
+        let endpoint = if base.starts_with("https://") {
+            crate::protocol_proxy::sign_joycode_gateway_url(base, "joycode_modelList")
+        } else {
+            format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'))
+        };
         let client = crate::http_client::proxied_client(&profile.user_agent)?;
+        let resolved_key = crate::protocol_proxy::get_latest_ptkey(profile.api_key.trim());
         let upstream = client
             .post(&endpoint)
-            .header("ptKey", profile.api_key.trim())
-            .header("loginType", "N_PIN_PC")
+            .header("ptKey", &resolved_key)
+            .header("loginType", crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header("client", "JoyCodeIDE")
+            .header("clientVersion", "3.8.61")
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
-            .json(&serde_json::json!({}))
+            .json(&serde_json::json!({
+                "client": "JoyCodeIDE",
+                "clientVersion": "3.8.61"
+            }))
             .send()
             .await?;
         

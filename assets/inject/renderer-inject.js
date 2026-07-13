@@ -8047,6 +8047,127 @@
     installThreadScrollRouteHooks();
     scheduleThreadScrollSync(true);
     refreshCodexServiceTierControls();
+    scheduleTokenUsageTracker();
+  }
+
+  function scheduleTokenUsageTracker() {
+    if (window.__codexPlusTokenUsageTrackerScheduled) return;
+    window.__codexPlusTokenUsageTrackerScheduled = true;
+    window.setInterval(checkAndUpdateTokenUsage, 1200);
+  }
+
+  async function checkAndUpdateTokenUsage() {
+    window.__codexSessionTokenUsage = window.__codexSessionTokenUsage || {};
+    
+    const currentRef = currentSessionRef();
+    const pill = document.getElementById("codex-plus-token-usage-pill");
+    
+    if (!currentRef || !currentRef.session_id) {
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+    
+    const conversation = conversationRoot();
+    if (!conversation) {
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+
+    const flexColRows = Array.from(conversation.querySelectorAll(".group.flex.w-full.flex-col"));
+    const assistantRows = flexColRows.filter(node => !nodeLooksLikeCodexUserBubble(node));
+
+    if (assistantRows.length === 0) {
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+
+    const latestAssistantRow = assistantRows[assistantRows.length - 1];
+    
+    // 1. If we already have the token usage for the current session in memory, show it!
+    const cachedData = window.__codexSessionTokenUsage[currentRef.session_id];
+    if (cachedData) {
+      updateTokenUsagePill(cachedData);
+      return;
+    }
+    
+    // 2. If not cached, but the latest bubble is already annotated, or is empty, we hide the pill for now
+    if (latestAssistantRow.dataset.codexTokenAnnotated === "true") {
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+
+    const bubble = latestAssistantRow.querySelector("[class*='bg-']") || 
+                   latestAssistantRow.querySelector(".prose") || 
+                   latestAssistantRow.querySelector(".markdown") || 
+                   latestAssistantRow;
+    
+    if (!bubble) return;
+    const currentText = bubble.textContent.trim();
+    if (currentText.length < 3) {
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+
+    if (currentText !== latestAssistantRow.dataset.codexLastSeenText) {
+      latestAssistantRow.dataset.codexLastSeenText = currentText;
+      latestAssistantRow.dataset.codexLastSeenTime = String(Date.now());
+      if (pill) pill.style.opacity = "0";
+      return;
+    }
+
+    const stableDuration = Date.now() - parseInt(latestAssistantRow.dataset.codexLastSeenTime || "0", 10);
+    if (stableDuration < 1500) {
+      return;
+    }
+
+    try {
+      sendCodexPlusDiagnostic("token_usage_fetch_start", {});
+      const data = await postJson("/codex/latest_token_usage", {});
+      sendCodexPlusDiagnostic("token_usage_fetch_response", data);
+      if (data && data.status === "ok" && data.conversation_id === currentRef.session_id) {
+        window.__codexSessionTokenUsage[data.conversation_id] = data;
+        updateTokenUsagePill(data);
+        latestAssistantRow.dataset.codexTokenAnnotated = "true";
+      }
+    } catch (e) {
+      sendCodexPlusDiagnostic("token_usage_error", {
+        error: String(e)
+      });
+    }
+  }
+
+  function updateTokenUsagePill(data) {
+    let pill = document.getElementById("codex-plus-token-usage-pill");
+    if (!pill) {
+      pill = document.createElement("div");
+      pill.id = "codex-plus-token-usage-pill";
+      pill.style.position = "fixed";
+      pill.style.bottom = "16px";
+      pill.style.right = "24px";
+      pill.style.zIndex = "999999";
+      pill.style.padding = "6px 12px";
+      pill.style.borderRadius = "20px";
+      pill.style.backgroundColor = "rgba(33, 33, 33, 0.85)";
+      pill.style.backdropFilter = "blur(12px)";
+      pill.style.border = "1px solid rgba(255, 255, 255, 0.08)";
+      pill.style.color = "rgba(255, 255, 255, 0.85)";
+      pill.style.fontSize = "11px";
+      pill.style.fontWeight = "500";
+      pill.style.fontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+      pill.style.boxShadow = "0 4px 16px rgba(0, 0, 0, 0.2)";
+      pill.style.pointerEvents = "none";
+      pill.style.transition = "opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1), transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)";
+      pill.style.transform = "translateY(0)";
+      pill.style.display = "flex";
+      pill.style.alignItems = "center";
+      pill.style.gap = "6px";
+      document.body.appendChild(pill);
+    }
+    const limitText = data.context_limit >= 1000000 ? `${data.context_limit / 1000000}M` : `${data.context_limit / 1000}K`;
+    pill.innerHTML = `<span style="opacity: 0.65; display: inline-flex; align-items: center;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px;"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>Token 累计:</span> <span style="color: #60a5fa;">${data.prompt_tokens}</span> <span style="opacity: 0.4;">/</span> <span style="opacity: 0.8;">${limitText}</span> <span style="opacity: 0.4; margin-left: 2px;">(输出: ${data.completion_tokens})</span>`;
+    pill.style.display = "flex";
+    pill.style.opacity = "1";
+    pill.style.transform = "translateY(0)";
   }
 
   let zedRemoteStatusPromise = null;

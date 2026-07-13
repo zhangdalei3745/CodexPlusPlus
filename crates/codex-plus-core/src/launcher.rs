@@ -1022,6 +1022,23 @@ async fn handle_helper_connection(
             } else {
                 overlay_image_response()
             }
+        } else if path == "/codex/latest_token_usage" && matches!(method, "GET" | "OPTIONS") {
+            if method == "OPTIONS" {
+                (
+                    "200 OK".to_string(),
+                    Vec::new(),
+                    "application/json; charset=utf-8".to_string(),
+                    "helper.latest_token_usage_options",
+                )
+            } else {
+                let usage = crate::protocol_proxy::get_latest_usage_json();
+                (
+                    "200 OK".to_string(),
+                    serde_json::to_vec(&usage).unwrap_or_default(),
+                    "application/json; charset=utf-8".to_string(),
+                    "helper.latest_token_usage_ok",
+                )
+            }
         } else {
             (
                 "404 Not Found".to_string(),
@@ -1285,6 +1302,13 @@ async fn handle_protocol_proxy_connection(
         while let Some(chunk) = bytes_stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.stream_chunk_received",
+                        serde_json::json!({
+                            "len": bytes.len(),
+                            "preview": String::from_utf8_lossy(&bytes[..bytes.len().min(256)])
+                        }),
+                    );
                     let openai_bytes = if let Some(ref mut translator) = anthropic_translator {
                         translator.push_bytes(&bytes)
                     } else {
@@ -1292,6 +1316,13 @@ async fn handle_protocol_proxy_connection(
                     };
                     if !openai_bytes.is_empty() {
                         let converted = converter.push_bytes(&openai_bytes);
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.stream_chunk_converted",
+                            serde_json::json!({
+                                "len": converted.len(),
+                                "preview": String::from_utf8_lossy(&converted[..converted.len().min(256)])
+                            }),
+                        );
                         if !converted.is_empty() {
                             stream.write_all(&converted).await?;
                         }
