@@ -1021,13 +1021,7 @@ pub async fn open_chat_completions_proxy_request(
 
     let mut request_json: Value = serde_json::from_str(body)?;
     if relay.protocol == RelayProtocol::Joycode {
-        if let Some(m) = request_json.get_mut("model") {
-            if m.as_str().unwrap_or("").trim().is_empty() {
-                *m = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
-            }
-        } else {
-            request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
-        }
+        request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
     }
 
     let is_stream = request_json
@@ -1112,13 +1106,7 @@ fn upstream_request_parts(
                 relay.base_url.trim()
             };
             let mut req_body = responses_to_chat_completions(request_json)?;
-            if let Some(m) = req_body.get_mut("model") {
-                if m.as_str().unwrap_or("").trim().is_empty() {
-                    *m = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
-                }
-            } else {
-                req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
-            }
+            req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
             if let Some(m) = req_body.get_mut("model") {
                 if let Some(m_str) = m.as_str() {
                     let trimmed = m_str.trim();
@@ -4723,6 +4711,13 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
         }
     }
 
+    let model_lower = body.get("model").and_then(Value::as_str).unwrap_or("").to_lowercase();
+    if model_lower.contains("claude-3-7") || model_lower.contains("claude-3.7") {
+        anthropic_body["thinking"] = serde_json::json!({
+            "type": "disabled"
+        });
+    }
+
     anthropic_body
 }
 
@@ -4783,12 +4778,14 @@ pub fn anthropic_to_openai_response(body: Value) -> Value {
 
 pub struct AnthropicToOpenAiSseTranslator {
     buffer: String,
+    tool_blocks: std::collections::HashMap<u32, (String, String)>,
 }
 
 impl Default for AnthropicToOpenAiSseTranslator {
     fn default() -> Self {
         Self {
             buffer: String::new(),
+            tool_blocks: std::collections::HashMap::new(),
         }
     }
 }
@@ -4833,6 +4830,43 @@ impl AnthropicToOpenAiSseTranslator {
                     
                     if let Some(event_type) = anthropic_val.get("type").and_then(Value::as_str) {
                         match event_type {
+                            "content_block_start" => {
+                                if let Some(index) = anthropic_val.get("index").and_then(Value::as_u64) {
+                                    if let Some(content_block) = anthropic_val.get("content_block") {
+                                        if content_block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                            let id = content_block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                                            let name = content_block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                                            self.tool_blocks.insert(index as u32, (id.clone(), name.clone()));
+
+                                            let openai_chunk = serde_json::json!({
+                                                "id": "chatcmpl-anthropic",
+                                                "object": "chat.completion.chunk",
+                                                "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                                "model": "claude",
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [
+                                                                {
+                                                                    "index": index as u32,
+                                                                    "id": id,
+                                                                    "type": "function",
+                                                                    "function": {
+                                                                        "name": name,
+                                                                        "arguments": ""
+                                                                    }
+                                                                }
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            });
+                                            output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                        }
+                                    }
+                                }
+                            }
                             "content_block_delta" => {
                                 let delta_type = anthropic_val.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str).unwrap_or("");
                                 if delta_type == "thinking_delta" {
@@ -4854,26 +4888,61 @@ impl AnthropicToOpenAiSseTranslator {
                                         });
                                         output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
                                     }
-                                } else if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
-                                    // Anthropic text block → OpenAI content
-                                    let openai_chunk = serde_json::json!({
-                                        "id": "chatcmpl-anthropic",
-                                        "object": "chat.completion.chunk",
-                                        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                                        "model": "claude",
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": text
+                                } else if delta_type == "text_delta" || delta_type == "text" {
+                                    if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+                                        // Anthropic text block → OpenAI content
+                                        let openai_chunk = serde_json::json!({
+                                            "id": "chatcmpl-anthropic",
+                                            "object": "chat.completion.chunk",
+                                            "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                            "model": "claude",
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": text
+                                                    }
                                                 }
-                                            }
-                                        ]
-                                    });
-                                    output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                            ]
+                                        });
+                                        output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                    }
+                                } else if delta_type == "input_json_delta" {
+                                    if let Some(partial_json) = anthropic_val.get("delta").and_then(|d| d.get("partial_json")).and_then(Value::as_str) {
+                                        if let Some(index) = anthropic_val.get("index").and_then(Value::as_u64) {
+                                            let openai_chunk = serde_json::json!({
+                                                "id": "chatcmpl-anthropic",
+                                                "object": "chat.completion.chunk",
+                                                "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                                                "model": "claude",
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "tool_calls": [
+                                                                {
+                                                                    "index": index as u32,
+                                                                    "function": {
+                                                                        "arguments": partial_json
+                                                                    }
+                                                                }
+                                                            ]
+                                                        }
+                                                    }
+                                                ]
+                                            });
+                                            output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                        }
+                                    }
                                 }
                             }
                             "message_delta" => {
+                                let stop_reason = anthropic_val.get("delta").and_then(|d| d.get("stop_reason")).and_then(Value::as_str);
+                                let finish_reason = if stop_reason == Some("tool_use") {
+                                    "tool_calls"
+                                } else {
+                                    "stop"
+                                };
                                 let openai_chunk = serde_json::json!({
                                     "id": "chatcmpl-anthropic",
                                     "object": "chat.completion.chunk",
@@ -4883,7 +4952,7 @@ impl AnthropicToOpenAiSseTranslator {
                                         {
                                             "index": 0,
                                             "delta": {},
-                                            "finish_reason": "stop"
+                                            "finish_reason": finish_reason
                                         }
                                     ]
                                 });
