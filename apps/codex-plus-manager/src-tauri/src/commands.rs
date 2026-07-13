@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use codex_plus_core::install::SILENT_BINARY;
 use codex_plus_core::models::{DeleteResult, SessionRef};
+use codex_plus_core::relay_environment::RelayEnvironmentReport;
 use codex_plus_core::script_market::{self, MarketScript, ScriptMarketManifest};
 use codex_plus_core::settings::{BackendSettings, RelayProfile, SettingsStore};
 use codex_plus_core::status::{LaunchStatus, StatusStore};
@@ -195,6 +196,13 @@ pub struct RelayProfileTestPayload {
     pub http_status: u16,
     pub endpoint: String,
     pub response_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayLatencyPayload {
+    pub latency_ms: Option<u64>,
+    pub http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -500,13 +508,7 @@ pub fn load_settings() -> CommandResult<SettingsPayload> {
 pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload> {
     let settings = normalize_settings_before_save(settings);
     match SettingsStore::default().save(&settings) {
-        Ok(()) => {
-            let wrapper_message = refresh_cli_wrapper_after_settings_save(&settings);
-            settings_payload(
-                &format!("设置已保存。{wrapper_message}"),
-                "设置保存后重新读取失败",
-            )
-        }
+        Ok(()) => settings_payload("设置已保存。", "设置保存后重新读取失败"),
         Err(error) => failed(
             &format!("保存设置失败：{error}"),
             SettingsPayload {
@@ -1381,20 +1383,6 @@ pub async fn repair_shortcuts() -> InstallActionResult {
 }
 
 #[tauri::command]
-pub fn repair_backend() -> CommandResult<SettingsPayload> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let message = match codex_plus_core::cli_wrapper::ensure_cli_wrapper(&settings) {
-        Ok(Some(install)) => format!(
-            "后端已修复，命令包装器已指向 {}。",
-            install.real_codex.to_string_lossy()
-        ),
-        Ok(None) => "后端已修复，命令包装器当前未启用。".to_string(),
-        Err(error) => format!("后端修复部分失败：{error}"),
-    };
-    settings_payload(&message, "修复后重新读取设置失败")
-}
-
-#[tauri::command]
 pub fn plugin_marketplace_status() -> CommandResult<PluginMarketplaceStatusPayload> {
     let home = codex_plus_core::codex_home::default_codex_home_dir();
     let status = codex_plus_core::plugin_marketplace::openai_curated_marketplace_status(&home);
@@ -1763,6 +1751,7 @@ pub fn reset_image_overlay_settings() -> CommandResult<SettingsPayload> {
     settings.codex_app_image_overlay_enabled = defaults.codex_app_image_overlay_enabled;
     settings.codex_app_image_overlay_path = defaults.codex_app_image_overlay_path;
     settings.codex_app_image_overlay_opacity = defaults.codex_app_image_overlay_opacity;
+    settings.codex_app_image_overlay_fit_mode = defaults.codex_app_image_overlay_fit_mode;
     let settings = normalize_settings_before_save(settings);
     match store.save(&settings) {
         Ok(()) => settings_payload("图片覆盖层设置已重置。", "图片覆盖层重置后重新读取失败"),
@@ -1816,6 +1805,17 @@ pub fn check_env_conflicts() -> CommandResult<EnvConflictsPayload> {
         "检测到可能覆盖 Codex 供应商配置的 OPENAI 环境变量。"
     };
     ok(message, EnvConflictsPayload { conflicts })
+}
+
+#[tauri::command]
+pub fn check_relay_environment() -> CommandResult<RelayEnvironmentReport> {
+    let report = codex_plus_core::relay_environment::inspect_relay_environment();
+    let message = if report.all_passed() {
+        "中转站环境配置检测全部通过。"
+    } else {
+        "检测到可能影响中转站配置的环境问题。"
+    };
+    ok(message, report)
 }
 
 #[tauri::command]
@@ -2243,6 +2243,26 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
                 http_status: 0,
                 endpoint: String::new(),
                 response_preview: String::new(),
+            },
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn measure_relay_latency(url: String) -> CommandResult<RelayLatencyPayload> {
+    match codex_plus_core::relay_latency::measure_relay_latency(&url).await {
+        Ok(measurement) => ok(
+            "目标 URL 延迟检测完成。",
+            RelayLatencyPayload {
+                latency_ms: Some(measurement.latency_ms),
+                http_status: Some(measurement.http_status),
+            },
+        ),
+        Err(error) => failed(
+            &format!("目标 URL 延迟检测失败：{error}"),
+            RelayLatencyPayload {
+                latency_ms: None,
+                http_status: None,
             },
         ),
     }
@@ -2876,17 +2896,6 @@ fn sanitize_manager_event(event: &str) -> String {
         suffix.to_string()
     } else {
         format!("manager.ui.{suffix}")
-    }
-}
-
-fn refresh_cli_wrapper_after_settings_save(settings: &BackendSettings) -> String {
-    match codex_plus_core::cli_wrapper::ensure_cli_wrapper(settings) {
-        Ok(Some(install)) => format!(
-            " 命令包装器已更新：{}。",
-            install.real_codex.to_string_lossy()
-        ),
-        Ok(None) => String::new(),
-        Err(error) => format!(" 但命令包装器更新失败：{error}。"),
     }
 }
 
@@ -3773,6 +3782,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_settings_before_save_preserves_manual_relay_mode_for_pure_api_profile() {
+        let settings = BackendSettings {
+            active_relay_id: "api".to_string(),
+            launch_mode: codex_plus_core::settings::LaunchMode::Relay,
+            relay_profiles: vec![RelayProfile {
+                id: "api".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+
+        let normalized = normalize_settings_before_save(settings);
+
+        assert_eq!(
+            normalized.launch_mode,
+            codex_plus_core::settings::LaunchMode::Relay
+        );
+    }
+
+    #[test]
     fn reset_image_overlay_settings_preserves_supplier_settings() {
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
@@ -3782,6 +3812,7 @@ mod tests {
             codex_app_image_overlay_enabled: true,
             codex_app_image_overlay_path: "C:\\Users\\me\\Pictures\\overlay.png".to_string(),
             codex_app_image_overlay_opacity: 42,
+            codex_app_image_overlay_fit_mode: "fill".to_string(),
             active_relay_id: "supplier-a".to_string(),
             relay_profiles: vec![RelayProfile {
                 id: "supplier-a".to_string(),
@@ -3801,6 +3832,10 @@ mod tests {
         assert!(!result.payload.settings.codex_app_image_overlay_enabled);
         assert_eq!(result.payload.settings.codex_app_image_overlay_path, "");
         assert_eq!(result.payload.settings.codex_app_image_overlay_opacity, 35);
+        assert_eq!(
+            result.payload.settings.codex_app_image_overlay_fit_mode,
+            "fit"
+        );
         assert_eq!(result.payload.settings.active_relay_id, "supplier-a");
         assert_eq!(result.payload.settings.relay_profiles.len(), 1);
         assert_eq!(result.payload.settings.relay_profiles[0].id, "supplier-a");

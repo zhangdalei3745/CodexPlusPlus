@@ -2,7 +2,8 @@ use base64::Engine;
 use codex_plus_core::assets;
 use codex_plus_core::bridge::{self, BRIDGE_BINDING_NAME};
 use codex_plus_core::cdp::{
-    CdpTarget, list_targets, pick_injectable_codex_page_target, pick_page_target,
+    CdpTarget, is_avatar_overlay_page_target, is_primary_codex_page_target, list_targets,
+    pick_injectable_codex_page_target, pick_page_target,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -54,6 +55,72 @@ fn injection_script_prefixes_helper_url_and_sponsor_images() {
 }
 
 #[test]
+fn pet_real_mouse_settings_are_gated_to_windows_in_injected_ui() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("codexPlusIsWindowsPlatform"));
+    assert!(script.contains(r#"/\bWindows\b/i.test(navigator.userAgent || "")"#));
+    assert!(script.contains("codexPlusIsWindowsPlatform ? `<div"));
+}
+
+#[test]
+fn pet_real_mouse_script_uses_cdp_push_and_native_avatar_event() {
+    let script = assets::pet_real_mouse_script();
+
+    assert!(script.contains("avatar-overlay-computer-use-cursor-changed"));
+    assert!(script.contains("data-avatar-mascot"));
+    assert!(script.contains("nativeCursorActive"));
+    assert!(script.contains("transport: \"cdp-push\""));
+    assert!(script.contains("updateScreenPoint(point)"));
+    assert!(script.contains("mascot.matches(\":hover\")"));
+    assert!(script.contains("document.elementFromPoint(localPoint.x, localPoint.y)"));
+    assert!(script.contains("if (mascotHovered)"));
+    assert!(
+        script
+            .contains("document.visibilityState !== \"visible\" || dragging || nativeCursorActive")
+    );
+    assert!(script.contains("sendPoint(null).catch(disableUpdates)"));
+    assert!(script.contains("void cleared.catch(disableUpdates)"));
+    assert!(script.contains("dispatcher.dispatchHostMessage({ type: eventType, point: null })"));
+    assert!(script.contains("movementHoldMs = 1400"));
+    assert!(script.contains("activationRadius = 480"));
+    assert!(!script.contains("/pet/cursor-position"));
+    assert!(!script.contains("X-Codex-Plus-Pet-Token"));
+    assert!(script.contains("delete window.__codexPlusPetRealMouseLook"));
+}
+
+#[test]
+fn pet_real_mouse_capability_probe_rejects_v1_without_explicit_v2_evidence() {
+    let probe = assets::pet_real_mouse_capability_probe_script();
+
+    assert!(probe.contains("data-avatar-mascot"));
+    assert!(probe.contains("image.naturalWidth === 1536"));
+    assert!(probe.contains("image.naturalHeight === 2288"));
+    assert!(!probe.contains("new Image()"));
+    assert!(probe.contains("if (!currentSpriteIsV2) return false"));
+    assert!(!probe.contains("spriteVersionNumber"));
+    assert!(probe.contains("dispatchHostMessage"));
+    assert!(probe.contains("typeof value.subscribe === \"function\""));
+    assert!(!probe.contains("__codexPlusPetRealMouseLook"));
+    assert!(!probe.contains("runtimeVersion"));
+}
+
+#[test]
+fn pet_real_mouse_update_script_stops_when_runtime_capability_is_missing() {
+    let script = assets::pet_real_mouse_update_script(-125, 640);
+
+    assert!(script.contains("data-avatar-mascot"));
+    assert!(script.contains("image.naturalWidth === 1536"));
+    assert!(script.contains("image.naturalHeight === 2288"));
+    assert!(script.contains("updateScreenPoint?.({ x: -125, y: 640 }) === true"));
+}
+
+#[test]
+fn pet_real_mouse_stop_script_retires_existing_runtime() {
+    assert!(assets::pet_real_mouse_stop_script().contains("__codexPlusPetRealMouseLook?.stop?.()"));
+}
+
+#[test]
 fn injection_script_exposes_image_overlay_config() {
     let temp = tempfile::tempdir().unwrap();
     let image_path = temp.path().join("overlay.png");
@@ -68,6 +135,7 @@ fn injection_script_exposes_image_overlay_config() {
         codex_app_image_overlay_enabled: true,
         codex_app_image_overlay_path: image_path.to_string_lossy().to_string(),
         codex_app_image_overlay_opacity: 42,
+        codex_app_image_overlay_fit_mode: "fill".to_string(),
         ..Default::default()
     };
     let script = assets::injection_script_with_settings(57321, &settings);
@@ -75,6 +143,7 @@ fn injection_script_exposes_image_overlay_config() {
     assert!(script.contains("window.__CODEX_PLUS_IMAGE_OVERLAY__"));
     assert!(script.contains("\"enabled\":true"));
     assert!(script.contains("\"opacity\":0.42"));
+    assert!(script.contains("\"fitMode\":\"fill\""));
     assert!(script.contains("\"dataUrl\":\"data:image/png;base64,"));
     assert!(script.contains("http://127.0.0.1:57321/overlay/image"));
 }
@@ -84,7 +153,10 @@ fn injection_script_installs_image_overlay_from_data_uri() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("const source = config.dataUrl || \"\""));
-    assert!(script.contains("image.src = source"));
+    assert!(script.contains("backgroundImage: `url(\"${source.replace(/\"/g, \"%22\")}\")`"));
+    assert!(script.contains(
+        "fit: { size: \"contain\", position: \"center center\", repeat: \"no-repeat\" }"
+    ));
     assert!(script.contains("image_overlay_installed"));
 }
 
@@ -117,7 +189,7 @@ fn injection_script_times_out_backend_bridge_calls_and_falls_back_to_helper() {
 
     assert!(script.contains("bridgeWithBackendTimeout"));
     assert!(script.contains("backend_bridge_timeout"));
-    assert!(script.contains("/backend/repair"));
+    assert!(!script.contains("/backend/repair"));
     assert!(script.contains("backend_status_bridge_failed_http_fallback_ok"));
     assert!(script.contains("backend_status_bridge_and_http_failed"));
 }
@@ -184,6 +256,37 @@ fn stepwise_assistant_detection_accepts_two_action_buttons() {
     assert!(script.contains("if (count < 2) continue;"));
     assert!(!script.contains("if (count >= 3) return current;"));
     assert!(!script.contains("if (count < 3) continue;"));
+}
+
+#[test]
+fn stepwise_refreshes_suggestions_for_virtualized_assistant_bubbles() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("function assistantBubbleCandidates("));
+    assert!(script.contains("\".group.flex.min-w-0.flex-col\""));
+    assert!(script.contains("candidates.push(...assistantBubbleCandidates())"));
+    assert!(script.contains("function latestMessageByDocumentOrder("));
+    assert!(script.contains("function clearPromptsForNewAssistant("));
+    assert!(script.contains(
+        "if (state.prompts.length || state.currentHash) clearPromptsForNewAssistant(hash);"
+    ));
+    assert!(script.contains("function setScanStatus("));
+    assert!(script.contains("setScanStatus(\"not-ready\""));
+    assert!(script.contains("setScanStatus(\"no-assistant-message\""));
+    assert!(!script.contains("setScanStatus(\"surface-not-ready\""));
+    assert!(!script.contains("return fallback[fallback.length - 1] || null;"));
+}
+
+#[test]
+fn stepwise_exposes_manual_refresh_without_refreshing_busy_chats() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("data-action=\"refresh\""));
+    assert!(script.contains("function forceRefreshStepwise("));
+    assert!(script.contains("state.bridgeStatus === \"pending\" || chatBusy()"));
+    assert!(script.contains("setScanStatus(\"manual-refresh-busy\""));
+    assert!(script.contains("state.bridgeCache.delete(bridgeKey)"));
+    assert!(script.contains("requestBridgeStepwise(bridgeKey, userText, assistantText)"));
 }
 
 #[test]
@@ -365,6 +468,8 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("__CODEX_PLUS_PLUGIN_MARKETPLACES__"));
     assert!(script.contains("mergeLocalPluginMarketplaces(result)"));
     assert!(script.contains("plugin_marketplace_local_merged"));
+    assert!(script.contains("cloned.marketplaceName = marketplaceName"));
+    assert!(script.contains("cloned.marketplacePath = marketplaceName"));
     assert!(script.contains("restorePluginMarketplaceName"));
     assert!(script.contains(
         "next.remoteMarketplaceName = restorePluginMarketplaceName(next.remoteMarketplaceName)"
@@ -1108,6 +1213,99 @@ fn pick_injectable_codex_page_target_rejects_non_codex_pages() {
             .to_string()
             .contains("No injectable Codex page target found")
     );
+}
+
+#[test]
+fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_page() {
+    let targets = vec![target(
+        "chatgpt",
+        "page",
+        "ChatGPT",
+        "https://chatgpt.com/",
+        Some("ws://chatgpt"),
+    )];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("ChatGPT desktop page should be selected");
+
+    assert_eq!(picked.id, "chatgpt");
+}
+
+#[test]
+fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_error_page() {
+    let targets = vec![target(
+        "chatgpt-error",
+        "page",
+        "ChatGPT",
+        "data:text/html;charset=utf-8,%3Ctitle%3EChatGPT%3C/title%3E",
+        Some("ws://chatgpt-error"),
+    )];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("ChatGPT desktop error page should be selected");
+
+    assert_eq!(picked.id, "chatgpt-error");
+}
+
+#[test]
+fn avatar_overlay_target_detection_is_narrow() {
+    let overlay = target(
+        "avatar",
+        "page",
+        "ChatGPT Avatar Overlay",
+        "app://-/index.html?initialRoute=%2Favatar-overlay",
+        Some("ws://avatar"),
+    );
+    let main = target(
+        "main",
+        "page",
+        "ChatGPT",
+        "https://chatgpt.com/",
+        Some("ws://main"),
+    );
+
+    assert!(is_avatar_overlay_page_target(&overlay));
+    assert!(!is_primary_codex_page_target(&overlay));
+    assert!(!is_avatar_overlay_page_target(&main));
+    assert!(is_primary_codex_page_target(&main));
+    assert!(!is_avatar_overlay_page_target(&target(
+        "external",
+        "page",
+        "avatar-overlay",
+        "https://example.test/avatar-overlay",
+        Some("ws://external"),
+    )));
+}
+
+#[test]
+fn primary_target_selection_skips_v1_and_v2_overlay_candidates() {
+    let targets = vec![
+        target(
+            "v1-overlay",
+            "page",
+            "Codex",
+            "app://-/index.html?initialRoute=%2Favatar-overlay",
+            Some("ws://v1"),
+        ),
+        target(
+            "v2-overlay",
+            "page",
+            "Codex",
+            "app://-/index.html?initialRoute=/avatar-overlay",
+            Some("ws://v2"),
+        ),
+        target(
+            "main",
+            "page",
+            "Codex",
+            "app://-/index.html",
+            Some("ws://main"),
+        ),
+    ];
+
+    let selected = pick_injectable_codex_page_target(&targets).unwrap();
+
+    assert_eq!(selected.id, "main");
 }
 
 #[test]

@@ -25,6 +25,7 @@ import {
   Copy,
   Download,
   Edit3,
+  Gauge,
   GripVertical,
   Info,
   ExternalLink,
@@ -69,6 +70,8 @@ import {
   type ModelWindowRow,
 } from "./model-windows";
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
+
+const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
 
 type Status = "ok" | "failed" | "not_implemented" | "not_checked" | string;
 
@@ -157,6 +160,7 @@ type BackendSettings = {
   codexAppNativeMenuPlacement: boolean;
   codexAppNativeMenuLocalization: boolean;
   codexAppServiceTierControls: boolean;
+  codexAppPetRealMouseLook: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppStepwiseDirectSend: boolean;
   codexAppStepwiseBaseUrl: string;
@@ -170,6 +174,7 @@ type BackendSettings = {
   codexAppImageOverlayEnabled: boolean;
   codexAppImageOverlayPath: string;
   codexAppImageOverlayOpacity: number;
+  codexAppImageOverlayFitMode: ImageOverlayFitMode;
   codexGoalsEnabled: boolean;
   launchMode: LaunchMode;
   relayBaseUrl: string;
@@ -181,14 +186,11 @@ type BackendSettings = {
   relayContextConfigContents: string;
   activeRelayId: string;
   relayTestModel: string;
-  cliWrapperEnabled: boolean;
-  cliWrapperBaseUrl: string;
-  cliWrapperApiKey: string;
-  cliWrapperApiKeyEnv: string;
 };
 
 type ZedOpenStrategy = "addToFocusedWorkspace" | "reuseWindow" | "newWindow" | "default";
 type LaunchMode = "patch" | "relay";
+type ImageOverlayFitMode = "fill" | "fit" | "stretch" | "tile" | "center";
 
 export type RelayProfile = {
   id: string;
@@ -457,6 +459,28 @@ type EnvConflictsResult = CommandResult<{
   conflicts: EnvConflict[];
 }>;
 
+type RelayLatencyResult = CommandResult<{
+  latencyMs: number | null;
+  httpStatus: number | null;
+}>;
+
+type RelayEnvironmentResult = CommandResult<{
+  clashVergeTun: {
+    enabled: boolean;
+    configPath: string | null;
+  };
+  proxyEnvironment: {
+    variables: Array<{
+      name: string;
+      source: "process" | "user" | "system" | string;
+    }>;
+  };
+  codexEnvFile: {
+    exists: boolean;
+    path: string;
+  };
+}>;
+
 type RemoveEnvConflictsResult = CommandResult<{
   removed: Array<{
     name: string;
@@ -547,6 +571,7 @@ type AdItem = {
   title: string;
   description: string;
   url: string;
+  image?: string;
   highlights?: string[];
   expires_at?: string;
 };
@@ -633,7 +658,7 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "sessions" | "context" | "enhance" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "enhance" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
@@ -648,6 +673,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "maintenance", label: t("安装维护"), icon: Wrench },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
+  { id: "relayEnvironment", label: t("中转站环境配置检测"), icon: ShieldCheck },
 ];
 
 const defaultSettings: BackendSettings = {
@@ -680,6 +706,7 @@ const defaultSettings: BackendSettings = {
   codexAppNativeMenuPlacement: true,
   codexAppNativeMenuLocalization: true,
   codexAppServiceTierControls: false,
+  codexAppPetRealMouseLook: false,
   codexAppStepwiseEnabled: false,
   codexAppStepwiseDirectSend: false,
   codexAppStepwiseBaseUrl: "",
@@ -693,6 +720,7 @@ const defaultSettings: BackendSettings = {
   codexAppImageOverlayEnabled: false,
   codexAppImageOverlayPath: "",
   codexAppImageOverlayOpacity: 35,
+  codexAppImageOverlayFitMode: "fit",
   codexGoalsEnabled: false,
   launchMode: "patch",
   relayBaseUrl: "",
@@ -727,10 +755,6 @@ const defaultSettings: BackendSettings = {
   aggregateRelayProfiles: [],
   activeAggregateRelayId: "",
   relayTestModel: "gpt-5.4-mini",
-  cliWrapperEnabled: false,
-  cliWrapperBaseUrl: "",
-  cliWrapperApiKey: "",
-  cliWrapperApiKeyEnv: "CUSTOM_OPENAI_API_KEY",
 };
 
 export function App() {
@@ -749,6 +773,7 @@ export function App() {
   const [relay, setRelay] = useState<RelayResult | null>(null);
   const [relayFiles, setRelayFiles] = useState<RelayFilesResult | null>(null);
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
+  const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
   const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
@@ -758,6 +783,11 @@ export function App() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResult | null>(null);
   const [watcher, setWatcher] = useState<WatcherResult | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
+  const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
+    active: false,
+    percent: 0,
+    message: t("尚未运行安装包更新。"),
+  });
   const [ads, setAds] = useState<AdsResult | null>(null);
   const [scriptMarket, setScriptMarket] = useState<ScriptMarketResult | null>(null);
   const [launchForm, setLaunchForm] = useState({
@@ -778,7 +808,6 @@ export function App() {
     percent: 0,
     message: t("尚未运行插件市场修复。"),
   });
-  const [pluginMarketplacePrompt, setPluginMarketplacePrompt] = useState<PluginMarketplaceStatusResult | null>(null);
   const [remotePluginMarketplace, setRemotePluginMarketplace] = useState<RemotePluginMarketplaceResult | null>(null);
   const [remotePluginMarketplaceProgress, setRemotePluginMarketplaceProgress] = useState<TaskProgress>({
     active: false,
@@ -897,6 +926,15 @@ export function App() {
     if (result) {
       setEnvConflicts(result);
       if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("环境变量检测"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const refreshRelayEnvironment = async (silent = false) => {
+    const result = await run(() => call<RelayEnvironmentResult>("check_relay_environment"));
+    if (result) {
+      setRelayEnvironment(result);
+      if (!silent) showResultNotice(t("中转站环境配置检测"), result, { silentSuccess: true });
     }
     return result;
   };
@@ -1129,6 +1167,7 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshCcsProviders(true);
     }
+    if (next === "relayEnvironment") await refreshRelayEnvironment(true);
     if (next === "sessions") {
       await refreshSettings(true);
       await refreshLocalSessions(true);
@@ -1189,18 +1228,8 @@ export function App() {
     return result;
   };
 
-  const repairBackend = async () => {
-    const result = await run(() => call<SettingsResult>("repair_backend"));
-    if (result) {
-      setSettings(result);
-      setSettingsForm(normalizeSettings(result.settings));
-      showNotice(t("后端修复"), result.message, result.status);
-    }
-  };
-
   const repairPluginMarketplace = async () => {
     if (pluginMarketplaceProgress.active) return;
-    setPluginMarketplacePrompt(null);
     setPluginMarketplaceProgress({ active: true, percent: 8, message: t("正在检查本地插件市场…") });
     const progressTimer = window.setInterval(() => {
       setPluginMarketplaceProgress((current) => {
@@ -1236,12 +1265,6 @@ export function App() {
     } finally {
       window.clearInterval(progressTimer);
     }
-  };
-
-  const checkPluginMarketplacePrompt = async () => {
-    const result = await run(() => call<PluginMarketplaceStatusResult>("plugin_marketplace_status"));
-    if (result?.needsRepair) setPluginMarketplacePrompt(result);
-    return result;
   };
 
   const refreshRemotePluginMarketplace = async (silent = false) => {
@@ -1349,6 +1372,7 @@ export function App() {
   };
 
   const performUpdate = async () => {
+    if (updateInstallProgress.active) return;
     const release =
       update?.latestVersion && update.assetName && update.assetUrl
         ? {
@@ -1359,10 +1383,43 @@ export function App() {
             asset_url: update.assetUrl,
           }
         : null;
-    const result = await run(() => call<UpdateResult>("perform_update", { release }));
-    if (result) {
-      setUpdate(result);
-      showNotice(t("更新安装"), result.message, result.status);
+    setUpdateInstallProgress({
+      active: true,
+      percent: 8,
+      message: t("正在准备安装包下载…"),
+    });
+    const progressTimer = window.setInterval(() => {
+      setUpdateInstallProgress((current) => {
+        if (!current.active) return current;
+        const nextPercent = Math.min(92, current.percent + 10);
+        const message =
+          nextPercent < 32
+            ? t("正在获取 GitHub Release 信息…")
+            : nextPercent < 72
+              ? t("正在下载安装包…")
+              : t("正在启动安装包…");
+        return { ...current, percent: nextPercent, message };
+      });
+    }, 500);
+    try {
+      const result = await run(() => call<UpdateResult>("perform_update", { release }));
+      if (result) {
+        setUpdate(result);
+        setUpdateInstallProgress({
+          active: false,
+          percent: result.progress ?? 100,
+          message: result.message,
+        });
+        showNotice(t("更新安装"), result.message, result.status);
+      } else {
+        setUpdateInstallProgress({
+          active: false,
+          percent: 100,
+          message: t("安装包更新失败，请查看错误提示后重试。"),
+        });
+      }
+    } finally {
+      window.clearInterval(progressTimer);
     }
   };
 
@@ -1611,6 +1668,10 @@ export function App() {
     if (result) showNotice(t("供应商测试"), result.message, result.status);
   };
 
+  const measureRelayLatency = async (url: string) => {
+    return await run(() => call<RelayLatencyResult>("measure_relay_latency", { url }));
+  };
+
   const diagnoseRelayProfile = async (profile: RelayProfile) => {
     const result = await run(() => call<ProviderDoctorResult>("diagnose_relay_profile", { profile }));
     if (result) showNotice("Provider Doctor", result.message, result.status);
@@ -1724,7 +1785,6 @@ export function App() {
         launchMode: selectedSettings.launchMode,
         status: result.status,
       });
-      showNotice(t("供应商切换"), relayProfileModeSwitchedText(currentSelected), result.status);
     } finally {
       setRelaySwitching(false);
     }
@@ -1801,7 +1861,6 @@ export function App() {
       await refreshEnvConflicts(true);
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
-      await checkPluginMarketplacePrompt();
       await refreshRemotePluginMarketplace(true);
     })();
   }, []);
@@ -1847,9 +1906,7 @@ export function App() {
       refreshCurrent: () => navigate(route),
       launch,
       restart,
-      repairBackend,
       repairPluginMarketplace,
-      checkPluginMarketplacePrompt,
       refreshRemotePluginMarketplace,
       repairRemotePluginMarketplace,
       installEntrypoints,
@@ -1945,6 +2002,7 @@ export function App() {
       refreshRelay,
       refreshRelayFiles,
       refreshEnvConflicts,
+      refreshRelayEnvironment,
       removeEnvConflicts,
       refreshCcsProviders,
       importCcsProviders,
@@ -1970,6 +2028,7 @@ export function App() {
       deleteContextEntry,
       extractRelayCommonConfig,
       testRelayProfile,
+      measureRelayLatency,
       diagnoseRelayProfile,
       testStepwiseSettings,
       fetchRelayProfileModels,
@@ -1995,7 +2054,7 @@ export function App() {
       disableWatcher: () => watcherAction("disable_watcher"),
       toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
     }),
-    [route, launchForm, settingsForm, settings, removeOwnedData, update, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, ccsProviders],
+    [route, launchForm, settingsForm, settings, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders],
   );
   const hasUpdate = update?.updateAvailable === true;
 
@@ -2096,6 +2155,9 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "relayEnvironment" ? (
+            <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+          ) : null}
           {route === "sessions" ? (
             <SessionsScreen
               settings={settings}
@@ -2144,7 +2206,16 @@ export function App() {
               actions={actions}
             />
           ) : null}
-          {route === "about" ? <AboutScreen overview={overview} update={update} logs={logs} diagnostics={diagnostics} actions={actions} /> : null}
+          {route === "about" ? (
+            <AboutScreen
+              overview={overview}
+              update={update}
+              updateInstallProgress={updateInstallProgress}
+              logs={logs}
+              diagnostics={diagnostics}
+              actions={actions}
+            />
+          ) : null}
           {route === "settings" ? (
             <SettingsScreen settings={settings} theme={theme} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
           ) : null}
@@ -2170,14 +2241,6 @@ export function App() {
           }}
         />
       ) : null}
-      {pluginMarketplacePrompt ? (
-        <PluginMarketplacePromptDialog
-          progress={pluginMarketplaceProgress}
-          status={pluginMarketplacePrompt}
-          onClose={() => setPluginMarketplacePrompt(null)}
-          onRepair={() => void actions.repairPluginMarketplace()}
-        />
-      ) : null}
       {pendingProviderImport ? (
         <PendingProviderImportDialog
           request={pendingProviderImport}
@@ -2193,9 +2256,7 @@ type Actions = {
   refreshCurrent: () => Promise<void>;
   launch: () => Promise<void>;
   restart: () => Promise<void>;
-  repairBackend: () => Promise<void>;
   repairPluginMarketplace: () => Promise<void>;
-  checkPluginMarketplacePrompt: () => Promise<PluginMarketplaceStatusResult | null>;
   refreshRemotePluginMarketplace: (silent?: boolean) => Promise<RemotePluginMarketplaceResult | null>;
   repairRemotePluginMarketplace: () => Promise<void>;
   installEntrypoints: () => Promise<void>;
@@ -2219,6 +2280,7 @@ type Actions = {
   refreshRelay: () => Promise<void>;
   refreshRelayFiles: () => Promise<RelayFilesResult | null>;
   refreshEnvConflicts: (silent?: boolean) => Promise<EnvConflictsResult | null>;
+  refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
   removeEnvConflicts: (names: string[]) => Promise<void>;
   refreshCcsProviders: (silent?: boolean) => Promise<CcsProvidersResult | null>;
   importCcsProviders: () => Promise<void>;
@@ -2249,6 +2311,7 @@ type Actions = {
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
   extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
+  measureRelayLatency: (url: string) => Promise<RelayLatencyResult | null>;
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
@@ -2293,12 +2356,15 @@ function OverviewScreen({
                 <span className="eyebrow">{t("官方中转站")}</span>
                 <h2>JOJO Code</h2>
                 <p>
-                  {t("Codex++ 官方中转站，主打稳定接入和划算价格，支持 GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。")}
+                  {t("Codex++ 官方中转站，主打稳定接入和划算价格，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。")}
                 </p>
               </div>
             </div>
             <div className="jojocode-overview-side">
               <div className="jojocode-model-tags">
+                <span>GPT-5.6 全系列</span>
+                <span>Fable 5</span>
+                <span>Sonnet 5</span>
                 <span>GPT-5.5</span>
                 <span>GPT-5.4</span>
                 <span>Opus 4.8</span>
@@ -2345,9 +2411,6 @@ function OverviewScreen({
               <Wrench className="h-4 w-4" />
               {t("修复入口")}
             </Button>
-            <Button variant="secondary" onClick={() => void actions.repairBackend()}>
-              {t("修复后端")}
-            </Button>
             <Button disabled={pluginMarketplaceProgress.active} variant="secondary" onClick={() => void actions.repairPluginMarketplace()}>
               {pluginMarketplaceProgress.active ? t("正在修复…") : t("修复插件市场")}
             </Button>
@@ -2371,6 +2434,80 @@ function OverviewScreen({
         </CardContent>
       </Panel>
     </>
+  );
+}
+
+function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentResult | null; actions: Actions }) {
+  const proxyVariables = result?.proxyEnvironment.variables ?? [];
+  const proxyVariableLabels = proxyVariables.map((item) => {
+    const source = item.source === "user" ? t("用户环境") : item.source === "system" ? t("系统环境") : t("进程环境");
+    return tf("{0}（{1}）", [item.name, source]);
+  });
+  const checks = [
+    {
+      id: "clash-verge-tun",
+      title: t("Clash Verge Rev TUN 模式"),
+      passed: result ? !result.clashVergeTun.enabled : false,
+      detail: result
+        ? result.clashVergeTun.enabled
+          ? tf("检测到 TUN 模式已开启，请在 Clash Verge Rev 中关闭。配置：{0}", [result.clashVergeTun.configPath || t("未记录路径")])
+          : result.clashVergeTun.configPath
+            ? tf("TUN 模式已关闭。配置：{0}", [result.clashVergeTun.configPath])
+            : t("未发现 Clash Verge Rev 配置，按未开启处理。")
+        : t("等待检测。"),
+    },
+    {
+      id: "proxy-environment",
+      title: t("系统代理环境变量"),
+      passed: result ? proxyVariables.length === 0 : false,
+      detail: result
+        ? proxyVariables.length
+          ? tf("检测到代理环境变量：{0}。请清理后重新启动 Codex++。", [proxyVariableLabels.join(t("、"))])
+          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY 或 FTP_PROXY。")
+        : t("等待检测。"),
+    },
+    {
+      id: "codex-dotenv",
+      title: t("Codex .env 文件"),
+      passed: result ? !result.codexEnvFile.exists : false,
+      detail: result
+        ? result.codexEnvFile.exists
+          ? tf("检测到可能干扰供应商配置的 .env 文件：{0}", [result.codexEnvFile.path])
+          : tf("未发现 .env 文件：{0}", [result.codexEnvFile.path])
+        : t("等待检测。"),
+    },
+  ];
+  const allPassed = Boolean(result) && checks.every((check) => check.passed);
+
+  return (
+    <Panel>
+      <CardHead
+        title={t("中转站环境配置检测")}
+        detail={result ? (allPassed ? t("三项检测全部通过") : t("检测到需要处理的环境问题")) : t("正在读取本机环境")}
+      />
+      <CardContent>
+        <div className="relay-environment-checks">
+          {checks.map((check) => (
+            <div className={`relay-environment-check ${result ? (check.passed ? "ok" : "failed") : "pending"}`} key={check.id}>
+              <div className="relay-environment-check-icon">
+                {result ? (check.passed ? <CheckCircle2 className="h-5 w-5" /> : <ShieldAlert className="h-5 w-5" />) : <RefreshCw className="h-5 w-5" />}
+              </div>
+              <div className="relay-environment-check-copy">
+                <strong>{check.title}</strong>
+                <span>{check.detail}</span>
+              </div>
+              <Badge status={result ? (check.passed ? "ok" : "failed") : "not_checked"} />
+            </div>
+          ))}
+        </div>
+        <Toolbar>
+          <Button onClick={() => void actions.refreshRelayEnvironment()}>
+            <RefreshCw className="h-4 w-4" />
+            {t("重新检测")}
+          </Button>
+        </Toolbar>
+      </CardContent>
+    </Panel>
   );
 }
 
@@ -2603,6 +2740,11 @@ function EnhanceScreen({
   actions: Actions;
 }) {
   const setEnhanceFlag = (key: keyof BackendSettings, value: boolean) => onFormChange({ ...form, [key]: value });
+  const setPersistedEnhanceFlag = (key: keyof BackendSettings, value: boolean) => {
+    const next = { ...form, [key]: value };
+    onFormChange(next);
+    void actions.saveSettingsValue(next, true);
+  };
   const masterEnabled = form.enhancementsEnabled;
   const patchMode = form.launchMode === "patch";
   const remoteMarketplaceStatus = remotePluginMarketplace?.marketplaceRoot
@@ -2694,6 +2836,7 @@ function EnhanceScreen({
               <FeatureToggle title={t("Stepwise 直接发送")} detail={t("点击建议后自动发送；关闭时只填入输入框。")} checked={form.codexAppStepwiseDirectSend} disabled={!masterEnabled || !form.codexAppStepwiseEnabled} onChange={(value) => setEnhanceFlag("codexAppStepwiseDirectSend", value)} />
             </FeatureGroup>
             <FeatureGroup title={t("界面与启动")} detail={t("控制语言、启动速度和 Codex 原生界面调整。")}>
+              {isWindowsPlatform ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
               <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
               <FeatureToggle title={t("快速启动")} detail={t("默认关闭；无 VPN 时可开启，让 Statsig 初始化快速失败，减少启动时长。需重启 Codex 才生效。")} checked={form.codexAppFastStartup} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppFastStartup", value)} />
               <FeatureToggle title={t("原生菜单栏位置")} detail={t("把 Codex++ 菜单插入 Codex 顶部原生菜单栏。")} checked={form.codexAppNativeMenuPlacement} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeMenuPlacement", value)} />
@@ -3218,7 +3361,6 @@ function MaintenanceScreen({
           <Toolbar>
             <Button onClick={() => void actions.checkHealth()}>{t("检查")}</Button>
             <Button variant="secondary" onClick={() => void actions.repairShortcuts()}>{t("修复快捷方式")}</Button>
-            <Button variant="secondary" onClick={() => void actions.repairBackend()}>{t("修复后端")}</Button>
           </Toolbar>
         </CardContent>
       </Panel>
@@ -3307,12 +3449,14 @@ function MaintenanceScreen({
 function AboutScreen({
   overview,
   update,
+  updateInstallProgress,
   logs,
   diagnostics,
   actions,
 }: {
   overview: OverviewResult | null;
   update: UpdateResult | null;
+  updateInstallProgress: TaskProgress;
   logs: LogsResult | null;
   diagnostics: DiagnosticsResult | null;
   actions: Actions;
@@ -3357,9 +3501,12 @@ function AboutScreen({
             <Metric label={t("进度")} value={`${update?.progress ?? 0}%`} />
           </div>
           <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
+          <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
-            <Button variant="secondary" onClick={() => void actions.performUpdate()}>{t("下载并运行安装包")}</Button>
+            <Button disabled={updateInstallProgress.active} variant="secondary" onClick={() => void actions.performUpdate()}>
+              {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
+            </Button>
           </Toolbar>
         </CardContent>
       </Panel>
@@ -3399,35 +3546,6 @@ function SettingsScreen({
               value={form.relayTestModel}
               onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
               placeholder={t("例如 gpt-5.4-mini")}
-            />
-          </Field>
-          <label className="check-row">
-            <input
-              checked={form.cliWrapperEnabled}
-              onChange={(event) => onFormChange({ ...form, cliWrapperEnabled: event.currentTarget.checked })}
-              type="checkbox"
-            />
-            <span>{t("启用 Codex 命令包装器")}</span>
-          </label>
-          <div className="form-row">
-            <Field label={t("包装器 Base URL")}>
-              <Input
-                value={form.cliWrapperBaseUrl}
-                onChange={(event) => onFormChange({ ...form, cliWrapperBaseUrl: event.currentTarget.value })}
-              />
-            </Field>
-            <Field label={t("API Key 环境变量")}>
-              <Input
-                value={form.cliWrapperApiKeyEnv}
-                onChange={(event) => onFormChange({ ...form, cliWrapperApiKeyEnv: event.currentTarget.value })}
-              />
-            </Field>
-          </div>
-          <Field label="API Key">
-            <Input
-              type="password"
-              value={form.cliWrapperApiKey}
-              onChange={(event) => onFormChange({ ...form, cliWrapperApiKey: event.currentTarget.value })}
             />
           </Field>
           <div className="settings-block stepwise-settings-block">
@@ -3553,6 +3671,24 @@ function SettingsScreen({
                   })
                 }
               />
+            </Field>
+            <Field label={t("背景适配方式")}>
+              <select
+                className="select-input"
+                value={form.codexAppImageOverlayFitMode}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    codexAppImageOverlayFitMode: event.currentTarget.value as ImageOverlayFitMode,
+                  })
+                }
+              >
+                <option value="fill">{t("填充")}</option>
+                <option value="fit">{t("适应")}</option>
+                <option value="stretch">{t("拉伸")}</option>
+                <option value="tile">{t("平铺")}</option>
+                <option value="center">{t("居中")}</option>
+              </select>
             </Field>
           </div>
           <Toolbar>
@@ -3704,10 +3840,50 @@ function SortableRelayProfileCard({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: profile.id });
   const active = profile.id === form.activeRelayId;
+  const latencyTarget = relayProfileLatencyTarget(profile);
+  const [latency, setLatency] = useState<{ status: "idle" | "loading" | "ok" | "failed"; latencyMs: number | null }>({
+    status: latencyTarget ? "loading" : "idle",
+    latencyMs: null,
+  });
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
   };
+  const refreshLatency = async () => {
+    if (!latencyTarget) {
+      setLatency({ status: "idle", latencyMs: null });
+      return;
+    }
+    setLatency({ status: "loading", latencyMs: null });
+    const result = await actions.measureRelayLatency(latencyTarget);
+    setLatency(
+      result && isSuccessStatus(result.status) && result.latencyMs !== null
+        ? { status: "ok", latencyMs: result.latencyMs }
+        : { status: "failed", latencyMs: null },
+    );
+  };
+
+  useEffect(() => {
+    let active = true;
+    if (!latencyTarget) {
+      setLatency({ status: "idle", latencyMs: null });
+      return () => {
+        active = false;
+      };
+    }
+    setLatency({ status: "loading", latencyMs: null });
+    void actions.measureRelayLatency(latencyTarget).then((result) => {
+      if (!active) return;
+      setLatency(
+        result && isSuccessStatus(result.status) && result.latencyMs !== null
+          ? { status: "ok", latencyMs: result.latencyMs }
+          : { status: "failed", latencyMs: null },
+      );
+    });
+    return () => {
+      active = false;
+    };
+  }, [latencyTarget]);
 
   return (
     <div
@@ -3738,6 +3914,27 @@ function SortableRelayProfileCard({
         <strong>{profile.name || t("未命名供应商")}</strong>
         <small>{relayModeLabel(profile.relayMode)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
       </span>
+      <button
+        className={`relay-latency ${latency.status}`}
+        disabled={!latencyTarget || latency.status === "loading"}
+        onClick={(event) => {
+          event.stopPropagation();
+          void refreshLatency();
+        }}
+        title={latencyTarget ? t("重新检测延迟") : t("此供应商没有单一目标 URL")}
+        type="button"
+      >
+        <Gauge className="h-4 w-4" />
+        <span>
+          {latency.status === "loading"
+            ? "..."
+            : latency.status === "ok" && latency.latencyMs !== null
+              ? tf("{0} ms", [latency.latencyMs])
+              : latency.status === "failed"
+                ? t("不可用")
+                : "--"}
+        </span>
+      </button>
       <span className="relay-card-actions">
         <Button
           className={`relay-use-button ${active ? "active" : ""}`}
@@ -5065,45 +5262,6 @@ function ConfirmDialog({
   );
 }
 
-function PluginMarketplacePromptDialog({
-  status,
-  progress,
-  onRepair,
-  onClose,
-}: {
-  status: PluginMarketplaceStatusResult;
-  progress: TaskProgress;
-  onRepair: () => void;
-  onClose: () => void;
-}) {
-  return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal-card plugin-marketplace-modal">
-        <div className="modal-head">
-          <div>
-            <h2>{t("插件市场需要修复")}</h2>
-            <p>{t("当前 CODEX_HOME 未发现可用的完整插件市场，API Key 模式下可能出现插件安装后不可用。")}</p>
-          </div>
-          <button className="toast-close" onClick={onClose} type="button">×</button>
-        </div>
-        <div className="metric-list">
-          <Metric label="CODEX_HOME" value={status.codexHome} />
-          <Metric label={t("本地插件市场")} value={status.marketplaceRoot ?? t("未发现")} />
-          <Metric label={t("配置状态")} value={status.configRegistered ? t("已注册") : t("未注册")} />
-        </div>
-        <TaskProgressBox progress={progress} title={t("修复进度")} />
-        <Toolbar>
-          <Button disabled={progress.active} onClick={onRepair}>
-            <Download className="h-4 w-4" />
-            {progress.active ? t("正在修复…") : t("一键修复")}
-          </Button>
-          <Button disabled={progress.active} onClick={onClose} variant="secondary">{t("稍后处理")}</Button>
-        </Toolbar>
-      </div>
-    </div>
-  );
-}
-
 function PendingProviderImportDialog({
   request,
   onConfirm,
@@ -5142,12 +5300,12 @@ function PendingProviderImportDialog({
   );
 }
 
-function TaskProgressBox({ progress, title }: { progress: TaskProgress; title: string }) {
+function TaskProgressBox({ progress, title, completedTitle = t("上次修复结果") }: { progress: TaskProgress; title: string; completedTitle?: string }) {
   if (!progress.active && progress.percent <= 0) return null;
   return (
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
-        <strong>{progress.active ? title : t("上次修复结果")}</strong>
+        <strong>{progress.active ? title : completedTitle}</strong>
         <span>{progress.percent}%</span>
       </div>
       <div
@@ -5261,6 +5419,7 @@ function AdGrid({ ads, empty, actions }: { ads: AdItem[]; empty: string; actions
     <div className="ad-grid">
       {ads.map((ad) => (
         <button className="ad-card" key={ad.id || `${ad.type}-${ad.title}`} onClick={() => void actions.openExternalUrl(ad.url)} type="button">
+          {ad.image ? <img alt="" className="ad-image" src={ad.image} /> : null}
           <div>
             <strong>{ad.title}</strong>
             <p>{ad.description}</p>
@@ -5296,6 +5455,7 @@ function routeSubtitle(route: Route) {
   const subtitles: Record<Route, string> = {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
+    relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP、Skills、Plugins"),
     enhance: t("会话删除、导出、项目移动和脚本能力"),
@@ -5304,7 +5464,7 @@ function routeSubtitle(route: Route) {
     recommendations: t("赞助商推荐与普通推荐"),
     maintenance: t("入口安装、修复、Watcher 与手动启动"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
-    settings: t("主题、命令包装器和启动参数"),
+    settings: t("主题和启动参数"),
   };
   return subtitles[route];
 }
@@ -6023,6 +6183,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     computerUseGuardEnabled: settings.computerUseGuardEnabled === true,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
+    codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
     codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 6, 0, 6),
     codexAppStepwiseMaxInputChars: clampNumber(settings.codexAppStepwiseMaxInputChars || 6000, 1000, 24000),
     codexAppStepwiseMaxOutputTokens: clampNumber(settings.codexAppStepwiseMaxOutputTokens || 500, 100, 4000),
@@ -6037,6 +6198,12 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function normalizeImageOverlayFitMode(value: string | undefined): ImageOverlayFitMode {
+  return value === "fill" || value === "fit" || value === "stretch" || value === "tile" || value === "center"
+    ? value
+    : "fit";
 }
 
 function codexExtraArgsToInput(args: string[] | undefined) {
@@ -6203,6 +6370,15 @@ function relayProfileConfigBrief(profile: RelayProfile): string {
   return profile.baseUrl || t("未填写 URL");
 }
 
+function relayProfileLatencyTarget(profile: RelayProfile): string {
+  if (isAggregateRelayProfile(profile)) return "";
+  if (profile.relayMode === "official" && !profile.officialMixApiKey) return "";
+  if (profile.protocol === "chatCompletions") {
+    return (profile.upstreamBaseUrl || profile.baseUrl).trim();
+  }
+  return profile.baseUrl.trim();
+}
+
 function relayProfileModeHelp(profile: RelayProfile): string {
   if (isAggregateRelayProfile(profile)) {
     return t("聚合供应商只保存成员和策略配置，成员来自已有 API 供应商；切为当前后会通过本地协议代理轮转请求。");
@@ -6248,12 +6424,6 @@ function relayProfileSwitchCommand(profile: RelayProfile): "clear_relay_injectio
   if (profile.relayMode === "official" && !profile.officialMixApiKey) return "clear_relay_injection";
   if (profile.configContents.trim()) return "apply_relay_injection";
   return profile.officialMixApiKey ? "apply_relay_injection" : "clear_relay_injection";
-}
-function relayProfileModeSwitchedText(profile: RelayProfile): string {
-  if (isAggregateRelayProfile(profile)) return t("已切换到聚合供应商；真实对话会按所选策略轮转成员。");
-  if (profile.relayMode === "pureApi") return t("已按此供应商切换到纯 API；Codex增强已设为完整增强。");
-  if (profile.officialMixApiKey) return t("已按此供应商使用官方登录，并混入 API Key；Codex增强已设为兼容增强。");
-  return t("已按此供应商切回官方登录；Codex增强已设为兼容增强。");
 }
 
 function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
