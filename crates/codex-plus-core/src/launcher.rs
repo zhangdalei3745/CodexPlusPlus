@@ -1494,8 +1494,17 @@ async fn handle_chat_completions_proxy_connection(
     if upstream.is_stream && is_success {
         write_http_stream_headers(stream, &status, &content_type).await?;
         let mut bytes_stream = upstream.response.unwrap().bytes_stream();
+        let mut adapter = crate::protocol_proxy::ChatCompletionStreamAdapter::default();
         while let Some(chunk) = bytes_stream.next().await {
-            stream.write_all(&chunk?).await?;
+            let chunk_bytes = chunk?;
+            let output_bytes = adapter.push_bytes(&chunk_bytes);
+            if !output_bytes.is_empty() {
+                stream.write_all(&output_bytes).await?;
+            }
+        }
+        let final_bytes = adapter.finish();
+        if !final_bytes.is_empty() {
+            stream.write_all(&final_bytes).await?;
         }
         log_helper_response(
             "helper.chat_completions_proxy_stream_ok",

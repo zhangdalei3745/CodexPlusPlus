@@ -428,6 +428,265 @@ pub async fn send_upstream_request_with_header_timeout(
         .context("上游请求失败")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatStreamInlineThinkMode {
+    Detecting,
+    Reasoning,
+    Text,
+}
+
+pub struct ChatCompletionStreamAdapter {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    mode: ChatStreamInlineThinkMode,
+    think_buffer: String,
+    last_id: String,
+    last_model: String,
+    last_created: u64,
+}
+
+impl Default for ChatCompletionStreamAdapter {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            utf8_remainder: Vec::new(),
+            mode: ChatStreamInlineThinkMode::Detecting,
+            think_buffer: String::new(),
+            last_id: "chatcmpl-synthetic".to_string(),
+            last_model: "synthetic".to_string(),
+            last_created: 0,
+        }
+    }
+}
+
+impl ChatCompletionStreamAdapter {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
+
+        let mut output = String::new();
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            self.handle_block(&block, &mut output);
+        }
+        output.into_bytes()
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.utf8_remainder.is_empty() {
+            self.buffer.push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.utf8_remainder.clear();
+        }
+
+        let mut output = String::new();
+        if !self.buffer.trim().is_empty() {
+            let block = std::mem::take(&mut self.buffer);
+            self.handle_block(&block, &mut output);
+        }
+
+        if !self.think_buffer.is_empty() {
+            let flushed = std::mem::take(&mut self.think_buffer);
+            match self.mode {
+                ChatStreamInlineThinkMode::Detecting | ChatStreamInlineThinkMode::Reasoning => {
+                    let clean = strip_leading_think_open_tag(&flushed).unwrap_or(flushed);
+                    if !clean.is_empty() {
+                        if let Some(json_block) = self.create_synthetic_delta_block("reasoning_content", &clean) {
+                            output.push_str(&json_block);
+                        }
+                    }
+                }
+                ChatStreamInlineThinkMode::Text => {
+                    if let Some(json_block) = self.create_synthetic_delta_block("content", &flushed) {
+                        output.push_str(&json_block);
+                    }
+                }
+            }
+        }
+
+        output.into_bytes()
+    }
+
+    fn handle_block(&mut self, block: &str, output: &mut String) {
+        let mut event_name: Option<String> = None;
+        let mut data_parts = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = Some(event.trim().to_string());
+            }
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data.to_string());
+            }
+        }
+
+        if data_parts.is_empty() {
+            output.push_str(block);
+            output.push_str("\n\n");
+            return;
+        }
+
+        let data = data_parts.join("\n");
+        let trimmed_data = data.trim();
+        if trimmed_data == "[DONE]" {
+            if let Some(event) = &event_name {
+                output.push_str(&format!("event: {event}\n"));
+            }
+            output.push_str("data: [DONE]\n\n");
+            return;
+        }
+
+        let mut chunk: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => {
+                output.push_str(block);
+                output.push_str("\n\n");
+                return;
+            }
+        };
+
+        if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+            self.last_id = id.to_string();
+        }
+        if let Some(model) = chunk.get("model").and_then(Value::as_str) {
+            self.last_model = model.to_string();
+        }
+        if let Some(created) = chunk.get("created").and_then(Value::as_u64) {
+            self.last_created = created;
+        }
+
+        if let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) {
+            if let Some(choice) = choices.first_mut() {
+                if let Some(delta) = choice.get_mut("delta") {
+                    let has_reasoning_content = delta.get("reasoning_content").is_some();
+                    
+                    if has_reasoning_content {
+                        // Already has reasoning_content, pass through
+                    } else if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                        let content_str = content.to_string();
+                        if !content_str.is_empty() {
+                            let (reasoning_delta, content_delta) = self.process_content_delta(&content_str);
+                            
+                            if !reasoning_delta.is_empty() && !content_delta.is_empty() {
+                                delta["reasoning_content"] = Value::String(reasoning_delta);
+                                delta.as_object_mut().unwrap().remove("content");
+                                self.write_chunk(output, event_name.as_deref(), &chunk);
+                                
+                                let mut second_chunk = chunk.clone();
+                                if let Some(second_choice) = second_chunk.get_mut("choices").and_then(Value::as_array_mut).and_then(|arr| arr.first_mut()) {
+                                    if let Some(second_delta) = second_choice.get_mut("delta") {
+                                        second_delta.as_object_mut().unwrap().remove("reasoning_content");
+                                        second_delta["content"] = Value::String(content_delta);
+                                    }
+                                }
+                                self.write_chunk(output, event_name.as_deref(), &second_chunk);
+                                return;
+                            } else if !reasoning_delta.is_empty() {
+                                delta["reasoning_content"] = Value::String(reasoning_delta);
+                                delta.as_object_mut().unwrap().remove("content");
+                            } else if !content_delta.is_empty() {
+                                delta["content"] = Value::String(content_delta);
+                            } else {
+                                delta.as_object_mut().unwrap().remove("content");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.write_chunk(output, event_name.as_deref(), &chunk);
+    }
+
+    fn write_chunk(&self, output: &mut String, event_name: Option<&str>, chunk: &Value) {
+        if let Some(event) = event_name {
+            output.push_str(&format!("event: {event}\n"));
+        }
+        output.push_str("data: ");
+        output.push_str(&serde_json::to_string(chunk).unwrap_or_default());
+        output.push_str("\n\n");
+    }
+
+    fn process_content_delta(&mut self, content: &str) -> (String, String) {
+        let mut reasoning_delta = String::new();
+        let mut content_delta = String::new();
+
+        match self.mode {
+            ChatStreamInlineThinkMode::Text => {
+                content_delta = content.to_string();
+            }
+            ChatStreamInlineThinkMode::Detecting => {
+                self.think_buffer.push_str(content);
+                match leading_think_prefix_decision(&self.think_buffer) {
+                    ThinkPrefixDecision::NeedMore => {}
+                    ThinkPrefixDecision::Text => {
+                        self.mode = ChatStreamInlineThinkMode::Text;
+                        content_delta = std::mem::take(&mut self.think_buffer);
+                    }
+                    ThinkPrefixDecision::Reasoning => {
+                        self.mode = ChatStreamInlineThinkMode::Reasoning;
+                        if let Some(stripped) = strip_leading_think_open_tag(&self.think_buffer) {
+                            self.think_buffer = stripped;
+                        }
+                        let (r, c) = self.process_reasoning_buffer();
+                        reasoning_delta = r;
+                        content_delta = c;
+                    }
+                }
+            }
+            ChatStreamInlineThinkMode::Reasoning => {
+                self.think_buffer.push_str(content);
+                let (r, c) = self.process_reasoning_buffer();
+                reasoning_delta = r;
+                content_delta = c;
+            }
+        }
+
+        (reasoning_delta, content_delta)
+    }
+
+    fn process_reasoning_buffer(&mut self) -> (String, String) {
+        let mut reasoning_delta = String::new();
+        let mut content_delta = String::new();
+
+        if self.think_buffer.contains(THINK_CLOSE_TAG) {
+            if let Some(index) = self.think_buffer.find(THINK_CLOSE_TAG) {
+                let reasoning = self.think_buffer[..index].to_string();
+                let answer = self.think_buffer[index + THINK_CLOSE_TAG.len()..].to_string();
+                
+                reasoning_delta = reasoning;
+                content_delta = strip_think_answer_separator(&answer).to_string();
+                
+                self.think_buffer.clear();
+                self.mode = ChatStreamInlineThinkMode::Text;
+            }
+        } else {
+            let send_len = find_safe_split_index(&self.think_buffer, 8);
+            if send_len > 0 {
+                reasoning_delta = self.think_buffer[..send_len].to_string();
+                self.think_buffer.drain(..send_len);
+            }
+        }
+
+        (reasoning_delta, content_delta)
+    }
+
+    fn create_synthetic_delta_block(&self, field: &str, value: &str) -> Option<String> {
+        let chunk = json!({
+            "id": self.last_id,
+            "object": "chat.completion.chunk",
+            "created": self.last_created,
+            "model": self.last_model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    field: value
+                }
+            }]
+        });
+        Some(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()))
+    }
+}
+
 pub struct ChatSseToResponsesConverter {
     buffer: String,
     utf8_remainder: Vec<u8>,
@@ -629,6 +888,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
+        let resolved_api_key = crate::relay_config::relay_profile_api_key(&relay);
         let (endpoint, upstream_body, wire_api) =
             upstream_request_parts(&relay, request_json.clone())?;
         let has_more_candidates = attempt + 1 < relay_count;
@@ -653,7 +913,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     original_user_agent,
                 ))?,
                 &endpoint,
-                relay.api_key.trim(),
+                resolved_api_key.trim(),
                 relay.protocol,
                 is_stream,
                 &upstream_body,
@@ -757,7 +1017,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                 original_user_agent,
                             ))?,
                             &endpoint,
-                            relay.api_key.trim(),
+                            resolved_api_key.trim(),
                             relay.protocol,
                             is_stream,
                             &upstream_body,
@@ -872,11 +1132,14 @@ pub async fn open_models_proxy_request_with_settings(
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
     validate_upstream(&relay)?;
 
+    let resolved_base_url = crate::relay_config::relay_profile_base_url(&relay);
+    let resolved_api_key = crate::relay_config::relay_profile_api_key(&relay);
+
     if relay.protocol == RelayProtocol::Joycode {
-        let base = if relay.base_url.trim().is_empty() {
+        let base = if resolved_base_url.trim().is_empty() {
             "http://joycode-api-saas.jd.com"
         } else {
-            relay.base_url.trim()
+            resolved_base_url.trim()
         };
         let endpoint = format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'));
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -892,7 +1155,7 @@ pub async fn open_models_proxy_request_with_settings(
             &relay.user_agent,
             original_user_agent,
         ))?;
-        let resolved_key = get_latest_ptkey(relay.api_key.trim());
+        let resolved_key = get_latest_ptkey(resolved_api_key.trim());
         let upstream = client
             .post(&endpoint)
             .header("ptKey", &resolved_key)
@@ -966,7 +1229,7 @@ pub async fn open_models_proxy_request_with_settings(
         });
     }
 
-    let endpoint = models_url(&relay.base_url);
+    let endpoint = models_url(&resolved_base_url);
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "protocol_proxy.models_request",
         json!({
@@ -982,7 +1245,7 @@ pub async fn open_models_proxy_request_with_settings(
             original_user_agent,
         ))?
         .get(endpoint)
-        .bearer_auth(relay.api_key.trim()),
+        .bearer_auth(resolved_api_key.trim()),
     )
     .await?;
     let status_code = upstream.status().as_u16();
@@ -1009,19 +1272,25 @@ pub async fn open_chat_completions_proxy_request(
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
+    let resolved_base_url = crate::relay_config::relay_profile_base_url(&relay);
+    let resolved_api_key = crate::relay_config::relay_profile_api_key(&relay);
+
     if relay.protocol != RelayProtocol::ChatCompletions && relay.protocol != RelayProtocol::Joycode {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
     }
-    if relay.protocol != RelayProtocol::Joycode && relay.base_url.trim().is_empty() {
+    if relay.protocol != RelayProtocol::Joycode && resolved_base_url.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if resolved_api_key.trim().is_empty() {
         anyhow::bail!("Chat Completions 上游 Key 不能为空");
     }
 
     let mut request_json: Value = serde_json::from_str(body)?;
     if relay.protocol == RelayProtocol::Joycode {
-        request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+        let req_model = request_json.get("model").and_then(Value::as_str).unwrap_or("");
+        if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
+            request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+        }
     }
 
     let is_stream = request_json
@@ -1036,7 +1305,7 @@ pub async fn open_chat_completions_proxy_request(
     .post(chat_completions_url_for_relay(&relay));
     
     if relay.protocol == RelayProtocol::Joycode {
-        let resolved_key = get_latest_ptkey(relay.api_key.trim());
+        let resolved_key = get_latest_ptkey(resolved_api_key.trim());
         request_builder = request_builder
             .header("ptKey", &resolved_key)
             .header("loginType", get_logintype_for_ptkey(&resolved_key))
@@ -1044,7 +1313,7 @@ pub async fn open_chat_completions_proxy_request(
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
     } else {
         request_builder = request_builder
-            .bearer_auth(relay.api_key.trim())
+            .bearer_auth(resolved_api_key.trim())
             .header(reqwest::header::CONTENT_TYPE, "application/json");
     }
 
@@ -1087,23 +1356,24 @@ fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     request_json: Value,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+    let resolved_base_url = crate::relay_config::relay_profile_base_url(relay);
     match relay.protocol {
         RelayProtocol::Responses => Ok((
-            responses_url(&relay.base_url),
+            responses_url(&resolved_base_url),
             request_json,
             UpstreamWireApi::Responses,
         )),
         RelayProtocol::ChatCompletions => Ok((
-            chat_completions_url(&relay.base_url),
+            chat_completions_url(&resolved_base_url),
             responses_to_chat_completions(request_json)?,
             UpstreamWireApi::ChatCompletions,
         )),
         RelayProtocol::Joycode => {
             init_model_lists_from_profile(relay);
-            let base = if relay.base_url.trim().is_empty() {
+            let base = if resolved_base_url.trim().is_empty() {
                 "http://joycode-api-saas.jd.com"
             } else {
-                relay.base_url.trim()
+                resolved_base_url.trim()
             };
             let mut req_body = responses_to_chat_completions(request_json)?;
             req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
@@ -1183,10 +1453,12 @@ fn upstream_request_builder(
 }
 
 fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()> {
-    if relay.protocol != RelayProtocol::Joycode && relay.base_url.trim().is_empty() {
+    let resolved_base_url = crate::relay_config::relay_profile_base_url(relay);
+    let resolved_api_key = crate::relay_config::relay_profile_api_key(relay);
+    if relay.protocol != RelayProtocol::Joycode && resolved_base_url.trim().is_empty() {
         anyhow::bail!("上游 Base URL 不能为空");
     }
-    if relay.api_key.trim().is_empty() {
+    if resolved_api_key.trim().is_empty() {
         anyhow::bail!("上游 Key 不能为空");
     }
     Ok(())
@@ -1278,11 +1550,12 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 }
 
 pub fn chat_completions_url_for_relay(relay: &crate::settings::RelayProfile) -> String {
+    let resolved_base_url = crate::relay_config::relay_profile_base_url(relay);
     if relay.protocol == RelayProtocol::Joycode {
-        let base = if relay.base_url.trim().is_empty() {
+        let base = if resolved_base_url.trim().is_empty() {
             "http://joycode-api-saas.jd.com"
         } else {
-            relay.base_url.trim()
+            resolved_base_url.trim()
         };
         if base.starts_with("https://") {
             sign_joycode_gateway_url(base, "chat_completions")
@@ -1290,7 +1563,7 @@ pub fn chat_completions_url_for_relay(relay: &crate::settings::RelayProfile) -> 
             format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
         }
     } else {
-        chat_completions_url(&relay.base_url)
+        chat_completions_url(&resolved_base_url)
     }
 }
 
@@ -1575,7 +1848,10 @@ impl ChatSseState {
                     ThinkPrefixDecision::NeedMore => {}
                     ThinkPrefixDecision::Reasoning => {
                         self.inline_think.mode = InlineThinkMode::Reasoning;
-                        self.drain_complete_inline_think_into(output);
+                        if let Some(stripped) = strip_leading_think_open_tag(&self.inline_think.buffer) {
+                            self.inline_think.buffer = stripped;
+                        }
+                        self.process_inline_reasoning_buffer_into(output);
                     }
                     ThinkPrefixDecision::Text => {
                         self.inline_think.mode = InlineThinkMode::Text;
@@ -1587,23 +1863,39 @@ impl ChatSseState {
             }
             InlineThinkMode::Reasoning => {
                 self.inline_think.buffer.push_str(delta);
-                self.drain_complete_inline_think_into(output);
+                self.process_inline_reasoning_buffer_into(output);
             }
         }
     }
 
-    fn drain_complete_inline_think_into(&mut self, output: &mut String) {
-        let Some((reasoning, answer)) = split_leading_think_block(&self.inline_think.buffer) else {
-            return;
-        };
-        self.inline_think.mode = InlineThinkMode::Text;
-        self.inline_think.buffer.clear();
-        if !reasoning.is_empty() {
-            self.push_reasoning_delta_into(&reasoning, output);
-            self.finalize_reasoning_into(output);
-        }
-        if !answer.is_empty() {
-            self.push_text_delta_into(&answer, output);
+    fn process_inline_reasoning_buffer_into(&mut self, output: &mut String) {
+        if self.inline_think.buffer.contains(THINK_CLOSE_TAG) {
+            if let Some(index) = self.inline_think.buffer.find(THINK_CLOSE_TAG) {
+                let reasoning = self.inline_think.buffer[..index].to_string();
+                let answer = self.inline_think.buffer[index + THINK_CLOSE_TAG.len()..].to_string();
+                
+                if !reasoning.is_empty() {
+                    self.push_reasoning_delta_into(&reasoning, output);
+                }
+                self.finalize_reasoning_into(output);
+                
+                let answer_clean = strip_think_answer_separator(&answer).to_string();
+                if !answer_clean.is_empty() {
+                    self.push_text_delta_into(&answer_clean, output);
+                }
+                
+                self.inline_think.buffer.clear();
+                self.inline_think.mode = InlineThinkMode::Text;
+            }
+        } else {
+            let send_len = find_safe_split_index(&self.inline_think.buffer, 8);
+            if send_len > 0 {
+                let reasoning = self.inline_think.buffer[..send_len].to_string();
+                if !reasoning.is_empty() {
+                    self.push_reasoning_delta_into(&reasoning, output);
+                }
+                self.inline_think.buffer.drain(..send_len);
+            }
         }
     }
 
@@ -1621,16 +1913,25 @@ impl ChatSseState {
             InlineThinkMode::Reasoning => {
                 let buffered = std::mem::take(&mut self.inline_think.buffer);
                 self.inline_think.mode = InlineThinkMode::Text;
-                if let Some((reasoning, answer)) = split_leading_think_block(&buffered) {
-                    if !reasoning.is_empty() {
-                        self.push_reasoning_delta_into(&reasoning, output);
+                
+                if buffered.contains(THINK_CLOSE_TAG) {
+                    if let Some(index) = buffered.find(THINK_CLOSE_TAG) {
+                        let reasoning = buffered[..index].to_string();
+                        let answer = buffered[index + THINK_CLOSE_TAG.len()..].to_string();
+                        
+                        if !reasoning.is_empty() {
+                            self.push_reasoning_delta_into(&reasoning, output);
+                        }
                         self.finalize_reasoning_into(output);
+                        
+                        let answer_clean = strip_think_answer_separator(&answer).to_string();
+                        if !answer_clean.is_empty() {
+                            self.push_text_delta_into(&answer_clean, output);
+                        }
+                        return;
                     }
-                    if !answer.is_empty() {
-                        self.push_text_delta_into(&answer, output);
-                    }
-                    return;
                 }
+                
                 let reasoning = strip_leading_think_open_tag(&buffered).unwrap_or(buffered);
                 if !reasoning.is_empty() {
                     self.push_reasoning_delta_into(&reasoning, output);
@@ -2142,6 +2443,17 @@ fn leading_think_prefix_decision(buffer: &str) -> ThinkPrefixDecision {
         return ThinkPrefixDecision::NeedMore;
     }
     ThinkPrefixDecision::Text
+}
+
+fn find_safe_split_index(s: &str, min_keep_bytes: usize) -> usize {
+    if s.len() <= min_keep_bytes {
+        return 0;
+    }
+    let mut split = s.len() - min_keep_bytes;
+    while split > 0 && !s.is_char_boundary(split) {
+        split -= 1;
+    }
+    split
 }
 
 fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
