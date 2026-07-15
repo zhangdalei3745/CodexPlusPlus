@@ -94,7 +94,7 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
                 "id": format!("relay-profile:{}", profile.id),
                 "type": "relay_profile_model_list",
                 "name": provider_name,
-                "base_url": profile.base_url.trim(),
+                "base_url": crate::relay_config::relay_profile_base_url(profile),
                 "status": "ok",
                 "models": model_count,
                 "responses_api": responses_api_status("unknown", "", "")
@@ -514,13 +514,14 @@ pub async fn fetch_relay_profile_model_ids(
     profile: &RelayProfile,
 ) -> anyhow::Result<(Vec<String>, String)> {
     if profile.protocol == RelayProtocol::Joycode {
-        let base = if profile.base_url.trim().is_empty() {
-            "http://joycode-api-saas.jd.com"
+        let base_resolved = crate::relay_config::relay_profile_base_url(profile);
+        let base = if base_resolved.trim().is_empty() {
+            "http://joycode-api-saas.jd.com".to_string()
         } else {
-            profile.base_url.trim()
+            base_resolved
         };
         let endpoint = if base.starts_with("https://") {
-            crate::protocol_proxy::sign_joycode_gateway_url(base, "joycode_modelList")
+            crate::protocol_proxy::sign_joycode_gateway_url(&base, "joycode_modelList")
         } else {
             format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'))
         };
@@ -591,11 +592,7 @@ pub async fn fetch_relay_profile_model_ids(
         } else {
             profile.name.trim().to_string()
         },
-        base_url: if profile.upstream_base_url.trim().is_empty() {
-            profile.base_url.trim().to_string()
-        } else {
-            profile.upstream_base_url.trim().to_string()
-        },
+        base_url: crate::relay_config::relay_profile_base_url(profile),
         api_key: profile.api_key.trim().to_string(),
     };
     if source.base_url.is_empty() {
