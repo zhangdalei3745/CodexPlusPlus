@@ -1905,6 +1905,22 @@ fn runtime_evaluate_result_is_true(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
+static CUSTOM_BRIDGE_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<crate::routes::BridgeContext>>> = std::sync::OnceLock::new();
+
+pub fn register_custom_bridge_context(ctx: crate::routes::BridgeContext) {
+    let mutex = CUSTOM_BRIDGE_CONTEXT.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(ctx);
+    }
+}
+
+pub fn get_registered_bridge_context() -> Option<crate::routes::BridgeContext> {
+    CUSTOM_BRIDGE_CONTEXT
+        .get()
+        .and_then(|mutex| mutex.lock().ok())
+        .and_then(|guard| guard.clone())
+}
+
 async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     let targets = crate::cdp::list_targets(debug_port).await?;
     let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
@@ -1914,10 +1930,12 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
     let settings = SettingsStore::default().load().unwrap_or_default();
     let script = crate::assets::injection_script_with_settings(helper_port, &settings);
-    let ctx = crate::routes::BridgeContext::core(Arc::new(crate::routes::CoreRuntimeService::new(
-        debug_port,
-        StatusStore::default(),
-    )));
+    let ctx = get_registered_bridge_context().unwrap_or_else(|| {
+        crate::routes::BridgeContext::core(Arc::new(crate::routes::CoreRuntimeService::new(
+            debug_port,
+            StatusStore::default(),
+        )))
+    });
     crate::bridge::install_bridge(
         websocket_url,
         crate::bridge::BRIDGE_BINDING_NAME,
