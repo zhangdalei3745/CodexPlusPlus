@@ -38,8 +38,17 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
+    let hooks = LauncherHooks::default();
+
+    // Register rich bridge context immediately on startup so watchdog re-injections always have access to it
+    let ctx = BridgeContext::core_with_data_and_app_dir(
+        hooks.runtime.clone(),
+        hooks.data.clone(),
+        codex_plus_core::codex_sqlite::default_codex_home_dir(),
+    );
+    codex_plus_core::launcher::register_custom_bridge_context(ctx);
+
     if helper_only {
-        let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
         std::future::pending::<()>().await;
         hooks.shutdown_helper(options.helper_port).await;
@@ -52,7 +61,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async {
         let _ = notify_manager_when_update_available().await;
     });
-    let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
