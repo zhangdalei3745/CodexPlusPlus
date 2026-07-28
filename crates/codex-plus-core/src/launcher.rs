@@ -700,7 +700,39 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
 
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
-            let cleanup_policy = if is_macos_app_running(app_dir).await {
+            let mut app_running = is_macos_app_running(app_dir).await;
+            if app_running {
+                // If it is running, check if the debugging port is responding.
+                // If the debugging port is NOT responding, it means ChatGPT was launched without debugging enabled!
+                // We should quit/terminate it so that we can launch it with debugging enabled.
+                if crate::cdp::list_targets(debug_port).await.is_err() {
+                    let app_name = app_dir
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("Codex");
+                    let script = format!(
+                        r#"tell application "{}" to quit"#,
+                        app_name.replace('"', "\\\"")
+                    );
+                    let _ = Command::new("osascript")
+                        .arg("-e")
+                        .arg(script)
+                        .output()
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    app_running = is_macos_app_running(app_dir).await;
+                    if app_running {
+                        let process_name = if app_name == "ChatGPT" { "ChatGPT" } else { "Codex" };
+                        let _ = Command::new("killall")
+                            .arg(process_name)
+                            .output()
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    app_running = false;
+                }
+            }
+            let cleanup_policy = if app_running {
                 MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
             } else {
                 MacosCleanupPolicy::QuitIfNotPreviouslyRunning

@@ -3630,7 +3630,15 @@
   }
 
   function sessionRefFromRow(row) {
-    const href = row.getAttribute("href") || row.querySelector("a")?.getAttribute("href") || "";
+    let href = row.getAttribute("href") || "";
+    if (!href) {
+      const aTags = Array.from(row.querySelectorAll("a"));
+      const chatLink = aTags.find((a) => {
+        const h = a.getAttribute("href") || "";
+        return h && !a.getAttribute("target") && (h.includes("/c/") || h.includes("/conversation") || h.includes("/thread/") || h.includes("/g/"));
+      });
+      href = (chatLink || aTags[0])?.getAttribute("href") || "";
+    }
     const idMatch = href.match(/(?:session|conversation|thread)[=/:-]([A-Za-z0-9_.-]+)/i) || href.match(/([A-Za-z0-9_-]{8,})$/);
     const codexThreadId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
     const fallbackId = row.getAttribute("data-session-id") || row.getAttribute("data-testid") || "";

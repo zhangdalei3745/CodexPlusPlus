@@ -1352,7 +1352,7 @@ fn is_transient_upstream_error(status_code: u16) -> bool {
     matches!(status_code, 429 | 502 | 503 | 504)
 }
 
-fn upstream_request_parts(
+pub fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     request_json: Value,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
@@ -1375,8 +1375,30 @@ fn upstream_request_parts(
             } else {
                 resolved_base_url.trim()
             };
-            let mut req_body = responses_to_chat_completions(request_json)?;
-            req_body["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+            let mut req_body = responses_to_chat_completions(request_json.clone())?;
+            let req_model = req_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.joycode_request_model",
+                json!({
+                    "raw_model": request_json.get("model"),
+                    "req_model": req_model,
+                    "relay_model": relay.model,
+                    "relay_test_model": relay.test_model,
+                }),
+            );
+            if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
+                let fallback_model = if relay.model.trim().is_empty() {
+                    "Kimi-K2.6".to_string()
+                } else {
+                    relay.model.trim().to_string()
+                };
+                req_body["model"] = Value::String(fallback_model);
+            }
             if let Some(m) = req_body.get_mut("model") {
                 if let Some(m_str) = m.as_str() {
                     let trimmed = m_str.trim();

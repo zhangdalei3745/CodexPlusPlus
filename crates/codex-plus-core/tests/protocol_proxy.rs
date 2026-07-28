@@ -1841,3 +1841,28 @@ fn test_fragmented_json_unauthorized_error_intercept() {
     assert!(response_str.contains("Joycode 认证已失效，请访问 https://joycode.jd.com/portal/login 并重新登录。"));
 }
 
+#[tokio::test]
+async fn test_joycode_preserves_selected_model() {
+    let relay = RelayProfile {
+        id: "test-joycode".to_string(),
+        name: "Test Joycode".to_string(),
+        model: "Kimi-K2.6".to_string(),
+        upstream_base_url: "http://joycode-api-saas.jd.com".to_string(),
+        protocol: RelayProtocol::Joycode,
+        ..Default::default()
+    };
+
+    let req_json = json!({
+        "model": "Claude-Opus-4.8-hq",
+        "input": "hello"
+    });
+
+    let (endpoint, req_body, wire_api) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
+
+    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeAnthropic);
+    assert!(endpoint.contains("/api/saas/anthropic/v1/messages"));
+    assert_eq!(req_body["model"], "Claude-Opus-4.8-hq");
+}
+
+

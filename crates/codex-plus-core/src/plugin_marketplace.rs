@@ -715,10 +715,17 @@ fn normalize_windows_extended_path(value: &str) -> String {
 
 fn windows_extended_path(path: &Path) -> String {
     let value = path.to_string_lossy();
-    if value.starts_with(r"\\?\") {
+    #[cfg(target_os = "windows")]
+    {
+        if value.starts_with(r"\\?\") {
+            value.into_owned()
+        } else {
+            format!(r"\\?\{value}")
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         value.into_owned()
-    } else {
-        format!(r"\\?\{value}")
     }
 }
 
