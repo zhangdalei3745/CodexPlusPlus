@@ -1876,7 +1876,7 @@ async fn test_joycode_official_openai_model_passthrough() {
         ..Default::default()
     };
 
-    // 1. Official OpenAI model gpt-4o should passthrough via standard ChatCompletions
+    // 1. Official OpenAI model gpt-4o should passthrough via /v1/responses
     let req_json = json!({
         "model": "gpt-4o",
         "input": "hello"
@@ -1884,8 +1884,8 @@ async fn test_joycode_official_openai_model_passthrough() {
     let (endpoint, req_body, wire_api) =
         codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
 
-    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
-    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/v1/chat/completions");
+    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::Responses);
+    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/v1/responses");
     assert_eq!(req_body["model"], "gpt-4o");
     assert!(req_body.get("client").is_none(), "Official OpenAI model should not inject Joycode client header");
 
@@ -1897,8 +1897,8 @@ async fn test_joycode_official_openai_model_passthrough() {
     let (endpoint_o3, req_body_o3, wire_api_o3) =
         codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json_o3).unwrap();
 
-    assert_eq!(wire_api_o3, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
-    assert_eq!(endpoint_o3, "http://joycode-api-saas.jd.com/v1/chat/completions");
+    assert_eq!(wire_api_o3, codex_plus_core::protocol_proxy::UpstreamWireApi::Responses);
+    assert_eq!(endpoint_o3, "http://joycode-api-saas.jd.com/v1/responses");
     assert_eq!(req_body_o3["model"], "o3-mini");
     assert!(req_body_o3.get("client").is_none());
 

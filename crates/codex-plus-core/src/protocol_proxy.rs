@@ -1375,39 +1375,53 @@ pub fn upstream_request_parts(
             } else {
                 resolved_base_url.trim()
             };
-            let mut req_body = responses_to_chat_completions(request_json.clone())?;
-            let req_model = req_body
+
+            let req_model = request_json
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
                 .to_string();
+
+            let model_name = if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
+                if relay.model.trim().is_empty() {
+                    "Kimi-K2.6".to_string()
+                } else {
+                    relay.model.trim().to_string()
+                }
+            } else {
+                req_model
+            };
+
+            let is_joycode = is_joycode_model(&model_name, relay);
+
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "protocol_proxy.joycode_request_model",
                 json!({
                     "raw_model": request_json.get("model"),
-                    "req_model": req_model,
+                    "model_name": model_name,
+                    "is_joycode_model": is_joycode,
                     "relay_model": relay.model,
                     "relay_test_model": relay.test_model,
                 }),
             );
-            if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
-                let fallback_model = if relay.model.trim().is_empty() {
-                    "Kimi-K2.6".to_string()
-                } else {
-                    relay.model.trim().to_string()
-                };
-                req_body["model"] = Value::String(fallback_model);
-            }
 
-            let current_model = req_body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            if !is_joycode {
+                // 不包含在 Joycode 供应商模型列表中，判定为官方 OpenAI 模型
+                // 走 /v1/responses 接口原样透传，只需替换请求地址为官方/上游地址
+                let endpoint = responses_url(base);
+                let mut passthrough_body = request_json;
+                passthrough_body["model"] = Value::String(model_name);
+                Ok((
+                    endpoint,
+                    passthrough_body,
+                    UpstreamWireApi::Responses,
+                ))
+            } else {
+                // 包含在 Joycode 供应商模型列表中，使用 Joycode 专属协议与网关接口
+                let mut req_body = responses_to_chat_completions(request_json)?;
+                req_body["model"] = Value::String(model_name);
 
-            if !is_official_openai_model(&current_model) {
                 if let Some(m) = req_body.get_mut("model") {
                     if let Some(m_str) = m.as_str() {
                         let trimmed = m_str.trim();
@@ -1419,56 +1433,37 @@ pub fn upstream_request_parts(
                         }
                     }
                 }
-            }
 
-            let model_name = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
+                let final_model = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
 
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "protocol_proxy.joycode_request_model",
-                json!({
-                    "raw_model": request_json.get("model"),
-                    "req_model": req_model,
-                    "final_model": model_name,
-                    "is_official_openai": is_official_openai_model(model_name),
-                    "relay_model": relay.model,
-                    "relay_test_model": relay.test_model,
-                }),
-            );
-
-            if is_official_openai_model(model_name) {
-                let endpoint = chat_completions_url(base);
-                Ok((
-                    endpoint,
-                    req_body,
-                    UpstreamWireApi::ChatCompletions,
-                ))
-            } else if is_anthropic_model(model_name) {
-                let mut anthropic_req = openai_to_anthropic_request(req_body);
-                anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
-                anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
-                let endpoint = if base.starts_with("https://") {
-                    sign_joycode_gateway_url(base, "anthropic_completions")
+                if is_anthropic_model(final_model) {
+                    let mut anthropic_req = openai_to_anthropic_request(req_body);
+                    anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
+                    anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
+                    let endpoint = if base.starts_with("https://") {
+                        sign_joycode_gateway_url(base, "anthropic_completions")
+                    } else {
+                        format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/'))
+                    };
+                    Ok((
+                        endpoint,
+                        anthropic_req,
+                        UpstreamWireApi::JoycodeAnthropic,
+                    ))
                 } else {
-                    format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/'))
-                };
-                Ok((
-                    endpoint,
-                    anthropic_req,
-                    UpstreamWireApi::JoycodeAnthropic,
-                ))
-            } else {
-                req_body["client"] = Value::String("JoyCodeIDE".to_string());
-                req_body["clientVersion"] = Value::String("3.8.61".to_string());
-                let endpoint = if base.starts_with("https://") {
-                    sign_joycode_gateway_url(base, "chat_completions")
-                } else {
-                    format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
-                };
-                Ok((
-                    endpoint,
-                    req_body,
-                    UpstreamWireApi::ChatCompletions,
-                ))
+                    req_body["client"] = Value::String("JoyCodeIDE".to_string());
+                    req_body["clientVersion"] = Value::String("3.8.61".to_string());
+                    let endpoint = if base.starts_with("https://") {
+                        sign_joycode_gateway_url(base, "chat_completions")
+                    } else {
+                        format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+                    };
+                    Ok((
+                        endpoint,
+                        req_body,
+                        UpstreamWireApi::ChatCompletions,
+                    ))
+                }
             }
         }
     }
@@ -4868,31 +4863,41 @@ pub fn is_anthropic_model(model_id: &str) -> bool {
     model_id.to_lowercase().contains("claude")
 }
 
-pub fn is_official_openai_model(model_id: &str) -> bool {
-    let m = model_id.trim().to_lowercase();
-    if m.is_empty() {
-        return false;
+pub fn is_joycode_model(model_id: &str, profile: &crate::settings::RelayProfile) -> bool {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return true;
     }
-    if m.contains("-sol")
-        || m.contains("-hq")
-        || m.starts_with("kimi")
-        || m.contains("claude")
-        || m == "joycode"
-        || m == "custom"
-        || m.starts_with("gpt-5")
-    {
-        return false;
+    let lower = trimmed.to_lowercase();
+
+    if is_joycode_model_registered(trimmed) || is_joycode_model_registered(&format!("{trimmed}-hq")) {
+        return true;
     }
 
-    m.starts_with("gpt-4")
-        || m.starts_with("gpt-3.5")
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("chatgpt-4o")
-        || m.starts_with("dall-e")
-        || m.starts_with("text-embedding")
-        || m.starts_with("tts-")
-        || m.starts_with("whisper-")
+    let profile_model = profile.model.trim();
+    if !profile_model.is_empty() && (profile_model.eq_ignore_ascii_case(trimmed) || format!("{profile_model}-hq").eq_ignore_ascii_case(trimmed)) {
+        return true;
+    }
+
+    for part in profile.model_list.split(['\r', '\n', ',']) {
+        let p = part.trim();
+        if !p.is_empty() && (p.eq_ignore_ascii_case(trimmed) || format!("{p}-hq").eq_ignore_ascii_case(trimmed)) {
+            return true;
+        }
+    }
+
+    if lower.contains("kimi")
+        || lower.contains("claude")
+        || lower.contains("-sol")
+        || lower.contains("-hq")
+        || lower == "joycode"
+        || lower == "custom"
+        || lower.starts_with("gpt-5")
+    {
+        return true;
+    }
+
+    false
 }
 
 pub fn clean_and_convert_image_url(url_str: &str) -> String {
