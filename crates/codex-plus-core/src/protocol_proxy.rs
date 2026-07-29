@@ -1399,19 +1399,50 @@ pub fn upstream_request_parts(
                 };
                 req_body["model"] = Value::String(fallback_model);
             }
-            if let Some(m) = req_body.get_mut("model") {
-                if let Some(m_str) = m.as_str() {
-                    let trimmed = m_str.trim();
-                    if !trimmed.ends_with("-hq") {
-                        let hq_version = format!("{}-hq", trimmed);
-                        if is_joycode_model_registered(&hq_version) {
-                            *m = Value::String(hq_version);
+
+            let current_model = req_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            if !is_official_openai_model(&current_model) {
+                if let Some(m) = req_body.get_mut("model") {
+                    if let Some(m_str) = m.as_str() {
+                        let trimmed = m_str.trim();
+                        if !trimmed.ends_with("-hq") {
+                            let hq_version = format!("{}-hq", trimmed);
+                            if is_joycode_model_registered(&hq_version) {
+                                *m = Value::String(hq_version);
+                            }
                         }
                     }
                 }
             }
+
             let model_name = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
-            if is_anthropic_model(model_name) {
+
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.joycode_request_model",
+                json!({
+                    "raw_model": request_json.get("model"),
+                    "req_model": req_model,
+                    "final_model": model_name,
+                    "is_official_openai": is_official_openai_model(model_name),
+                    "relay_model": relay.model,
+                    "relay_test_model": relay.test_model,
+                }),
+            );
+
+            if is_official_openai_model(model_name) {
+                let endpoint = chat_completions_url(base);
+                Ok((
+                    endpoint,
+                    req_body,
+                    UpstreamWireApi::ChatCompletions,
+                ))
+            } else if is_anthropic_model(model_name) {
                 let mut anthropic_req = openai_to_anthropic_request(req_body);
                 anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
                 anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
@@ -4835,6 +4866,33 @@ pub fn is_anthropic_model(model_id: &str) -> bool {
         }
     }
     model_id.to_lowercase().contains("claude")
+}
+
+pub fn is_official_openai_model(model_id: &str) -> bool {
+    let m = model_id.trim().to_lowercase();
+    if m.is_empty() {
+        return false;
+    }
+    if m.contains("-sol")
+        || m.contains("-hq")
+        || m.starts_with("kimi")
+        || m.contains("claude")
+        || m == "joycode"
+        || m == "custom"
+        || m.starts_with("gpt-5")
+    {
+        return false;
+    }
+
+    m.starts_with("gpt-4")
+        || m.starts_with("gpt-3.5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("chatgpt-4o")
+        || m.starts_with("dall-e")
+        || m.starts_with("text-embedding")
+        || m.starts_with("tts-")
+        || m.starts_with("whisper-")
 }
 
 pub fn clean_and_convert_image_url(url_str: &str) -> String {

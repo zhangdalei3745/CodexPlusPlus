@@ -1865,4 +1865,54 @@ async fn test_joycode_preserves_selected_model() {
     assert_eq!(req_body["model"], "Claude-Opus-4.8-hq");
 }
 
+#[tokio::test]
+async fn test_joycode_official_openai_model_passthrough() {
+    let relay = RelayProfile {
+        id: "test-joycode".to_string(),
+        name: "Test Joycode".to_string(),
+        model: "Kimi-K2.6".to_string(),
+        upstream_base_url: "http://joycode-api-saas.jd.com".to_string(),
+        protocol: RelayProtocol::Joycode,
+        ..Default::default()
+    };
+
+    // 1. Official OpenAI model gpt-4o should passthrough via standard ChatCompletions
+    let req_json = json!({
+        "model": "gpt-4o",
+        "input": "hello"
+    });
+    let (endpoint, req_body, wire_api) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
+
+    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
+    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/v1/chat/completions");
+    assert_eq!(req_body["model"], "gpt-4o");
+    assert!(req_body.get("client").is_none(), "Official OpenAI model should not inject Joycode client header");
+
+    // 2. Official OpenAI model o3-mini
+    let req_json_o3 = json!({
+        "model": "o3-mini",
+        "input": "hello"
+    });
+    let (endpoint_o3, req_body_o3, wire_api_o3) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json_o3).unwrap();
+
+    assert_eq!(wire_api_o3, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
+    assert_eq!(endpoint_o3, "http://joycode-api-saas.jd.com/v1/chat/completions");
+    assert_eq!(req_body_o3["model"], "o3-mini");
+    assert!(req_body_o3.get("client").is_none());
+
+    // 3. Joycode custom model Kimi-K2.6 should use Joycode gateway API
+    let req_json_kimi = json!({
+        "model": "Kimi-K2.6",
+        "input": "hello"
+    });
+    let (endpoint_kimi, req_body_kimi, _) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json_kimi).unwrap();
+
+    assert!(endpoint_kimi.contains("/api/saas/openai/v2/chat/completions"));
+    assert_eq!(req_body_kimi["model"], "Kimi-K2.6");
+    assert_eq!(req_body_kimi["client"], "JoyCodeIDE");
+}
+
 
