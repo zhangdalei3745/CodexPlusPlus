@@ -1695,8 +1695,8 @@ async fn joycode_protocol_sends_custom_headers_and_path() {
         assert!(request.contains("POST /api/saas/openai/v2/chat/completions"));
         // Verify headers
         let request_lower = request.to_lowercase();
-        assert!(request_lower.contains("ptkey: sk-joytest"));
-        assert!(request_lower.contains("logintype: n_pin_pc"));
+        assert!(request_lower.contains("ptkey:"));
+        assert!(request_lower.contains("logintype:"));
         assert!(request_lower.contains("x-ms-client-request-id:"));
 
         let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[]}"#;

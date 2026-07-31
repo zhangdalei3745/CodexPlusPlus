@@ -315,9 +315,9 @@ model = "gpt-5-mini"
     assert!(!updated.contains(r#"model_provider = "custom1""#));
     assert!(!updated.contains("[model_providers.custom1]"));
     assert!(!updated.contains("[profiles.default]"));
-    assert!(updated.contains(r#"model_provider = "custom""#));
-    assert!(updated.contains("[model_providers.custom]"));
-    assert!(updated.contains(r#"name = "custom""#));
+    assert!(updated.contains(r#"model_provider = "openai""#));
+    assert!(updated.contains("[model_providers.openai]"));
+    assert!(updated.contains(r#"name = "openai""#));
     assert!(updated.contains(r#"wire_api = "responses""#));
     assert!(updated.contains("requires_openai_auth = true"));
     assert!(updated.contains(r#"base_url = "https://relay.example.test/v1""#));
@@ -507,12 +507,14 @@ fn apply_pure_api_config_switches_auth_json_and_writes_provider_token() {
     assert!(result.configured);
     assert!(!config.contains(r#"model = "gpt-5""#));
     assert_eq!(
-        auth,
-        serde_json::json!({"OPENAI_API_KEY":"sk-test-redacted"})
+        auth["auth_mode"], "chatgpt"
     );
-    assert!(config.contains(r#"model_provider = "custom""#));
-    assert!(config.contains("[model_providers.custom]"));
-    assert!(config.contains(r#"name = "custom""#));
+    assert_eq!(
+        auth["OPENAI_API_KEY"], "sk-test-redacted"
+    );
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains("[model_providers.openai]"));
+    assert!(config.contains(r#"name = "openai""#));
     assert!(config.contains(r#"wire_api = "responses""#));
     assert!(config.contains("requires_openai_auth = true"));
     assert!(config.contains(r#"base_url = "http://192.168.188.245:3001/v1""#));
@@ -1242,17 +1244,17 @@ fn backfill_relay_profile_restores_template_provider_id_from_stable_live_config(
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
-        r#"model_provider = "custom"
+        r#"model_provider = "openai"
 
-[model_providers.custom]
-name = "custom"
+[model_providers.openai]
+name = "openai"
 wire_api = "responses"
 requires_openai_auth = true
 base_url = "https://new.example/v1"
 experimental_bearer_token = "sk-new"
 
 [profiles.default]
-model_provider = "custom"
+model_provider = "openai"
 "#,
     )
     .unwrap();
@@ -1415,8 +1417,8 @@ model = "gpt-5-mini"
     )
     .unwrap();
     let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    let provider_index = updated.find(r#"model_provider = "custom""#).unwrap();
-    let codexpp_index = updated.find("[model_providers.custom]").unwrap();
+    let provider_index = updated.find(r#"model_provider = "openai""#).unwrap();
+    let codexpp_index = updated.find("[model_providers.openai]").unwrap();
 
     assert!(provider_index < codexpp_index);
     assert!(!updated.contains("[profiles.default]"));
@@ -1444,8 +1446,8 @@ base_url = "https://old.example.test/v1"
     .unwrap();
     let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
 
-    assert!(updated.contains(r#"model_provider = "custom""#));
-    assert!(updated.contains("[model_providers.custom]"));
+    assert!(updated.contains(r#"model_provider = "openai""#));
+    assert!(updated.contains("[model_providers.openai]"));
     assert!(!updated.contains("[model_providers.CodexPP]"));
 }
 
@@ -2286,8 +2288,8 @@ base_url = "https://relay.example/v1"
     assert!(auth.get("tokens").is_none());
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(!config.contains("experimental_bearer_token"));
-    assert!(config.contains(r#"model_provider = "custom""#));
-    assert!(config.contains("[model_providers.custom]"));
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains("[model_providers.openai]"));
 }
 
 #[test]
@@ -2310,7 +2312,7 @@ experimental_bearer_token = "sk-live"
         base_url: "https://relay.example/v1".to_string(),
         api_key: "sk-new".to_string(),
         relay_mode: RelayMode::PureApi,
-        config_contents: r#"[model_providers.custom]
+        config_contents: r#"[model_providers.openai]
 experimental_bearer_token = "sk-new"
 "#
         .to_string(),
@@ -2322,9 +2324,9 @@ experimental_bearer_token = "sk-new"
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"model = "qwen3-coder""#));
-    assert!(config.contains(r#"model_provider = "custom""#));
-    assert!(config.contains("[model_providers.custom]"));
-    assert!(config.contains(r#"name = "custom""#));
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains("[model_providers.openai]"));
+    assert!(config.contains(r#"name = "openai""#));
     assert!(config.contains(r#"wire_api = "responses""#));
     assert!(config.contains("requires_openai_auth = true"));
     assert!(config.contains(r#"base_url = "https://relay.example/v1""#));
@@ -2677,8 +2679,8 @@ base_url = "http://192.168.188.245:3001/v1"
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"model = "gpt-5.5""#));
-    assert!(config.contains(r#"model_provider = "custom""#));
-    assert!(config.contains("[model_providers.custom]"));
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains("[model_providers.openai]"));
     assert!(config.contains(r#"base_url = "http://192.168.188.245:3001/v1""#));
 }
 
@@ -2872,9 +2874,9 @@ experimental_bearer_token = "sk-new"
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"model = "gpt-5.4""#));
-    assert!(config.contains(r#"model_provider = "custom""#));
-    assert!(config.contains("[model_providers.custom]"));
-    assert!(config.contains(r#"name = "custom""#));
+    assert!(config.contains(r#"model_provider = "openai""#));
+    assert!(config.contains("[model_providers.openai]"));
+    assert!(config.contains(r#"name = "openai""#));
     assert!(config.contains(r#"base_url = "https://max2.jojocode.com/v1""#));
     assert!(config.contains(r#"wire_api = "responses""#));
     assert!(config.contains("requires_openai_auth = true"));

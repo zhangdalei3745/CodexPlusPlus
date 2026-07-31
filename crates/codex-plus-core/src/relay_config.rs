@@ -8,8 +8,8 @@ use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
 
-const RELAY_PROVIDER: &str = "custom";
-const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
+const RELAY_PROVIDER: &str = "openai";
+const LEGACY_RELAY_PROVIDERS: &[&str] = &["custom", "CodexPlusPlus", "CodexPP"];
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
@@ -257,9 +257,17 @@ pub fn apply_relay_config_to_home_with_protocol(
     }
     let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
     let updated = upsert_model_provider_config("", &codex_base_url, bearer_token)?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
+    let auth_path = home.join("auth.json");
+    let mut auth_val = if let Ok(contents) = std::fs::read_to_string(&auth_path) {
+        serde_json::from_str::<Value>(&contents).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !auth_val.is_object() {
+        auth_val = json!({});
+    }
+    auth_val["OPENAI_API_KEY"] = Value::String(bearer_token.to_string());
+    let auth_contents = serde_json::to_string_pretty(&auth_val)?;
     let backup_path =
         write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()), false)?;
     let status = relay_config_status_from_home(home);
@@ -482,9 +490,17 @@ pub fn apply_pure_api_config_to_home_with_protocol(
     }
     let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
     let updated = upsert_model_provider_config("", &codex_base_url, bearer_token)?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
+    let auth_path = home.join("auth.json");
+    let mut auth_val = if let Ok(contents) = std::fs::read_to_string(&auth_path) {
+        serde_json::from_str::<Value>(&contents).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !auth_val.is_object() {
+        auth_val = json!({});
+    }
+    auth_val["OPENAI_API_KEY"] = Value::String(bearer_token.to_string());
+    let auth_contents = serde_json::to_string_pretty(&auth_val)?;
     let backup_path =
         write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()), false)?;
     let status = relay_config_status_from_home(home);
