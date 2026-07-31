@@ -837,33 +837,44 @@ fn count_sqlite_updates(
         return Ok(0);
     }
     let db = Connection::open(path)?;
+    let mut total: usize = 0;
+
     let columns = table_columns(&db, "threads")?;
-    if !columns.contains("model_provider") {
-        return Ok(0);
-    }
-    let mut total: usize = db.query_row(
-        "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
-        [target_provider],
-        |row| row.get::<_, i64>(0),
-    )? as usize;
-    if columns.contains("has_user_event") {
-        for thread_id in user_event_thread_ids {
-            total += db.query_row(
-                "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
-                [thread_id],
-                |row| row.get::<_, i64>(0),
-            )? as usize;
+    if columns.contains("model_provider") {
+        total += db.query_row(
+            "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
+            [target_provider],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        if columns.contains("has_user_event") {
+            for thread_id in user_event_thread_ids {
+                total += db.query_row(
+                    "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
+                    [thread_id],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+            }
+        }
+        if columns.contains("cwd") {
+            for (thread_id, cwd) in cwd_by_thread_id {
+                total += db.query_row(
+                    "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2",
+                    (thread_id, cwd),
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
+            }
         }
     }
-    if columns.contains("cwd") {
-        for (thread_id, cwd) in cwd_by_thread_id {
-            total += db.query_row(
-                "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2",
-                (thread_id, cwd),
-                |row| row.get::<_, i64>(0),
-            )? as usize;
-        }
+
+    let catalog_columns = table_columns(&db, "local_thread_catalog").unwrap_or_default();
+    if catalog_columns.contains("model_provider") {
+        total += db.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE COALESCE(model_provider, '') <> ?1",
+            [target_provider],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
     }
+
     Ok(total)
 }
 
@@ -896,31 +907,45 @@ fn apply_sqlite_update(
     }
     let mut db = Connection::open(path)?;
     let columns = table_columns(&db, "threads")?;
-    if !columns.contains("model_provider") {
+    let catalog_columns = table_columns(&db, "local_thread_catalog")?;
+
+    if !columns.contains("model_provider") && !catalog_columns.contains("model_provider") {
         return Ok(SqliteUpdateCounts::default());
     }
+
     let tx = db.transaction()?;
     let mut counts = SqliteUpdateCounts::default();
-    counts.provider_rows = tx.execute(
-        "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-        [target_provider],
-    )?;
-    if columns.contains("has_user_event") {
-        for thread_id in user_event_thread_ids {
-            counts.user_event_rows += tx.execute(
-                "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
-                [thread_id],
-            )?;
+
+    if columns.contains("model_provider") {
+        counts.provider_rows += tx.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+            [target_provider],
+        )?;
+        if columns.contains("has_user_event") {
+            for thread_id in user_event_thread_ids {
+                counts.user_event_rows += tx.execute(
+                    "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
+                    [thread_id],
+                )?;
+            }
+        }
+        if columns.contains("cwd") {
+            for (thread_id, cwd) in cwd_by_thread_id {
+                counts.cwd_rows += tx.execute(
+                    "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
+                    (cwd, thread_id),
+                )?;
+            }
         }
     }
-    if columns.contains("cwd") {
-        for (thread_id, cwd) in cwd_by_thread_id {
-            counts.cwd_rows += tx.execute(
-                "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
-                (cwd, thread_id),
-            )?;
-        }
+
+    if catalog_columns.contains("model_provider") {
+        counts.provider_rows += tx.execute(
+            "UPDATE local_thread_catalog SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+            [target_provider],
+        )?;
     }
+
     tx.commit()?;
     Ok(counts)
 }
