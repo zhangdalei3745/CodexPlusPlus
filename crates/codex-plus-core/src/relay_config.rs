@@ -8,7 +8,7 @@ use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
 
-const RELAY_PROVIDER: &str = "openai";
+const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["custom", "CodexPlusPlus", "CodexPP"];
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
