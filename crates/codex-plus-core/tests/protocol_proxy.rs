@@ -2,10 +2,12 @@ use codex_plus_core::protocol_proxy::{
     ChatSseToResponsesConverter, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_completions_url_for_relay,
     chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path,
-    is_models_proxy_path, is_responses_proxy_path, models_url, open_chat_completions_proxy_request,
+    is_joycode_model, is_joycode_responses_model, is_models_proxy_path, is_responses_proxy_path,
+    models_url, open_chat_completions_proxy_request,
     open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings, responses_error_from_upstream,
-    responses_to_chat_completions, send_upstream_request_with_header_timeout,
+    register_joycode_model_metadata, responses_to_chat_completions,
+    send_upstream_request_with_header_timeout,
     upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
 };
 use codex_plus_core::settings::{
@@ -1866,53 +1868,151 @@ async fn test_joycode_preserves_selected_model() {
 }
 
 #[tokio::test]
-async fn test_joycode_official_openai_model_passthrough() {
+async fn test_joycode_gpt_5_6_sol_uses_joycode_responses_api() {
     let relay = RelayProfile {
         id: "test-joycode".to_string(),
         name: "Test Joycode".to_string(),
-        model: "Kimi-K2.6".to_string(),
+        model: "gpt-5.6".to_string(),
+        model_list: "gpt-5.6\nKimi-K2.6".to_string(),
         upstream_base_url: "http://joycode-api-saas.jd.com".to_string(),
         protocol: RelayProtocol::Joycode,
         ..Default::default()
     };
 
-    // 1. Official OpenAI model gpt-4o should passthrough via /v1/responses
     let req_json = json!({
-        "model": "gpt-4o",
+        "model": "gpt-5.6",
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+    let (endpoint, req_body, wire_api) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
+
+    assert_eq!(
+        wire_api,
+        codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeResponses
+    );
+    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/api/saas/openai/v1/responses");
+    assert_eq!(req_body["model"], "gpt-5.6");
+    assert_eq!(req_body["input"][0]["content"], "hello");
+    assert_eq!(req_body["client"], "JoyCodeIDE");
+    assert_eq!(req_body["clientVersion"], "3.8.61");
+    assert!(req_body.get("messages").is_none());
+    assert!(is_joycode_responses_model("gpt-5.6"));
+    assert!(is_joycode_responses_model("gpt-5.6-sol"));
+}
+
+#[tokio::test]
+async fn test_joycode_gpt_model_does_not_use_official_openai_route() {
+    let relay = RelayProfile {
+        id: "test-joycode".to_string(),
+        model: "gpt-5.5".to_string(),
+        model_list: "gpt-5.5".to_string(),
+        upstream_base_url: "http://joycode-api-saas.jd.com".to_string(),
+        protocol: RelayProtocol::Joycode,
+        ..Default::default()
+    };
+
+    let req_json = json!({
+        "model": "gpt-5.5",
         "input": "hello"
     });
     let (endpoint, req_body, wire_api) =
         codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
 
-    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::Responses);
-    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/v1/responses");
-    assert_eq!(req_body["model"], "gpt-4o");
-    assert!(req_body.get("client").is_none(), "Official OpenAI model should not inject Joycode client header");
-
-    // 2. Official OpenAI model o3-mini
-    let req_json_o3 = json!({
-        "model": "o3-mini",
-        "input": "hello"
-    });
-    let (endpoint_o3, req_body_o3, wire_api_o3) =
-        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json_o3).unwrap();
-
-    assert_eq!(wire_api_o3, codex_plus_core::protocol_proxy::UpstreamWireApi::Responses);
-    assert_eq!(endpoint_o3, "http://joycode-api-saas.jd.com/v1/responses");
-    assert_eq!(req_body_o3["model"], "o3-mini");
-    assert!(req_body_o3.get("client").is_none());
-
-    // 3. Joycode custom model Kimi-K2.6 should use Joycode gateway API
-    let req_json_kimi = json!({
-        "model": "Kimi-K2.6",
-        "input": "hello"
-    });
-    let (endpoint_kimi, req_body_kimi, _) =
-        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json_kimi).unwrap();
-
-    assert!(endpoint_kimi.contains("/api/saas/openai/v2/chat/completions"));
-    assert_eq!(req_body_kimi["model"], "Kimi-K2.6");
-    assert_eq!(req_body_kimi["client"], "JoyCodeIDE");
+    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
+    assert!(endpoint.contains("/api/saas/openai/v2/chat/completions"));
+    assert_eq!(req_body["model"], "gpt-5.5");
+    assert_eq!(req_body["client"], "JoyCodeIDE");
 }
 
+#[test]
+fn joycode_model_routing_treats_profile_models_as_joycode_models() {
+    let relay = RelayProfile {
+        model: "Kimi-K2.6".to_string(),
+        model_list: "Kimi-K2.6\ngpt-5.5\no3-mini\ncustom-jd-model".to_string(),
+        protocol: RelayProtocol::Joycode,
+        ..Default::default()
+    };
 
+    assert!(is_joycode_model("gpt-5.5", &relay));
+    assert!(is_joycode_model("o3-mini", &relay));
+    assert!(is_joycode_model("Kimi-K2.6", &relay));
+    assert!(is_joycode_model("custom-jd-model", &relay));
+}
+
+#[test]
+fn joycode_model_metadata_registers_openai_responses_adapter() {
+    let model_id = register_joycode_model_metadata(&json!({
+        "chatApiModel": "gpt-native-from-metadata",
+        "extJson": {"adapterType": "openai-response"}
+    }));
+
+    assert_eq!(model_id.as_deref(), Some("gpt-native-from-metadata"));
+    assert!(is_joycode_responses_model("gpt-native-from-metadata"));
+}
+
+#[test]
+fn joycode_responses_model_name_is_preserved_and_recognized() {
+    assert!(is_joycode_responses_model("GPT-5.6 Sol"));
+
+    let relay = RelayProfile {
+        protocol: RelayProtocol::Joycode,
+        upstream_base_url: "http://joycode-api-saas.jd.com".to_string(),
+        ..Default::default()
+    };
+    let request = json!({
+        "model": "GPT-5.6 Sol",
+        "input": "hello",
+        "stream": true
+    });
+    let (_, upstream_body, wire_api) =
+        codex_plus_core::protocol_proxy::upstream_request_parts(&relay, request).unwrap();
+
+    assert_eq!(upstream_body["model"], "GPT-5.6 Sol");
+    assert_eq!(
+        wire_api,
+        codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeResponses
+    );
+}
+
+#[test]
+fn joycode_responses_sse_unwraps_outer_data_events() {
+    let upstream = concat!(
+        "data: event: response.created\n\n",
+        "data: data: {\"type\":\"response.created\"}\n\n",
+        "data: event: response.completed\n\n",
+        "data: data: {\"type\":\"response.completed\"}\n\n",
+    );
+    let split = upstream.len() / 2;
+    let mut normalizer =
+        codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+    let mut normalized = normalizer.push_bytes(&upstream.as_bytes()[..split]);
+    normalized.extend(normalizer.push_bytes(&upstream.as_bytes()[split..]));
+    normalized.extend(normalizer.finish());
+
+    assert_eq!(
+        String::from_utf8(normalized).unwrap(),
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        )
+    );
+}
+
+#[test]
+fn joycode_responses_sse_keeps_standard_openai_events_unchanged() {
+    let upstream = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\"}\n\n",
+    );
+    let mut normalizer =
+        codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+    let mut normalized = normalizer.push_bytes(upstream.as_bytes());
+    normalized.extend(normalizer.finish());
+
+    assert_eq!(String::from_utf8(normalized).unwrap(), upstream);
+}

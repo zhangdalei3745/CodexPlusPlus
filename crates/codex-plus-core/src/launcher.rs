@@ -1369,6 +1369,35 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeResponses {
+            let mut normalizer =
+                crate::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+            let mut bytes_stream = upstream.response.unwrap().bytes_stream();
+            while let Some(chunk) = bytes_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        let normalized = normalizer.push_bytes(&bytes);
+                        if !normalized.is_empty() {
+                            stream.write_all(&normalized).await?;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let tail = normalizer.finish();
+            if !tail.is_empty() {
+                stream.write_all(&tail).await?;
+            }
+            log_helper_response(
+                "helper.protocol_proxy_stream_ok",
+                method,
+                path,
+                "200 OK",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
         let mut converter = request_json
             .as_ref()
             .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -1439,7 +1468,11 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let upstream_body = upstream.bytes().await?;
-    if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+    if matches!(
+        upstream.wire_api,
+        crate::protocol_proxy::UpstreamWireApi::Responses
+            | crate::protocol_proxy::UpstreamWireApi::JoycodeResponses
+    ) {
         write_http_response(
             stream,
             "200 OK",

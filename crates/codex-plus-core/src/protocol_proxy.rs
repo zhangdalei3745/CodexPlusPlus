@@ -362,8 +362,85 @@ pub struct UpstreamProxyResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum UpstreamWireApi {
     Responses,
+    JoycodeResponses,
     ChatCompletions,
     JoycodeAnthropic,
+}
+
+/// JoyCode 的 Responses 网关会把标准 SSE 的每一行再次包装成一个 `data:`
+/// 事件，例如 `data: event: response.created`。Codex 需要标准的 event/data
+/// 组合，因此这里只移除 JoyCode 外层包装，不解析也不改写事件 JSON。
+#[derive(Default)]
+pub struct JoycodeResponsesSseNormalizer {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    pending_event: Option<String>,
+}
+
+impl JoycodeResponsesSseNormalizer {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
+        let mut output = String::new();
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            self.handle_block(&block, &mut output);
+        }
+        output.into_bytes()
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.utf8_remainder.is_empty() {
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.utf8_remainder.clear();
+        }
+        let mut output = String::new();
+        if !self.buffer.trim().is_empty() {
+            let block = std::mem::take(&mut self.buffer);
+            self.handle_block(&block, &mut output);
+        }
+        if let Some(event) = self.pending_event.take() {
+            output.push_str(&event);
+            output.push_str("\n\n");
+        }
+        output.into_bytes()
+    }
+
+    fn handle_block(&mut self, block: &str, output: &mut String) {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut lines = trimmed.lines();
+        let first = lines.next().unwrap_or_default().trim_end_matches('\r');
+        if lines.next().is_none()
+            && let Some(outer_data) = first.strip_prefix("data:")
+        {
+            let inner = outer_data.trim_start();
+            if inner.starts_with("event:") {
+                if let Some(previous) = self.pending_event.replace(inner.to_string()) {
+                    output.push_str(&previous);
+                    output.push_str("\n\n");
+                }
+                return;
+            }
+            if inner.starts_with("data:") {
+                if let Some(event) = self.pending_event.take() {
+                    output.push_str(&event);
+                    output.push('\n');
+                }
+                output.push_str(inner);
+                output.push_str("\n\n");
+                return;
+            }
+        }
+
+        if let Some(event) = self.pending_event.take() {
+            output.push_str(&event);
+            output.push('\n');
+        }
+        output.push_str(trimmed);
+        output.push_str("\n\n");
+    }
 }
 
 impl UpstreamProxyResponse {
@@ -1141,7 +1218,11 @@ pub async fn open_models_proxy_request_with_settings(
         } else {
             resolved_base_url.trim()
         };
-        let endpoint = format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'));
+        let endpoint = if base.starts_with("https://") {
+            sign_joycode_gateway_url(base, "joycode_modelList")
+        } else {
+            format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'))
+        };
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.models_request",
             json!({
@@ -1161,8 +1242,13 @@ pub async fn open_models_proxy_request_with_settings(
             .header("ptKey", &resolved_key)
             .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
+            .header("client", "JoyCodeIDE")
+            .header("clientVersion", "3.8.61")
             .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
-            .json(&serde_json::json!({}))
+            .json(&serde_json::json!({
+                "client": "JoyCodeIDE",
+                "clientVersion": "3.8.61"
+            }))
             .send()
             .await?;
 
@@ -1179,6 +1265,7 @@ pub async fn open_models_proxy_request_with_settings(
                             .or_else(|| m.get("label").and_then(Value::as_str))
                             .filter(|s| !s.trim().is_empty());
                         if let Some(model_id) = model_id {
+                            register_joycode_model_metadata(m);
                             let max_tokens = m.get("maxTotalTokens")
                                 .and_then(Value::as_u64)
                                 .or_else(|| m.get("respMaxTokens").and_then(Value::as_u64));
@@ -1195,12 +1282,6 @@ pub async fn open_models_proxy_request_with_settings(
                         }
                     }
                 }
-                openai_models.push(serde_json::json!({
-                    "id": "gpt-5",
-                    "object": "model",
-                    "created": 1719736000,
-                    "owned_by": "openai"
-                }));
                 let result_json = serde_json::json!({
                     "object": "list",
                     "data": openai_models
@@ -1393,50 +1474,59 @@ pub fn upstream_request_parts(
                 req_model
             };
 
-            let is_joycode = is_joycode_model(&model_name, relay);
+            let final_model = if model_name.ends_with("-hq") {
+                model_name.clone()
+            } else {
+                let hq_version = format!("{model_name}-hq");
+                if is_joycode_model_registered(&hq_version) {
+                    hq_version
+                } else {
+                    model_name.clone()
+                }
+            };
+            let adapter = if is_joycode_responses_model(&final_model) {
+                "openai-response"
+            } else if is_anthropic_model(&final_model) {
+                "anthropic"
+            } else {
+                "openai"
+            };
 
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "protocol_proxy.joycode_request_model",
                 json!({
                     "raw_model": request_json.get("model"),
                     "model_name": model_name,
-                    "is_joycode_model": is_joycode,
+                    "final_model": final_model,
+                    "adapter": adapter,
                     "relay_model": relay.model,
                     "relay_test_model": relay.test_model,
                 }),
             );
 
-            if !is_joycode {
-                // 不包含在 Joycode 供应商模型列表中，判定为官方 OpenAI 模型
-                // 走 /v1/responses 接口原样透传，只需替换请求地址为官方/上游地址
-                let endpoint = responses_url(base);
+            if adapter == "openai-response" {
                 let mut passthrough_body = request_json;
-                passthrough_body["model"] = Value::String(model_name);
+                passthrough_body["model"] = Value::String(final_model);
+                passthrough_body["client"] = Value::String("JoyCodeIDE".to_string());
+                passthrough_body["clientVersion"] = Value::String("3.8.61".to_string());
+                let endpoint = if base.starts_with("https://") {
+                    sign_joycode_gateway_url(base, "responses_completions")
+                } else {
+                    format!(
+                        "{}/api/saas/openai/v1/responses",
+                        base.trim_end_matches('/')
+                    )
+                };
                 Ok((
                     endpoint,
                     passthrough_body,
-                    UpstreamWireApi::Responses,
+                    UpstreamWireApi::JoycodeResponses,
                 ))
             } else {
-                // 包含在 Joycode 供应商模型列表中，使用 Joycode 专属协议与网关接口
                 let mut req_body = responses_to_chat_completions(request_json)?;
-                req_body["model"] = Value::String(model_name);
+                req_body["model"] = Value::String(final_model.clone());
 
-                if let Some(m) = req_body.get_mut("model") {
-                    if let Some(m_str) = m.as_str() {
-                        let trimmed = m_str.trim();
-                        if !trimmed.ends_with("-hq") {
-                            let hq_version = format!("{}-hq", trimmed);
-                            if is_joycode_model_registered(&hq_version) {
-                                *m = Value::String(hq_version);
-                            }
-                        }
-                    }
-                }
-
-                let final_model = req_body.get("model").and_then(Value::as_str).unwrap_or("").trim();
-
-                if is_anthropic_model(final_model) {
+                if adapter == "anthropic" {
                     let mut anthropic_req = openai_to_anthropic_request(req_body);
                     anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
                     anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
@@ -1564,6 +1654,28 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 upstream_content_type
             },
             body: upstream_body.to_vec(),
+        });
+    }
+
+    if wire_api == UpstreamWireApi::JoycodeResponses {
+        let body = if is_stream {
+            let mut normalizer = JoycodeResponsesSseNormalizer::default();
+            let mut normalized = normalizer.push_bytes(&upstream_body);
+            normalized.extend(normalizer.finish());
+            normalized
+        } else {
+            upstream_body
+        };
+        return Ok(ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: if is_stream {
+                "text/event-stream; charset=utf-8".to_string()
+            } else if upstream_content_type.is_empty() {
+                "application/json; charset=utf-8".to_string()
+            } else {
+                upstream_content_type
+            },
+            body,
         });
     }
 
@@ -4805,12 +4917,46 @@ use std::sync::OnceLock;
 
 static ANTHROPIC_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static JOYCODE_MODEL_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static JOYCODE_RESPONSES_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub fn register_joycode_model(model_id: String) {
     let mutex = JOYCODE_MODEL_IDS.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut guard) = mutex.lock() {
         guard.insert(model_id);
     }
+}
+
+pub fn register_joycode_model_metadata(model: &Value) -> Option<String> {
+    let model_id = model
+        .get("chatApiModel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())?
+        .to_string();
+    register_joycode_model(model_id.clone());
+
+    let adapter = model
+        .get("extJson")
+        .and_then(|ext| ext.get("adapterType"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            model
+                .get("ext")
+                .and_then(Value::as_str)
+                .and_then(|ext| serde_json::from_str::<Value>(ext).ok())
+                .and_then(|ext| {
+                    ext.get("adapterType")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        });
+    match adapter.as_deref() {
+        Some("anthropic") => register_anthropic_model(model_id.clone()),
+        Some("openai-response") => register_joycode_responses_model(model_id.clone()),
+        _ => {}
+    }
+    Some(model_id)
 }
 
 pub fn is_joycode_model_registered(model_id: &str) -> bool {
@@ -4838,12 +4984,35 @@ pub fn init_model_lists_from_profile(profile: &crate::settings::RelayProfile) {
         models.push(trimmed_model.to_string());
     }
     
-    for m in models {
-        register_joycode_model(m.clone());
-        if m.to_lowercase().contains("claude") {
-            register_anthropic_model(m);
+    for model in models {
+        register_joycode_model(model.clone());
+        if model.to_ascii_lowercase().contains("claude") {
+            register_anthropic_model(model.clone());
+        }
+        if model.to_ascii_lowercase().ends_with("-sol") {
+            register_joycode_responses_model(model);
         }
     }
+}
+
+pub fn register_joycode_responses_model(model_id: String) {
+    let mutex = JOYCODE_RESPONSES_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.insert(model_id.to_ascii_lowercase());
+    }
+}
+
+pub fn is_joycode_responses_model(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let mutex = JOYCODE_RESPONSES_MODELS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(guard) = mutex.lock()
+        && guard.contains(&normalized)
+    {
+        return true;
+    }
+    normalized == "gpt-5.6"
+        || normalized == "gpt-5.6 sol"
+        || normalized.ends_with("-sol")
 }
 
 pub fn register_anthropic_model(model_id: String) {
@@ -5642,8 +5811,3 @@ pub fn get_latest_ptkey(fallback: &str) -> String {
         fallback.to_string()
     }
 }
-
-
-
-
-

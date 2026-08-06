@@ -6498,7 +6498,9 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   const configModel = codexModelFromConfig(configContents);
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
-  const model = /\[.+\]$/.test(profile.model.trim()) ? profile.model.trim() : configModel;
+  const model = /\[.+\]$/.test(profile.model.trim())
+    ? profile.model.trim()
+    : configModel || profile.model.trim();
   return {
     ...profile,
     model,

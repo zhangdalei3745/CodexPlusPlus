@@ -408,6 +408,54 @@ base_url = "http://127.0.0.1:57321/v1"
 }
 
 #[test]
+fn legacy_joycode_responses_profile_migrates_to_pure_api_proxy() {
+    let mut profile = RelayProfile {
+        id: "relay-joycode".to_string(),
+        name: "Joycode (JD)".to_string(),
+        protocol: RelayProtocol::Responses,
+        relay_mode: RelayMode::Official,
+        official_mix_api_key: true,
+        model_list: "gpt-5.6-sol\nClaude-Opus-4.8-hq".to_string(),
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://joycode-api-saas.jd.com"
+experimental_bearer_token = "pt-key"
+"#
+        .to_string(),
+        auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official-token"}}"#
+            .to_string(),
+        ..RelayProfile::default()
+    };
+
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+
+    assert_eq!(profile.protocol, RelayProtocol::Joycode);
+    assert_eq!(profile.relay_mode, RelayMode::PureApi);
+    assert!(!profile.official_mix_api_key);
+    assert_eq!(profile.model, "gpt-5.6-sol");
+    assert_eq!(profile.upstream_base_url, "http://joycode-api-saas.jd.com");
+    assert!(profile.config_contents.contains(r#"model = "gpt-5.6-sol""#));
+    assert!(
+        profile
+            .config_contents
+            .contains(r#"base_url = "http://127.0.0.1:57321/v1""#)
+    );
+    assert!(
+        !profile
+            .config_contents
+            .contains("experimental_bearer_token")
+    );
+    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
+    assert_eq!(auth["OPENAI_API_KEY"], "pt-key");
+    assert!(auth.get("tokens").is_none());
+}
+
+#[test]
 fn official_mix_api_profile_does_not_generate_auth_api_key() {
     let mut profile = RelayProfile {
         relay_mode: RelayMode::Official,

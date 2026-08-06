@@ -552,31 +552,13 @@ pub async fn fetch_relay_profile_model_ids(
         let mut model_ids = Vec::new();
         if let Some(models) = models {
             for m in models {
-                if let Some(model_id) = m.get("chatApiModel").and_then(Value::as_str) {
-                    model_ids.push(model_id.to_string());
-                    crate::protocol_proxy::register_joycode_model(model_id.to_string());
-                    let mut is_anthropic = false;
-                    if let Some(ext_json) = m.get("extJson") {
-                        if let Some(adapter) = ext_json.get("adapterType").and_then(Value::as_str) {
-                            is_anthropic = adapter == "anthropic";
-                        }
-                    }
-                    if !is_anthropic {
-                        if let Some(ext_str) = m.get("ext").and_then(Value::as_str) {
-                            if let Ok(ext_val) = serde_json::from_str::<Value>(ext_str) {
-                                if let Some(adapter) = ext_val.get("adapterType").and_then(Value::as_str) {
-                                    is_anthropic = adapter == "anthropic";
-                                }
-                            }
-                        }
-                    }
-                    if is_anthropic {
-                        crate::protocol_proxy::register_anthropic_model(model_id.to_string());
-                    }
+                if let Some(model_id) =
+                    crate::protocol_proxy::register_joycode_model_metadata(m)
+                {
+                    model_ids.push(model_id);
                 }
             }
         }
-        model_ids.push("gpt-5".to_string());
         
         if model_ids.is_empty() {
             anyhow::bail!("上游没有返回可用模型");

@@ -504,7 +504,10 @@ impl BackendSettings {
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
+            || matches!(
+                self.active_relay_profile().protocol,
+                RelayProtocol::ChatCompletions | RelayProtocol::Joycode
+            )
     }
 }
 
@@ -1291,6 +1294,22 @@ mod tests {
         assert_eq!(settings.codex_app_stepwise_max_input_chars, 6000);
         assert_eq!(settings.codex_app_stepwise_max_output_tokens, 500);
         assert_eq!(settings.codex_app_stepwise_timeout_ms, 8000);
+    }
+
+    #[test]
+    fn joycode_profile_enables_protocol_proxy_without_ui_enhancements() {
+        let settings = BackendSettings {
+            enhancements_enabled: false,
+            relay_profiles: vec![RelayProfile {
+                id: "joycode".to_string(),
+                protocol: RelayProtocol::Joycode,
+                ..Default::default()
+            }],
+            active_relay_id: "joycode".to_string(),
+            ..Default::default()
+        };
+
+        assert!(settings.active_relay_uses_protocol_proxy());
     }
 
     #[test]

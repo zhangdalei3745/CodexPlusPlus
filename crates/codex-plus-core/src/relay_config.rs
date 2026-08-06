@@ -2075,6 +2075,45 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
         profile.model_list = clean_list;
         profile.model_windows = serde_json::to_string(&windows).unwrap_or_default();
     }
+
+    // 早期版本把 JoyCode 预设保存成 Responses + 官方混合模式，导致 Codex 绕过
+    // 本地协议代理，直接请求 `joycode-api-saas.jd.com/responses`。加载旧配置时按
+    // 上游域名识别并迁移，同时先保存模型与 ptKey，避免切换协议后派生字段丢失。
+    let provider_base_url =
+        provider_string_from_config(&profile.config_contents, "base_url").unwrap_or_default();
+    let is_joycode_profile = profile.protocol == RelayProtocol::Joycode
+        || [
+            profile.upstream_base_url.as_str(),
+            profile.base_url.as_str(),
+            provider_base_url.as_str(),
+        ]
+        .iter()
+        .any(|value| is_joycode_base_url(value));
+    if is_joycode_profile {
+        let selected_model = relay_profile_model(profile);
+        let source_api_key = relay_profile_api_key(profile);
+        let detected_base_url = relay_profile_base_url(profile);
+        let upstream_base_url = if is_joycode_base_url(&detected_base_url) {
+            detected_base_url
+        } else {
+            "http://joycode-api-saas.jd.com".to_string()
+        };
+
+        profile.protocol = RelayProtocol::Joycode;
+        profile.relay_mode = crate::settings::RelayMode::PureApi;
+        profile.official_mix_api_key = false;
+        profile.model = selected_model;
+        profile.upstream_base_url = upstream_base_url.clone();
+        profile.base_url = upstream_base_url;
+        if !source_api_key.trim().is_empty() {
+            profile.auth_contents = serde_json::to_string_pretty(&json!({
+                "OPENAI_API_KEY": source_api_key.trim()
+            }))?;
+        } else if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
+            profile.auth_contents.clear();
+        }
+    }
+
     if profile.relay_mode == crate::settings::RelayMode::Official && !profile.official_mix_api_key {
         let has_api_config = !profile.base_url.trim().is_empty()
             || !profile.api_key.trim().is_empty()
@@ -2123,6 +2162,11 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
     profile.base_url = source_base_url;
     profile.api_key = relay_profile_api_key(profile);
     Ok(())
+}
+
+fn is_joycode_base_url(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.contains("joycode-api-saas.jd.com") || value.contains("joycode.jd.com")
 }
 
 fn remove_openai_api_key_from_auth_contents(auth_contents: &str) -> anyhow::Result<String> {
