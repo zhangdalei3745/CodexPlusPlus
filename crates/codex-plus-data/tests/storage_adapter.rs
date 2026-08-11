@@ -452,6 +452,94 @@ fn delete_local_from_paths_removes_duplicate_threads_from_all_databases() {
 }
 
 #[test]
+fn delete_local_from_paths_resolves_unique_transient_thread_id_by_exact_title() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let first_rollout = tmp.path().join("first.jsonl");
+    let transient_rollout = tmp.path().join("transient.jsonl");
+    fs::write(&first_rollout, "{\"type\":\"message\"}\n").unwrap();
+    fs::write(&transient_rollout, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&db_path, &first_rollout);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO threads (id, rollout_path, title, cwd, archived, updated_at_ms) VALUES (?1, ?2, ?3, '', 0, 200000)",
+            [
+                "019fc70b-9420-79e2-9809-88185b4fe708",
+                transient_rollout.to_str().unwrap(),
+                "回应问候",
+            ],
+        )
+        .unwrap();
+
+    let result = delete_local_from_paths(
+        vec![db_path.clone()],
+        BackupStore::new(tmp.path().join("backups")),
+        &session(
+            "local:client-new-thread:45cb25e5-6a2c-4dbc-a44a-b57e174ecf4d",
+            "回应问候",
+        ),
+    );
+
+    assert_eq!(result.status, DeleteStatus::LocalDeleted);
+    assert_eq!(result.session_id, "019fc70b-9420-79e2-9809-88185b4fe708");
+    assert_eq!(
+        thread_count(&db_path, "019fc70b-9420-79e2-9809-88185b4fe708"),
+        0
+    );
+    assert_eq!(thread_count(&db_path, "t1"), 1);
+    assert!(!transient_rollout.exists());
+}
+
+#[test]
+fn delete_local_from_paths_rejects_ambiguous_transient_thread_title() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let rollout_path = tmp.path().join("first.jsonl");
+    fs::write(&rollout_path, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&db_path, &rollout_path);
+    let db = Connection::open(&db_path).unwrap();
+    db.execute("UPDATE threads SET title = '同名会话' WHERE id = 't1'", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO threads (id, rollout_path, title, cwd, archived, updated_at_ms) VALUES ('t2', '', '同名会话', '', 0, 200000)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = delete_local_from_paths(
+        vec![db_path.clone()],
+        BackupStore::new(tmp.path().join("backups")),
+        &session("local:client-new-thread:temporary", "同名会话"),
+    );
+
+    assert_eq!(result.status, DeleteStatus::Failed);
+    assert!(result.message.contains("2 个同名本地会话"));
+    assert_eq!(thread_count(&db_path, "t1"), 1);
+    assert_eq!(thread_count(&db_path, "t2"), 1);
+}
+
+#[test]
+fn delete_local_from_paths_does_not_resolve_regular_missing_id_by_title() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let rollout_path = tmp.path().join("first.jsonl");
+    fs::write(&rollout_path, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&db_path, &rollout_path);
+
+    let result = delete_local_from_paths(
+        vec![db_path.clone()],
+        BackupStore::new(tmp.path().join("backups")),
+        &session("missing-id", "Codex Thread"),
+    );
+
+    assert_eq!(result.status, DeleteStatus::Failed);
+    assert_eq!(result.message, "Thread not found in local storage");
+    assert_eq!(thread_count(&db_path, "t1"), 1);
+}
+
+#[test]
 fn move_thread_workspace_from_paths_uses_database_that_contains_thread() {
     let tmp = tempdir().unwrap();
     let stale_db = tmp.path().join("stale.sqlite");

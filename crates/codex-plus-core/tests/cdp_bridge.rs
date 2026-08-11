@@ -620,6 +620,15 @@ fn injection_script_moves_export_and_project_move_into_more_menu() {
 }
 
 #[test]
+fn injection_script_prefers_explicit_sidebar_title_for_transient_threads() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("data-app-action-sidebar-thread-id"));
+    assert!(script.contains("data-app-action-sidebar-thread-title"));
+    assert!(script.contains("const rawTitle = explicitTitle || titleNode?.textContent"));
+}
+
+#[test]
 fn injection_script_does_not_add_delete_controls_on_archived_page() {
     let script = assets::injection_script(57321);
 
@@ -1964,8 +1973,10 @@ async fn install_bridge_processes_calls_concurrently() {
         }) as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
     });
 
-    let _ = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]).await.unwrap();
-    
+    let _ = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[])
+        .await
+        .unwrap();
+
     request_rx
         .await
         .expect("server task should finish without panicking");

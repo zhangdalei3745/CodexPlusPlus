@@ -3643,9 +3643,11 @@
     const codexThreadId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
     const fallbackId = row.getAttribute("data-session-id") || row.getAttribute("data-testid") || "";
     const sessionId = codexThreadId || (idMatch && idMatch[1]) || fallbackId;
+    const explicitTitle = (row.getAttribute("data-app-action-sidebar-thread-title") || row.getAttribute("data-session-title") || "").trim();
     const titleNode = row.querySelector(`${selectors.threadTitle}, .truncate.select-none, .truncate.text-base`);
-    const rawTitle = (titleNode?.textContent || (titleNode ? "" : (row.textContent || "Untitled session")));
-    const title = (titleNode ? rawTitle : rawTitle.replace(/\s*(导出|删除|移动|移出项目)(\s*(导出|删除|移动|移出项目))*$/g, "")).trim().slice(0, 160);
+    const rawTitle = explicitTitle || titleNode?.textContent || (titleNode ? "" : (row.textContent || "Untitled session"));
+    const titleNeedsCleanup = !explicitTitle && !titleNode;
+    const title = (titleNeedsCleanup ? rawTitle.replace(/\s*(导出|删除|移动|移出项目)(\s*(导出|删除|移动|移出项目))*$/g, "") : rawTitle).trim().slice(0, 160);
     return { session_id: sessionId, title };
   }
 

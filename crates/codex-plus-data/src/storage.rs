@@ -15,14 +15,20 @@ pub fn delete_local_from_paths(
     backup_store: BackupStore,
     session: &SessionRef,
 ) -> DeleteResult {
+    let db_paths = db_paths.into_iter().collect::<Vec<_>>();
+    let resolved_session = match resolve_transient_codex_thread_session(&db_paths, session) {
+        Ok(Some(resolved_session)) => resolved_session,
+        Ok(None) => session.clone(),
+        Err(message) => return failed(&session.session_id, message),
+    };
     let mut result = failed(
-        &session.session_id,
+        &resolved_session.session_id,
         "Thread not found in local storage".to_string(),
     );
     let mut deleted_count = 0usize;
     for db_path in db_paths {
         let adapter = SQLiteStorageAdapter::new(db_path, backup_store.clone());
-        let candidate_result = adapter.delete_local(session);
+        let candidate_result = adapter.delete_local(&resolved_session);
         if matches!(candidate_result.status, DeleteStatus::LocalDeleted) {
             deleted_count += 1;
             result = candidate_result;
@@ -34,6 +40,67 @@ pub fn delete_local_from_paths(
         result.message = format!("已从 {deleted_count} 个本地存储删除");
     }
     result
+}
+
+fn resolve_transient_codex_thread_session(
+    db_paths: &[PathBuf],
+    session: &SessionRef,
+) -> Result<Option<SessionRef>, String> {
+    if !is_transient_codex_thread_id(&session.session_id) || session.title.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut matching_ids = HashSet::new();
+    for db_path in db_paths {
+        if !db_path.exists() {
+            continue;
+        }
+        let db = Connection::open(db_path).map_err(|err| {
+            format!(
+                "无法解析临时会话 ID（{}）：{err}",
+                db_path.to_string_lossy()
+            )
+        })?;
+        let schema = schema_kind(&db).map_err(|err| {
+            format!(
+                "无法解析临时会话 ID（{}）：{err}",
+                db_path.to_string_lossy()
+            )
+        })?;
+        if schema != Some(SchemaKind::CodexThreads) {
+            continue;
+        }
+        let mut stmt = db
+            .prepare("SELECT id FROM threads WHERE title = ?1")
+            .map_err(|err| format!("无法解析临时会话 ID：{err}"))?;
+        let ids = stmt
+            .query_map([session.title.trim()], |row| row.get::<_, String>(0))
+            .map_err(|err| format!("无法解析临时会话 ID：{err}"))?;
+        for id in ids {
+            matching_ids.insert(id.map_err(|err| format!("无法解析临时会话 ID：{err}"))?);
+        }
+    }
+
+    match matching_ids.len() {
+        0 => Ok(None),
+        1 => Ok(matching_ids
+            .into_iter()
+            .next()
+            .map(|session_id| SessionRef {
+                session_id,
+                title: session.title.clone(),
+            })),
+        count => Err(format!(
+            "找到 {count} 个同名本地会话，无法安全删除；请刷新侧栏后重试"
+        )),
+    }
+}
+
+fn is_transient_codex_thread_id(session_id: &str) -> bool {
+    session_id
+        .strip_prefix("local:")
+        .unwrap_or(session_id)
+        .starts_with("client-new-thread:")
 }
 
 pub fn move_codex_thread_workspace_from_paths(
