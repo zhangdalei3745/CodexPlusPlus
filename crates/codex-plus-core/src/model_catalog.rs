@@ -523,43 +523,53 @@ pub async fn fetch_relay_profile_model_ids(
         let endpoint = if base.starts_with("https://") {
             crate::protocol_proxy::sign_joycode_gateway_url(&base, "joycode_modelList")
         } else {
-            format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'))
+            format!(
+                "{}/api/saas/models/v2/modelList",
+                base.trim_end_matches('/')
+            )
         };
         let client = crate::http_client::proxied_client(&profile.user_agent)?;
         let resolved_key = crate::protocol_proxy::get_latest_ptkey(profile.api_key.trim());
         let upstream = client
             .post(&endpoint)
             .header("ptKey", &resolved_key)
-            .header("loginType", crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key))
+            .header(
+                "loginType",
+                crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key),
+            )
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
-            .header("clientVersion", "3.8.61")
-            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+            .header(
+                "clientVersion",
+                crate::protocol_proxy::JOYCODE_CLIENT_VERSION,
+            )
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            )
             .json(&serde_json::json!({
                 "client": "JoyCodeIDE",
-                "clientVersion": "3.8.61"
+                "clientVersion": crate::protocol_proxy::JOYCODE_CLIENT_VERSION
             }))
             .send()
             .await?;
-        
+
         let status_code = upstream.status().as_u16();
         if !(200..300).contains(&status_code) {
             anyhow::bail!("HTTP {}", status_code);
         }
-        
+
         let res_json = upstream.json::<Value>().await?;
         let models = res_json.get("data").and_then(Value::as_array);
         let mut model_ids = Vec::new();
         if let Some(models) = models {
             for m in models {
-                if let Some(model_id) =
-                    crate::protocol_proxy::register_joycode_model_metadata(m)
-                {
+                if let Some(model_id) = crate::protocol_proxy::register_joycode_model_metadata(m) {
                     model_ids.push(model_id);
                 }
             }
         }
-        
+
         if model_ids.is_empty() {
             anyhow::bail!("上游没有返回可用模型");
         }

@@ -1,14 +1,14 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, chat_completion_to_response,
-    chat_completion_to_response_with_request, chat_completions_url, chat_completions_url_for_relay,
-    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path,
-    is_joycode_model, is_joycode_responses_model, is_models_proxy_path, is_responses_proxy_path,
-    models_url, open_chat_completions_proxy_request,
-    open_models_proxy_request, open_responses_proxy_request,
-    open_responses_proxy_request_with_settings, responses_error_from_upstream,
-    register_joycode_model_metadata, responses_to_chat_completions,
-    send_upstream_request_with_header_timeout,
-    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
+    AnthropicToOpenAiSseTranslator, ChatSseToResponsesConverter, anthropic_to_openai_response,
+    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
+    chat_completions_url_for_relay, chat_sse_to_responses_sse,
+    chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path, is_joycode_model,
+    is_joycode_responses_model, is_models_proxy_path, is_responses_proxy_path, models_url,
+    open_chat_completions_proxy_request, open_models_proxy_request, open_responses_proxy_request,
+    open_responses_proxy_request_with_settings, openai_to_anthropic_request,
+    register_joycode_model_metadata, responses_error_from_upstream, responses_to_chat_completions,
+    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
+    upstream_stream_header_timeout,
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
@@ -1692,7 +1692,7 @@ async fn joycode_protocol_sends_custom_headers_and_path() {
         let mut buffer = [0u8; 4096];
         let bytes = stream.read(&mut buffer).await.unwrap();
         let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
-        
+
         // Verify path
         assert!(request.contains("POST /api/saas/openai/v2/chat/completions"));
         // Verify headers
@@ -1741,6 +1741,102 @@ async fn joycode_protocol_sends_custom_headers_and_path() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn joycode_chat_cache_key_falls_back_when_gateway_rejects_it() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut first_buffer = [0u8; 4096];
+        let first_bytes = first.read(&mut first_buffer).await.unwrap();
+        let first_request = String::from_utf8_lossy(&first_buffer[..first_bytes]);
+        assert!(first_request.contains("\"prompt_cache_key\":\"thread-cache-key\""));
+        let error_body = r#"{"error":{"message":"unknown field"}}"#;
+        first
+            .write_all(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    error_body.len(),
+                    error_body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let mut second_buffer = [0u8; 4096];
+        let second_bytes = second.read(&mut second_buffer).await.unwrap();
+        let second_request = String::from_utf8_lossy(&second_buffer[..second_bytes]);
+        assert!(!second_request.contains("prompt_cache_key"));
+        let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[]}"#;
+        second
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let (mut third, _) = listener.accept().await.unwrap();
+        let mut third_buffer = [0u8; 4096];
+        let third_bytes = third.read(&mut third_buffer).await.unwrap();
+        let third_request = String::from_utf8_lossy(&third_buffer[..third_bytes]);
+        assert!(!third_request.contains("prompt_cache_key"));
+        third
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let settings = BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            id: "joycode-cache-fallback".to_string(),
+            name: "Joycode Cache Fallback".to_string(),
+            model: "Kimi-K2.6".to_string(),
+            base_url: format!("http://{addr}"),
+            upstream_base_url: format!("http://{addr}"),
+            api_key: "sk-joytest".to_string(),
+            protocol: RelayProtocol::Joycode,
+            relay_mode: RelayMode::PureApi,
+            ..Default::default()
+        }],
+        active_relay_id: "joycode-cache-fallback".to_string(),
+        relay_profiles_enabled: true,
+        ..Default::default()
+    };
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"Kimi-K2.6","input":"hi","stream":false,"client_metadata":{"thread_id":"thread-cache-key"}}"#,
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let second_result = open_responses_proxy_request_with_settings(
+        r#"{"model":"Kimi-K2.6","input":"next","stream":false,"client_metadata":{"thread_id":"thread-cache-key"}}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_result.status_code, 200);
+    server.await.unwrap();
+}
+
 #[test]
 fn joycode_defaults_and_fallbacks() {
     let profile_empty = RelayProfile {
@@ -1752,16 +1848,19 @@ fn joycode_defaults_and_fallbacks() {
         protocol: RelayProtocol::Joycode,
         ..Default::default()
     };
-    
+
     // Check URL fallback
     let url = chat_completions_url_for_relay(&profile_empty);
-    assert_eq!(url, "http://joycode-api-saas.jd.com/api/saas/openai/v2/chat/completions");
+    assert_eq!(
+        url,
+        "http://joycode-api-saas.jd.com/api/saas/openai/v2/chat/completions"
+    );
 }
 
 #[test]
 fn responses_request_prunes_historical_base64_media() {
     let large_base64 = format!("data:image/png;base64,{}", "A".repeat(2000));
-    
+
     let converted = responses_to_chat_completions(json!({
         "model": "gpt-4o",
         "input": [
@@ -1811,36 +1910,55 @@ fn responses_request_prunes_historical_base64_media() {
     // Verify first message (history) has its base64 image stripped and replaced/pruned
     let msg1_content = messages[0].get("content").unwrap().as_array().unwrap();
     assert_eq!(msg1_content.len(), 1);
-    assert_eq!(msg1_content[0].get("text").unwrap().as_str().unwrap(), "Describe this image");
+    assert_eq!(
+        msg1_content[0].get("text").unwrap().as_str().unwrap(),
+        "Describe this image"
+    );
 
     // Verify second message (history assistant) remains correct
-    assert_eq!(messages[1].get("content").unwrap().as_str().unwrap(), "It is a picture of a cat.");
+    assert_eq!(
+        messages[1].get("content").unwrap().as_str().unwrap(),
+        "It is a picture of a cat."
+    );
 
     // Verify third message (latest user query) preserves the base64 media data!
     let msg3_content = messages[2].get("content").unwrap().as_array().unwrap();
     assert_eq!(msg3_content.len(), 2);
-    assert_eq!(msg3_content[0].get("text").unwrap().as_str().unwrap(), "What about this one?");
+    assert_eq!(
+        msg3_content[0].get("text").unwrap().as_str().unwrap(),
+        "What about this one?"
+    );
     let img_part = msg3_content[1].get("image_url").unwrap();
-    assert_eq!(img_part.get("url").unwrap().as_str().unwrap(), &large_base64);
+    assert_eq!(
+        img_part.get("url").unwrap().as_str().unwrap(),
+        &large_base64
+    );
 }
 
 #[test]
 fn test_fragmented_json_unauthorized_error_intercept() {
     use codex_plus_core::protocol_proxy::ChatSseToResponsesConverter;
     let mut converter = ChatSseToResponsesConverter::default();
-    
+
     // Fragment 1: Incomplete JSON error
     let chunk1 = b" {\"code\": 401, \"data\": {\"loginUrl\": \"https://joycode.jd.com/portal/login\", \"other\": \"";
     let out1 = converter.push_bytes(chunk1);
     assert!(out1.is_empty(), "Incomplete JSON should return empty bytes");
-    
+
     // Fragment 2: Rest of JSON error
     let chunk2 = b"value\"}}";
     let out2 = converter.push_bytes(chunk2);
-    assert!(!out2.is_empty(), "Complete JSON should return failure response bytes");
-    
+    assert!(
+        !out2.is_empty(),
+        "Complete JSON should return failure response bytes"
+    );
+
     let response_str = String::from_utf8(out2).unwrap();
-    assert!(response_str.contains("Joycode 认证已失效，请访问 https://joycode.jd.com/portal/login 并重新登录。"));
+    assert!(
+        response_str.contains(
+            "Joycode 认证已失效，请访问 https://joycode.jd.com/portal/login 并重新登录。"
+        )
+    );
 }
 
 #[tokio::test]
@@ -1862,9 +1980,82 @@ async fn test_joycode_preserves_selected_model() {
     let (endpoint, req_body, wire_api) =
         codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
 
-    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeAnthropic);
+    assert_eq!(
+        wire_api,
+        codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeAnthropic
+    );
     assert!(endpoint.contains("/api/saas/anthropic/v1/messages"));
     assert_eq!(req_body["model"], "Claude-Opus-4.8-hq");
+    assert_eq!(
+        req_body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
+fn joycode_anthropic_request_adds_native_cache_breakpoints() {
+    let converted = openai_to_anthropic_request(json!({
+        "model": "Claude-Opus-4.8-hq",
+        "messages": [
+            {"role": "system", "content": "stable system prompt"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second"}
+        ],
+        "stream": true
+    }));
+
+    assert_eq!(converted["system"][0]["text"], "stable system prompt");
+    assert_eq!(converted["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(converted["messages"][0]["content"].is_string());
+    assert_eq!(
+        converted["messages"][1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        converted["messages"][2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
+fn joycode_anthropic_non_stream_usage_preserves_cache_metrics() {
+    let converted = anthropic_to_openai_response(json!({
+        "id": "msg_test",
+        "model": "Claude-Opus-4.8-hq",
+        "content": [{"type": "text", "text": "done"}],
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 80,
+            "cache_creation_input_tokens": 10
+        }
+    }));
+
+    assert_eq!(converted["usage"]["input_tokens"], 20);
+    assert_eq!(converted["usage"]["prompt_tokens"], 110);
+    assert_eq!(converted["usage"]["cache_read_input_tokens"], 80);
+    assert_eq!(converted["usage"]["cache_creation_input_tokens"], 10);
+    assert_eq!(converted["usage"]["total_tokens"], 115);
+}
+
+#[test]
+fn joycode_anthropic_stream_usage_preserves_cache_metrics() {
+    let upstream = concat!(
+        "data: event: message_start\n\n",
+        "data: data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10}}}\n\n",
+        "data: event: message_delta\n\n",
+        "data: data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: event: message_stop\n\n",
+        "data: data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let mut translator = AnthropicToOpenAiSseTranslator::default();
+    let translated = String::from_utf8(translator.push_bytes(upstream.as_bytes())).unwrap();
+
+    assert!(translated.contains("\"cache_read_input_tokens\":80"));
+    assert!(translated.contains("\"cache_creation_input_tokens\":10"));
+    assert!(translated.contains("\"completion_tokens\":5"));
+    assert!(translated.contains("\"total_tokens\":115"));
 }
 
 #[tokio::test]
@@ -1891,11 +2082,15 @@ async fn test_joycode_gpt_5_6_sol_uses_joycode_responses_api() {
         wire_api,
         codex_plus_core::protocol_proxy::UpstreamWireApi::JoycodeResponses
     );
-    assert_eq!(endpoint, "http://joycode-api-saas.jd.com/api/saas/openai/v1/responses");
+    assert_eq!(
+        endpoint,
+        "http://joycode-api-saas.jd.com/api/saas/openai/v1/responses"
+    );
     assert_eq!(req_body["model"], "gpt-5.6");
     assert_eq!(req_body["input"][0]["content"], "hello");
     assert_eq!(req_body["client"], "JoyCodeIDE");
-    assert_eq!(req_body["clientVersion"], "3.8.61");
+    assert_eq!(req_body["clientVersion"], "3.8.67");
+    assert_eq!(req_body["store"], true);
     assert!(req_body.get("messages").is_none());
     assert!(is_joycode_responses_model("gpt-5.6"));
     assert!(is_joycode_responses_model("gpt-5.6-sol"));
@@ -1914,15 +2109,20 @@ async fn test_joycode_gpt_model_does_not_use_official_openai_route() {
 
     let req_json = json!({
         "model": "gpt-5.5",
-        "input": "hello"
+        "input": "hello",
+        "client_metadata": {"thread_id": "thread-cache-key"}
     });
     let (endpoint, req_body, wire_api) =
         codex_plus_core::protocol_proxy::upstream_request_parts(&relay, req_json).unwrap();
 
-    assert_eq!(wire_api, codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions);
+    assert_eq!(
+        wire_api,
+        codex_plus_core::protocol_proxy::UpstreamWireApi::ChatCompletions
+    );
     assert!(endpoint.contains("/api/saas/openai/v2/chat/completions"));
     assert_eq!(req_body["model"], "gpt-5.5");
     assert_eq!(req_body["client"], "JoyCodeIDE");
+    assert_eq!(req_body["prompt_cache_key"], "thread-cache-key");
 }
 
 #[test]
@@ -1984,8 +2184,7 @@ fn joycode_responses_sse_unwraps_outer_data_events() {
         "data: data: {\"type\":\"response.completed\"}\n\n",
     );
     let split = upstream.len() / 2;
-    let mut normalizer =
-        codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+    let mut normalizer = codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
     let mut normalized = normalizer.push_bytes(&upstream.as_bytes()[..split]);
     normalized.extend(normalizer.push_bytes(&upstream.as_bytes()[split..]));
     normalized.extend(normalizer.finish());
@@ -2009,8 +2208,7 @@ fn joycode_responses_sse_keeps_standard_openai_events_unchanged() {
         "event: response.completed\n",
         "data: {\"type\":\"response.completed\"}\n\n",
     );
-    let mut normalizer =
-        codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+    let mut normalizer = codex_plus_core::protocol_proxy::JoycodeResponsesSseNormalizer::default();
     let mut normalized = normalizer.push_bytes(upstream.as_bytes());
     normalized.extend(normalizer.finish());
 

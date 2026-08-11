@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -38,6 +38,9 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
+pub(crate) const JOYCODE_CLIENT_VERSION: &str = "3.8.67";
+const JOYCODE_RESPONSE_SESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const JOYCODE_RESPONSE_SESSION_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
@@ -357,6 +360,7 @@ pub struct UpstreamProxyResponse {
     pub wire_api: UpstreamWireApi,
     pub response: Option<reqwest::Response>,
     pub custom_body: Option<Vec<u8>>,
+    pub(crate) joycode_session_context: Option<JoycodeResponseSessionContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -367,6 +371,39 @@ pub enum UpstreamWireApi {
     JoycodeAnthropic,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct JoycodeResponseSessionKey {
+    relay_id: String,
+    model: String,
+    conversation_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct JoycodeResponseSession {
+    response_id: String,
+    request_input: Value,
+    response_output: Vec<Value>,
+    updated_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JoycodeResponseSessionContext {
+    key: JoycodeResponseSessionKey,
+    original_input: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JoycodePreparedResponseRequest {
+    context: Option<JoycodeResponseSessionContext>,
+    fallback_body: Option<Value>,
+}
+
+static JOYCODE_RESPONSE_SESSIONS: OnceLock<
+    Mutex<HashMap<JoycodeResponseSessionKey, JoycodeResponseSession>>,
+> = OnceLock::new();
+static JOYCODE_CHAT_CACHE_KEY_UNSUPPORTED: OnceLock<Mutex<HashSet<(String, String)>>> =
+    OnceLock::new();
+
 /// JoyCode 的 Responses 网关会把标准 SSE 的每一行再次包装成一个 `data:`
 /// 事件，例如 `data: event: response.created`。Codex 需要标准的 event/data
 /// 组合，因此这里只移除 JoyCode 外层包装，不解析也不改写事件 JSON。
@@ -375,9 +412,19 @@ pub struct JoycodeResponsesSseNormalizer {
     buffer: String,
     utf8_remainder: Vec<u8>,
     pending_event: Option<String>,
+    session_context: Option<JoycodeResponseSessionContext>,
 }
 
 impl JoycodeResponsesSseNormalizer {
+    pub(crate) fn with_session_context(
+        session_context: Option<JoycodeResponseSessionContext>,
+    ) -> Self {
+        Self {
+            session_context,
+            ..Self::default()
+        }
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -428,6 +475,7 @@ impl JoycodeResponsesSseNormalizer {
                     output.push_str(&event);
                     output.push('\n');
                 }
+                self.observe_data(inner.trim_start_matches("data:").trim_start());
                 output.push_str(inner);
                 output.push_str("\n\n");
                 return;
@@ -438,8 +486,389 @@ impl JoycodeResponsesSseNormalizer {
             output.push_str(&event);
             output.push('\n');
         }
+        for line in trimmed.lines() {
+            if let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") {
+                self.observe_data(data.trim_start());
+            }
+        }
         output.push_str(trimmed);
         output.push_str("\n\n");
+    }
+
+    fn observe_data(&self, data: &str) {
+        let Some(context) = self.session_context.as_ref() else {
+            return;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("response.completed") {
+            return;
+        }
+        record_joycode_completed_response(context, &payload);
+    }
+}
+
+fn prepare_joycode_response_session_request(
+    relay_id: &str,
+    body: &mut Value,
+) -> JoycodePreparedResponseRequest {
+    // JoyCode 原生 Responses provider 默认持久化响应，并使用 response.id
+    // 续接下一轮。该行为只在 JoyCode Responses 分支启用。
+    body["store"] = Value::Bool(true);
+
+    let Some(conversation_id) = stable_conversation_id_from_responses_request(body) else {
+        return JoycodePreparedResponseRequest::default();
+    };
+    let Some(original_input) = body.get("input").cloned() else {
+        return JoycodePreparedResponseRequest::default();
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let key = JoycodeResponseSessionKey {
+        relay_id: relay_id.to_string(),
+        model,
+        conversation_id,
+    };
+    let context = JoycodeResponseSessionContext {
+        key: key.clone(),
+        original_input: original_input.clone(),
+    };
+
+    let caller_supplied_previous = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if caller_supplied_previous {
+        return JoycodePreparedResponseRequest {
+            context: Some(context),
+            fallback_body: None,
+        };
+    }
+
+    let previous = JOYCODE_RESPONSE_SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|mut sessions| {
+            prune_joycode_response_sessions(&mut sessions);
+            sessions.get(&key).cloned()
+        });
+    let Some(previous) = previous else {
+        return JoycodePreparedResponseRequest {
+            context: Some(context),
+            fallback_body: None,
+        };
+    };
+    let Some(incremental_input) = joycode_incremental_input(
+        &original_input,
+        &previous.request_input,
+        &previous.response_output,
+    ) else {
+        clear_joycode_response_session(&key);
+        return JoycodePreparedResponseRequest {
+            context: Some(context),
+            fallback_body: None,
+        };
+    };
+
+    let fallback_body = body.clone();
+    body["previous_response_id"] = Value::String(previous.response_id);
+    body["input"] = incremental_input;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.joycode_response_chain",
+        json!({
+            "relayId": relay_id,
+            "model": body.get("model"),
+            "continued": true,
+            "inputItems": body.get("input").and_then(Value::as_array).map(Vec::len),
+        }),
+    );
+    JoycodePreparedResponseRequest {
+        context: Some(context),
+        fallback_body: Some(fallback_body),
+    }
+}
+
+fn stable_conversation_id_from_responses_request(body: &Value) -> Option<String> {
+    for key in ["conversation", "conversation_id", "prompt_cache_key"] {
+        if let Some(value) = body.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let metadata = body.get("client_metadata").or_else(|| body.get("metadata"));
+    for key in ["thread_id", "session_id", "conversation_id"] {
+        if let Some(value) = metadata
+            .and_then(|metadata| metadata.get(key))
+            .and_then(Value::as_str)
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn joycode_chat_cache_key_is_supported(relay_id: &str, model: &str) -> bool {
+    JOYCODE_CHAT_CACHE_KEY_UNSUPPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|unsupported| !unsupported.contains(&(relay_id.to_string(), model.to_string())))
+        .unwrap_or(true)
+}
+
+fn mark_joycode_chat_cache_key_unsupported(relay_id: &str, model: &str) {
+    if let Ok(mut unsupported) = JOYCODE_CHAT_CACHE_KEY_UNSUPPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+    {
+        unsupported.insert((relay_id.to_string(), model.to_string()));
+    }
+}
+
+fn joycode_incremental_input(
+    current_input: &Value,
+    previous_input: &Value,
+    previous_output: &[Value],
+) -> Option<Value> {
+    let current = current_input.as_array()?;
+    let previous = previous_input.as_array()?;
+    if previous_output.is_empty()
+        || current.len() <= previous.len() + previous_output.len()
+        || current.get(..previous.len())? != previous.as_slice()
+    {
+        return None;
+    }
+    let replayed_output = current.get(previous.len()..previous.len() + previous_output.len())?;
+    if !replayed_output
+        .iter()
+        .zip(previous_output)
+        .all(|(input_item, output_item)| joycode_response_items_match(input_item, output_item))
+    {
+        return None;
+    }
+    let delta = current[previous.len() + previous_output.len()..].to_vec();
+    (!delta.is_empty()).then_some(Value::Array(delta))
+}
+
+fn joycode_response_items_match(input_item: &Value, output_item: &Value) -> bool {
+    let input_type = input_item.get("type").and_then(Value::as_str);
+    let output_type = output_item.get("type").and_then(Value::as_str);
+    let input_id = input_item.get("id").and_then(Value::as_str);
+    let output_id = output_item.get("id").and_then(Value::as_str);
+    if input_type == output_type
+        && input_id.is_some()
+        && output_id.is_some()
+        && input_id == output_id
+    {
+        return true;
+    }
+    input_item == output_item
+}
+
+fn record_joycode_completed_response(context: &JoycodeResponseSessionContext, payload: &Value) {
+    let response = payload.get("response").unwrap_or(payload);
+    let Some(response_id) = response
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let Some(response_output) = response.get("output").and_then(Value::as_array) else {
+        return;
+    };
+    if response_output.is_empty() {
+        return;
+    }
+    if let Ok(mut sessions) = JOYCODE_RESPONSE_SESSIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        prune_joycode_response_sessions(&mut sessions);
+        if sessions.len() >= JOYCODE_RESPONSE_SESSION_LIMIT
+            && !sessions.contains_key(&context.key)
+            && let Some(oldest_key) = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.updated_at)
+                .map(|(key, _)| key.clone())
+        {
+            sessions.remove(&oldest_key);
+        }
+        sessions.insert(
+            context.key.clone(),
+            JoycodeResponseSession {
+                response_id: response_id.to_string(),
+                request_input: context.original_input.clone(),
+                response_output: response_output.clone(),
+                updated_at: Instant::now(),
+            },
+        );
+    }
+    let usage = response.get("usage");
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.joycode_response_completed",
+        json!({
+            "model": response.get("model"),
+            "inputTokens": usage.and_then(|usage| usage.get("input_tokens")),
+            "cachedTokens": usage
+                .and_then(|usage| usage.get("input_tokens_details"))
+                .and_then(|details| details.get("cached_tokens")),
+            "outputItems": response_output.len(),
+        }),
+    );
+}
+
+pub(crate) fn record_joycode_non_stream_response(
+    context: Option<&JoycodeResponseSessionContext>,
+    body: &[u8],
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let Ok(response) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    if response.get("status").and_then(Value::as_str) == Some("completed") {
+        record_joycode_completed_response(context, &response);
+    }
+}
+
+fn prune_joycode_response_sessions(
+    sessions: &mut HashMap<JoycodeResponseSessionKey, JoycodeResponseSession>,
+) {
+    sessions.retain(|_, session| session.updated_at.elapsed() <= JOYCODE_RESPONSE_SESSION_TTL);
+}
+
+fn clear_joycode_response_session(key: &JoycodeResponseSessionKey) {
+    if let Some(sessions) = JOYCODE_RESPONSE_SESSIONS.get()
+        && let Ok(mut sessions) = sessions.lock()
+    {
+        sessions.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod joycode_response_session_tests {
+    use super::*;
+
+    fn response_output() -> Value {
+        json!({
+            "type": "message",
+            "id": "msg_test",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello"}]
+        })
+    }
+
+    #[test]
+    fn response_chain_sends_only_verified_incremental_input() {
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let first_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first"}]
+        }]);
+        let mut first = json!({
+            "model": "GPT-5.6 Sol",
+            "prompt_cache_key": conversation_id,
+            "store": false,
+            "input": first_input
+        });
+        let prepared = prepare_joycode_response_session_request("relay-test", &mut first);
+        assert_eq!(first["store"], true);
+        assert!(first.get("previous_response_id").is_none());
+
+        let context = prepared.context.expect("session context");
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_test",
+                "status": "completed",
+                "output": [response_output()]
+            }
+        });
+        let wrapped_sse = format!(
+            "data: event: response.completed\n\ndata: data: {}\n\n",
+            completed
+        );
+        let mut normalizer =
+            JoycodeResponsesSseNormalizer::with_session_context(Some(context.clone()));
+        let normalized = normalizer.push_bytes(wrapped_sse.as_bytes());
+        assert!(
+            String::from_utf8(normalized)
+                .expect("normalized SSE")
+                .contains("event: response.completed")
+        );
+
+        let replayed_output = json!({
+            "type": "message",
+            "id": "msg_test",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}]
+        });
+        let next_input = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second"}]
+        });
+        let mut second = json!({
+            "model": "GPT-5.6 Sol",
+            "prompt_cache_key": conversation_id,
+            "store": false,
+            "input": [first_input[0].clone(), replayed_output, next_input.clone()]
+        });
+        let prepared = prepare_joycode_response_session_request("relay-test", &mut second);
+
+        assert_eq!(second["store"], true);
+        assert_eq!(second["previous_response_id"], "resp_test");
+        assert_eq!(second["input"], json!([next_input]));
+        assert!(prepared.fallback_body.is_some());
+        clear_joycode_response_session(&context.key);
+    }
+
+    #[test]
+    fn response_chain_falls_back_when_history_prefix_changed() {
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let original_input = json!([{"type": "message", "role": "user", "content": "old"}]);
+        let mut first = json!({
+            "model": "GPT-5.6 Sol",
+            "client_metadata": {"thread_id": conversation_id},
+            "input": original_input
+        });
+        let context = prepare_joycode_response_session_request("relay-test", &mut first)
+            .context
+            .expect("session context");
+        record_joycode_completed_response(
+            &context,
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "resp_old", "output": [response_output()]}
+            }),
+        );
+
+        let changed_input = json!([{"type": "message", "role": "user", "content": "edited"}]);
+        let mut changed = json!({
+            "model": "GPT-5.6 Sol",
+            "client_metadata": {"thread_id": conversation_id},
+            "input": changed_input.clone()
+        });
+        let prepared = prepare_joycode_response_session_request("relay-test", &mut changed);
+
+        assert!(changed.get("previous_response_id").is_none());
+        assert_eq!(changed["input"], changed_input);
+        assert!(prepared.fallback_body.is_none());
+        clear_joycode_response_session(&context.key);
     }
 }
 
@@ -552,7 +981,8 @@ impl ChatCompletionStreamAdapter {
 
     pub fn finish(&mut self) -> Vec<u8> {
         if !self.utf8_remainder.is_empty() {
-            self.buffer.push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
             self.utf8_remainder.clear();
         }
 
@@ -568,13 +998,16 @@ impl ChatCompletionStreamAdapter {
                 ChatStreamInlineThinkMode::Detecting | ChatStreamInlineThinkMode::Reasoning => {
                     let clean = strip_leading_think_open_tag(&flushed).unwrap_or(flushed);
                     if !clean.is_empty() {
-                        if let Some(json_block) = self.create_synthetic_delta_block("reasoning_content", &clean) {
+                        if let Some(json_block) =
+                            self.create_synthetic_delta_block("reasoning_content", &clean)
+                        {
                             output.push_str(&json_block);
                         }
                     }
                 }
                 ChatStreamInlineThinkMode::Text => {
-                    if let Some(json_block) = self.create_synthetic_delta_block("content", &flushed) {
+                    if let Some(json_block) = self.create_synthetic_delta_block("content", &flushed)
+                    {
                         output.push_str(&json_block);
                     }
                 }
@@ -635,23 +1068,31 @@ impl ChatCompletionStreamAdapter {
             if let Some(choice) = choices.first_mut() {
                 if let Some(delta) = choice.get_mut("delta") {
                     let has_reasoning_content = delta.get("reasoning_content").is_some();
-                    
+
                     if has_reasoning_content {
                         // Already has reasoning_content, pass through
                     } else if let Some(content) = delta.get("content").and_then(Value::as_str) {
                         let content_str = content.to_string();
                         if !content_str.is_empty() {
-                            let (reasoning_delta, content_delta) = self.process_content_delta(&content_str);
-                            
+                            let (reasoning_delta, content_delta) =
+                                self.process_content_delta(&content_str);
+
                             if !reasoning_delta.is_empty() && !content_delta.is_empty() {
                                 delta["reasoning_content"] = Value::String(reasoning_delta);
                                 delta.as_object_mut().unwrap().remove("content");
                                 self.write_chunk(output, event_name.as_deref(), &chunk);
-                                
+
                                 let mut second_chunk = chunk.clone();
-                                if let Some(second_choice) = second_chunk.get_mut("choices").and_then(Value::as_array_mut).and_then(|arr| arr.first_mut()) {
+                                if let Some(second_choice) = second_chunk
+                                    .get_mut("choices")
+                                    .and_then(Value::as_array_mut)
+                                    .and_then(|arr| arr.first_mut())
+                                {
                                     if let Some(second_delta) = second_choice.get_mut("delta") {
-                                        second_delta.as_object_mut().unwrap().remove("reasoning_content");
+                                        second_delta
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .remove("reasoning_content");
                                         second_delta["content"] = Value::String(content_delta);
                                     }
                                 }
@@ -729,10 +1170,10 @@ impl ChatCompletionStreamAdapter {
             if let Some(index) = self.think_buffer.find(THINK_CLOSE_TAG) {
                 let reasoning = self.think_buffer[..index].to_string();
                 let answer = self.think_buffer[index + THINK_CLOSE_TAG.len()..].to_string();
-                
+
                 reasoning_delta = reasoning;
                 content_delta = strip_think_answer_separator(&answer).to_string();
-                
+
                 self.think_buffer.clear();
                 self.mode = ChatStreamInlineThinkMode::Text;
             }
@@ -760,7 +1201,10 @@ impl ChatCompletionStreamAdapter {
                 }
             }]
         });
-        Some(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()))
+        Some(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&chunk).unwrap_or_default()
+        ))
     }
 }
 
@@ -798,7 +1242,11 @@ impl ChatSseToResponsesConverter {
             if let Ok(value) = serde_json::from_str::<Value>(self.buffer.trim_start()) {
                 let trimmed_buf_str = self.buffer.trim_start().to_string();
                 self.buffer.clear();
-                if let Some(login_url) = value.get("data").and_then(|d| d.get("loginUrl")).and_then(Value::as_str) {
+                if let Some(login_url) = value
+                    .get("data")
+                    .and_then(|d| d.get("loginUrl"))
+                    .and_then(Value::as_str)
+                {
                     return self.fail(
                         format!("Joycode 认证已失效，请访问 {} 并重新登录。", login_url),
                         Some("unauthorized".to_string()),
@@ -812,11 +1260,13 @@ impl ChatSseToResponsesConverter {
                         );
                     }
                 }
-                let msg = value.get("message")
+                let msg = value
+                    .get("message")
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| {
-                        value.get("msg")
+                        value
+                            .get("msg")
                             .and_then(Value::as_str)
                             .map(str::to_string)
                             .unwrap_or_else(|| trimmed_buf_str)
@@ -966,8 +1416,26 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
         let resolved_api_key = crate::relay_config::relay_profile_api_key(&relay);
-        let (endpoint, upstream_body, wire_api) =
+        let (endpoint, mut upstream_body, wire_api) =
             upstream_request_parts(&relay, request_json.clone())?;
+        let joycode_prepared = if wire_api == UpstreamWireApi::JoycodeResponses {
+            prepare_joycode_response_session_request(&relay.id, &mut upstream_body)
+        } else {
+            JoycodePreparedResponseRequest::default()
+        };
+        let joycode_chat_cache_fallback_body = if relay.protocol == RelayProtocol::Joycode
+            && wire_api == UpstreamWireApi::ChatCompletions
+            && upstream_body.get("prompt_cache_key").is_some()
+        {
+            let mut fallback_body = upstream_body.clone();
+            if let Some(fallback_body) = fallback_body.as_object_mut() {
+                fallback_body.remove("prompt_cache_key");
+            }
+            Some(fallback_body)
+        } else {
+            None
+        };
+        let joycode_session_context = joycode_prepared.context.clone();
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -983,7 +1451,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "headerTimeoutSeconds": header_timeout.as_secs()
             }),
         );
-        let upstream = match send_upstream_request_for_responses(
+        let mut upstream = match send_upstream_request_for_responses(
             upstream_request_builder(
                 crate::http_client::proxied_client(&effective_user_agent(
                     &relay.user_agent,
@@ -1028,6 +1496,102 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 });
             }
         };
+        if upstream.status().as_u16() == 400
+            && let Some(fallback_body) = joycode_prepared.fallback_body.as_ref()
+        {
+            if let Some(context) = joycode_session_context.as_ref() {
+                clear_joycode_response_session(&context.key);
+            }
+            let _ = upstream.bytes().await;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.joycode_response_chain_fallback",
+                json!({
+                    "relayId": relay.id,
+                    "model": upstream_body.get("model"),
+                    "statusCode": 400,
+                }),
+            );
+            upstream_body = fallback_body.clone();
+            upstream = match send_upstream_request_for_responses(
+                upstream_request_builder(
+                    crate::http_client::proxied_client(&effective_user_agent(
+                        &relay.user_agent,
+                        original_user_agent,
+                    ))?,
+                    &endpoint,
+                    resolved_api_key.trim(),
+                    relay.protocol,
+                    is_stream,
+                    &upstream_body,
+                ),
+                is_stream,
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    crate::relay_rotation::record_relay_request_failure(&settings);
+                    if has_more_candidates {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "供应商「{}」JoyCode 会话回退请求失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    });
+                }
+            };
+        }
+        if upstream.status().as_u16() == 400
+            && let Some(fallback_body) = joycode_chat_cache_fallback_body.as_ref()
+        {
+            let _ = upstream.bytes().await;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.joycode_chat_cache_key_fallback",
+                json!({
+                    "relayId": relay.id,
+                    "model": upstream_body.get("model"),
+                    "statusCode": 400,
+                }),
+            );
+            upstream_body = fallback_body.clone();
+            upstream = match send_upstream_request_for_responses(
+                upstream_request_builder(
+                    crate::http_client::proxied_client(&effective_user_agent(
+                        &relay.user_agent,
+                        original_user_agent,
+                    ))?,
+                    &endpoint,
+                    resolved_api_key.trim(),
+                    relay.protocol,
+                    is_stream,
+                    &upstream_body,
+                ),
+                is_stream,
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    crate::relay_rotation::record_relay_request_failure(&settings);
+                    if has_more_candidates {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "供应商「{}」JoyCode Chat 缓存键回退请求失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    });
+                }
+            };
+            if upstream.status().is_success()
+                && let Some(model) = upstream_body.get("model").and_then(Value::as_str)
+            {
+                mark_joycode_chat_cache_key_unsupported(&relay.id, model);
+            }
+        }
         let status_code = upstream.status().as_u16();
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_response",
@@ -1063,13 +1627,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             if !has_more_candidates && is_transient_upstream_error(status_code) {
                 // 消费掉 response body 用于日志，然后重试
                 let error_body_bytes = upstream.bytes().await.unwrap_or_default();
-                let error_body_preview = String::from_utf8_lossy(
-                    &error_body_bytes[..error_body_bytes.len().min(512)]
-                ).to_string();
+                let error_body_preview =
+                    String::from_utf8_lossy(&error_body_bytes[..error_body_bytes.len().min(512)])
+                        .to_string();
                 let mut last_status = status_code;
                 for retry in 1..=TRANSIENT_ERROR_MAX_RETRIES {
                     let backoff = Duration::from_secs(
-                        TRANSIENT_ERROR_BACKOFF_BASE_SECS * (1u64 << (retry - 1))
+                        TRANSIENT_ERROR_BACKOFF_BASE_SECS * (1u64 << (retry - 1)),
                     );
                     let _ = crate::diagnostic_log::append_diagnostic_log(
                         "protocol_proxy.transient_error_retry",
@@ -1129,6 +1693,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                     wire_api,
                                     response: Some(retry_upstream),
                                     custom_body: None,
+                                    joycode_session_context: joycode_session_context.clone(),
                                 });
                             }
                             // 更新 last_status 以继续重试
@@ -1148,6 +1713,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                     wire_api,
                                     response: Some(retry_upstream),
                                     custom_body: None,
+                                    joycode_session_context: joycode_session_context.clone(),
                                 });
                             }
                             // 还是临时错误，消费body后继续
@@ -1166,6 +1732,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     wire_api,
                     response: None,
                     custom_body: Some(error_body_bytes.to_vec()),
+                    joycode_session_context: joycode_session_context.clone(),
                 });
             }
             return Ok(UpstreamProxyResponse {
@@ -1175,6 +1742,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 wire_api,
                 response: Some(upstream),
                 custom_body: None,
+                joycode_session_context,
             });
         }
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1221,7 +1789,10 @@ pub async fn open_models_proxy_request_with_settings(
         let endpoint = if base.starts_with("https://") {
             sign_joycode_gateway_url(base, "joycode_modelList")
         } else {
-            format!("{}/api/saas/models/v2/modelList", base.trim_end_matches('/'))
+            format!(
+                "{}/api/saas/models/v2/modelList",
+                base.trim_end_matches('/')
+            )
         };
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.models_request",
@@ -1243,11 +1814,14 @@ pub async fn open_models_proxy_request_with_settings(
             .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
-            .header("clientVersion", "3.8.61")
-            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+            .header("clientVersion", JOYCODE_CLIENT_VERSION)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            )
             .json(&serde_json::json!({
                 "client": "JoyCodeIDE",
-                "clientVersion": "3.8.61"
+                "clientVersion": JOYCODE_CLIENT_VERSION
             }))
             .send()
             .await?;
@@ -1260,13 +1834,15 @@ pub async fn open_models_proxy_request_with_settings(
                 let mut openai_models = Vec::new();
                 if let Some(models) = models {
                     for m in models {
-                        let model_id = m.get("chatApiModel")
+                        let model_id = m
+                            .get("chatApiModel")
                             .and_then(Value::as_str)
                             .or_else(|| m.get("label").and_then(Value::as_str))
                             .filter(|s| !s.trim().is_empty());
                         if let Some(model_id) = model_id {
                             register_joycode_model_metadata(m);
-                            let max_tokens = m.get("maxTotalTokens")
+                            let max_tokens = m
+                                .get("maxTotalTokens")
                                 .and_then(Value::as_u64)
                                 .or_else(|| m.get("respMaxTokens").and_then(Value::as_u64));
                             let mut model_obj = serde_json::json!({
@@ -1307,6 +1883,7 @@ pub async fn open_models_proxy_request_with_settings(
             wire_api: UpstreamWireApi::ChatCompletions,
             response: None,
             custom_body,
+            joycode_session_context: None,
         });
     }
 
@@ -1344,6 +1921,7 @@ pub async fn open_models_proxy_request_with_settings(
         wire_api: UpstreamWireApi::Responses,
         response: Some(upstream),
         custom_body: None,
+        joycode_session_context: None,
     })
 }
 
@@ -1356,7 +1934,8 @@ pub async fn open_chat_completions_proxy_request(
     let resolved_base_url = crate::relay_config::relay_profile_base_url(&relay);
     let resolved_api_key = crate::relay_config::relay_profile_api_key(&relay);
 
-    if relay.protocol != RelayProtocol::ChatCompletions && relay.protocol != RelayProtocol::Joycode {
+    if relay.protocol != RelayProtocol::ChatCompletions && relay.protocol != RelayProtocol::Joycode
+    {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
     }
     if relay.protocol != RelayProtocol::Joycode && resolved_base_url.trim().is_empty() {
@@ -1368,9 +1947,16 @@ pub async fn open_chat_completions_proxy_request(
 
     let mut request_json: Value = serde_json::from_str(body)?;
     if relay.protocol == RelayProtocol::Joycode {
-        let req_model = request_json.get("model").and_then(Value::as_str).unwrap_or("");
+        let req_model = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
-            request_json["model"] = Value::String(if relay.model.trim().is_empty() { "Kimi-K2.6".to_string() } else { relay.model.trim().to_string() });
+            request_json["model"] = Value::String(if relay.model.trim().is_empty() {
+                "Kimi-K2.6".to_string()
+            } else {
+                relay.model.trim().to_string()
+            });
         }
     }
 
@@ -1378,30 +1964,30 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    
+
     let mut request_builder = crate::http_client::proxied_client(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
     ))?
     .post(chat_completions_url_for_relay(&relay));
-    
+
     if relay.protocol == RelayProtocol::Joycode {
         let resolved_key = get_latest_ptkey(resolved_api_key.trim());
         request_builder = request_builder
             .header("ptKey", &resolved_key)
             .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
-            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            );
     } else {
         request_builder = request_builder
             .bearer_auth(resolved_api_key.trim())
             .header(reqwest::header::CONTENT_TYPE, "application/json");
     }
 
-    let upstream = request_builder
-        .json(&request_json)
-        .send()
-        .await?;
+    let upstream = request_builder.json(&request_json).send().await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -1417,6 +2003,7 @@ pub async fn open_chat_completions_proxy_request(
         wire_api: UpstreamWireApi::ChatCompletions,
         response: Some(upstream),
         custom_body: None,
+        joycode_session_context: None,
     })
 }
 
@@ -1464,15 +2051,16 @@ pub fn upstream_request_parts(
                 .trim()
                 .to_string();
 
-            let model_name = if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
-                if relay.model.trim().is_empty() {
-                    "Kimi-K2.6".to_string()
+            let model_name =
+                if req_model.is_empty() || req_model == "joycode" || req_model == "custom" {
+                    if relay.model.trim().is_empty() {
+                        "Kimi-K2.6".to_string()
+                    } else {
+                        relay.model.trim().to_string()
+                    }
                 } else {
-                    relay.model.trim().to_string()
-                }
-            } else {
-                req_model
-            };
+                    req_model
+                };
 
             let final_model = if model_name.ends_with("-hq") {
                 model_name.clone()
@@ -1491,6 +2079,7 @@ pub fn upstream_request_parts(
             } else {
                 "openai"
             };
+            let stable_cache_key = stable_conversation_id_from_responses_request(&request_json);
 
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "protocol_proxy.joycode_request_model",
@@ -1508,7 +2097,9 @@ pub fn upstream_request_parts(
                 let mut passthrough_body = request_json;
                 passthrough_body["model"] = Value::String(final_model);
                 passthrough_body["client"] = Value::String("JoyCodeIDE".to_string());
-                passthrough_body["clientVersion"] = Value::String("3.8.61".to_string());
+                passthrough_body["clientVersion"] =
+                    Value::String(JOYCODE_CLIENT_VERSION.to_string());
+                passthrough_body["store"] = Value::Bool(true);
                 let endpoint = if base.starts_with("https://") {
                     sign_joycode_gateway_url(base, "responses_completions")
                 } else {
@@ -1529,30 +2120,34 @@ pub fn upstream_request_parts(
                 if adapter == "anthropic" {
                     let mut anthropic_req = openai_to_anthropic_request(req_body);
                     anthropic_req["client"] = Value::String("JoyCodeIDE".to_string());
-                    anthropic_req["clientVersion"] = Value::String("3.8.61".to_string());
+                    anthropic_req["clientVersion"] =
+                        Value::String(JOYCODE_CLIENT_VERSION.to_string());
                     let endpoint = if base.starts_with("https://") {
                         sign_joycode_gateway_url(base, "anthropic_completions")
                     } else {
-                        format!("{}/api/saas/anthropic/v1/messages", base.trim_end_matches('/'))
+                        format!(
+                            "{}/api/saas/anthropic/v1/messages",
+                            base.trim_end_matches('/')
+                        )
                     };
-                    Ok((
-                        endpoint,
-                        anthropic_req,
-                        UpstreamWireApi::JoycodeAnthropic,
-                    ))
+                    Ok((endpoint, anthropic_req, UpstreamWireApi::JoycodeAnthropic))
                 } else {
+                    if let Some(cache_key) = stable_cache_key
+                        && joycode_chat_cache_key_is_supported(&relay.id, &final_model)
+                    {
+                        req_body["prompt_cache_key"] = Value::String(cache_key);
+                    }
                     req_body["client"] = Value::String("JoyCodeIDE".to_string());
-                    req_body["clientVersion"] = Value::String("3.8.61".to_string());
+                    req_body["clientVersion"] = Value::String(JOYCODE_CLIENT_VERSION.to_string());
                     let endpoint = if base.starts_with("https://") {
                         sign_joycode_gateway_url(base, "chat_completions")
                     } else {
-                        format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+                        format!(
+                            "{}/api/saas/openai/v2/chat/completions",
+                            base.trim_end_matches('/')
+                        )
                     };
-                    Ok((
-                        endpoint,
-                        req_body,
-                        UpstreamWireApi::ChatCompletions,
-                    ))
+                    Ok((endpoint, req_body, UpstreamWireApi::ChatCompletions))
                 }
             }
         }
@@ -1575,8 +2170,11 @@ fn upstream_request_builder(
             .header("loginType", get_logintype_for_ptkey(&resolved_key))
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
-            .header("clientVersion", "3.8.61")
-            .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8");
+            .header("clientVersion", JOYCODE_CLIENT_VERSION)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/json; charset=UTF-8",
+            );
     } else {
         builder = builder
             .bearer_auth(api_key)
@@ -1603,12 +2201,13 @@ fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
-    for key in ["conversation", "conversation_id", "previous_response_id"] {
-        if let Some(value) = body.get(key).and_then(Value::as_str) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
+    if let Some(conversation_id) = stable_conversation_id_from_responses_request(body) {
+        return Some(conversation_id);
+    }
+    if let Some(value) = body.get("previous_response_id").and_then(Value::as_str) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
         }
     }
     None
@@ -1633,6 +2232,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
+    let joycode_session_context = upstream.joycode_session_context.clone();
     let upstream_body = upstream.bytes().await?;
 
     if !(200..300).contains(&status_code) {
@@ -1659,11 +2259,13 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 
     if wire_api == UpstreamWireApi::JoycodeResponses {
         let body = if is_stream {
-            let mut normalizer = JoycodeResponsesSseNormalizer::default();
+            let mut normalizer =
+                JoycodeResponsesSseNormalizer::with_session_context(joycode_session_context);
             let mut normalized = normalizer.push_bytes(&upstream_body);
             normalized.extend(normalizer.finish());
             normalized
         } else {
+            record_joycode_non_stream_response(joycode_session_context.as_ref(), &upstream_body);
             upstream_body
         };
         return Ok(ProxyHttpResponse {
@@ -1720,7 +2322,10 @@ pub fn chat_completions_url_for_relay(relay: &crate::settings::RelayProfile) -> 
         if base.starts_with("https://") {
             sign_joycode_gateway_url(base, "chat_completions")
         } else {
-            format!("{}/api/saas/openai/v2/chat/completions", base.trim_end_matches('/'))
+            format!(
+                "{}/api/saas/openai/v2/chat/completions",
+                base.trim_end_matches('/')
+            )
         }
     } else {
         chat_completions_url(&resolved_base_url)
@@ -1921,8 +2526,13 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
-        let model = original_request.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-        let conversation_id = conversation_id_from_responses_request(original_request).unwrap_or_default();
+        let model = original_request
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let conversation_id =
+            conversation_id_from_responses_request(original_request).unwrap_or_default();
         Self {
             tool_context: build_codex_tool_context(original_request.get("tools")),
             original_request: Some(original_request.clone()),
@@ -2008,7 +2618,9 @@ impl ChatSseState {
                     ThinkPrefixDecision::NeedMore => {}
                     ThinkPrefixDecision::Reasoning => {
                         self.inline_think.mode = InlineThinkMode::Reasoning;
-                        if let Some(stripped) = strip_leading_think_open_tag(&self.inline_think.buffer) {
+                        if let Some(stripped) =
+                            strip_leading_think_open_tag(&self.inline_think.buffer)
+                        {
                             self.inline_think.buffer = stripped;
                         }
                         self.process_inline_reasoning_buffer_into(output);
@@ -2033,17 +2645,17 @@ impl ChatSseState {
             if let Some(index) = self.inline_think.buffer.find(THINK_CLOSE_TAG) {
                 let reasoning = self.inline_think.buffer[..index].to_string();
                 let answer = self.inline_think.buffer[index + THINK_CLOSE_TAG.len()..].to_string();
-                
+
                 if !reasoning.is_empty() {
                     self.push_reasoning_delta_into(&reasoning, output);
                 }
                 self.finalize_reasoning_into(output);
-                
+
                 let answer_clean = strip_think_answer_separator(&answer).to_string();
                 if !answer_clean.is_empty() {
                     self.push_text_delta_into(&answer_clean, output);
                 }
-                
+
                 self.inline_think.buffer.clear();
                 self.inline_think.mode = InlineThinkMode::Text;
             }
@@ -2073,17 +2685,17 @@ impl ChatSseState {
             InlineThinkMode::Reasoning => {
                 let buffered = std::mem::take(&mut self.inline_think.buffer);
                 self.inline_think.mode = InlineThinkMode::Text;
-                
+
                 if buffered.contains(THINK_CLOSE_TAG) {
                     if let Some(index) = buffered.find(THINK_CLOSE_TAG) {
                         let reasoning = buffered[..index].to_string();
                         let answer = buffered[index + THINK_CLOSE_TAG.len()..].to_string();
-                        
+
                         if !reasoning.is_empty() {
                             self.push_reasoning_delta_into(&reasoning, output);
                         }
                         self.finalize_reasoning_into(output);
-                        
+
                         let answer_clean = strip_think_answer_separator(&answer).to_string();
                         if !answer_clean.is_empty() {
                             self.push_text_delta_into(&answer_clean, output);
@@ -2091,7 +2703,7 @@ impl ChatSseState {
                         return;
                     }
                 }
-                
+
                 let reasoning = strip_leading_think_open_tag(&buffered).unwrap_or(buffered);
                 if !reasoning.is_empty() {
                     self.push_reasoning_delta_into(&reasoning, output);
@@ -4911,7 +5523,7 @@ fn is_openai_o_series(model: &str) -> bool {
             .is_some_and(|byte| byte.is_ascii_digit())
 }
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -4971,7 +5583,7 @@ pub fn is_joycode_model_registered(model_id: &str) -> bool {
 pub fn init_model_lists_from_profile(profile: &crate::settings::RelayProfile) {
     let list_str = &profile.model_list;
     let model = &profile.model;
-    
+
     let mut models = Vec::new();
     for part in list_str.split(['\r', '\n', ',']) {
         let trimmed = part.trim();
@@ -4983,7 +5595,7 @@ pub fn init_model_lists_from_profile(profile: &crate::settings::RelayProfile) {
     if !trimmed_model.is_empty() {
         models.push(trimmed_model.to_string());
     }
-    
+
     for model in models {
         register_joycode_model(model.clone());
         if model.to_ascii_lowercase().contains("claude") {
@@ -5010,9 +5622,7 @@ pub fn is_joycode_responses_model(model_id: &str) -> bool {
     {
         return true;
     }
-    normalized == "gpt-5.6"
-        || normalized == "gpt-5.6 sol"
-        || normalized.ends_with("-sol")
+    normalized == "gpt-5.6" || normalized == "gpt-5.6 sol" || normalized.ends_with("-sol")
 }
 
 pub fn register_anthropic_model(model_id: String) {
@@ -5039,18 +5649,24 @@ pub fn is_joycode_model(model_id: &str, profile: &crate::settings::RelayProfile)
     }
     let lower = trimmed.to_lowercase();
 
-    if is_joycode_model_registered(trimmed) || is_joycode_model_registered(&format!("{trimmed}-hq")) {
+    if is_joycode_model_registered(trimmed) || is_joycode_model_registered(&format!("{trimmed}-hq"))
+    {
         return true;
     }
 
     let profile_model = profile.model.trim();
-    if !profile_model.is_empty() && (profile_model.eq_ignore_ascii_case(trimmed) || format!("{profile_model}-hq").eq_ignore_ascii_case(trimmed)) {
+    if !profile_model.is_empty()
+        && (profile_model.eq_ignore_ascii_case(trimmed)
+            || format!("{profile_model}-hq").eq_ignore_ascii_case(trimmed))
+    {
         return true;
     }
 
     for part in profile.model_list.split(['\r', '\n', ',']) {
         let p = part.trim();
-        if !p.is_empty() && (p.eq_ignore_ascii_case(trimmed) || format!("{p}-hq").eq_ignore_ascii_case(trimmed)) {
+        if !p.is_empty()
+            && (p.eq_ignore_ascii_case(trimmed) || format!("{p}-hq").eq_ignore_ascii_case(trimmed))
+        {
             return true;
         }
     }
@@ -5127,10 +5743,19 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
                 // Convert tool_calls to Anthropic tool_use blocks
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                     for tc in tool_calls {
-                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        let id = tc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         if let Some(func) = tc.get("function") {
-                            let name = func.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                            let input: Value = func.get("arguments")
+                            let name = func
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let input: Value = func
+                                .get("arguments")
                                 .and_then(Value::as_str)
                                 .and_then(|s| serde_json::from_str(s).ok())
                                 .unwrap_or_else(|| json!({}));
@@ -5154,8 +5779,16 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
                 }
             } else if role == "tool" {
                 // Convert role:"tool" -> role:"user" with tool_result content block
-                let tool_call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
-                let content_str = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let content_str = msg
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let tool_result_block = json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
@@ -5163,12 +5796,14 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
                 });
 
                 // Merge consecutive tool results into a single user message
-                let should_merge = messages.last()
+                let should_merge = messages
+                    .last()
                     .and_then(|m| m.get("role"))
                     .and_then(Value::as_str)
-               .map(|r| r == "user")
+                    .map(|r| r == "user")
                     .unwrap_or(false)
-                    && messages.last()
+                    && messages
+                        .last()
                         .and_then(|m| m.get("content"))
                         .and_then(Value::as_array)
                         .and_then(|arr| arr.first())
@@ -5179,7 +5814,8 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
 
                 if should_merge {
                     if let Some(last_msg) = messages.last_mut() {
-                        if let Some(arr) = last_msg.get_mut("content").and_then(Value::as_array_mut) {
+                        if let Some(arr) = last_msg.get_mut("content").and_then(Value::as_array_mut)
+                        {
                             arr.push(tool_result_block);
                         }
                     }
@@ -5199,10 +5835,16 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
                             if let Some(item_type) = item.get("type").and_then(Value::as_str) {
                                 if item_type == "image_url" {
                                     if let Some(image_url_obj) = item.get("image_url") {
-                                        if let Some(url_str) = image_url_obj.get("url").and_then(Value::as_str) {
+                                        if let Some(url_str) =
+                                            image_url_obj.get("url").and_then(Value::as_str)
+                                        {
                                             let cleaned_url = clean_and_convert_image_url(url_str);
-                                            if let Some(stripped) = cleaned_url.strip_prefix("data:") {
-                                                if let Some((media_type, rest)) = stripped.split_once(";base64,") {
+                                            if let Some(stripped) =
+                                                cleaned_url.strip_prefix("data:")
+                                            {
+                                                if let Some((media_type, rest)) =
+                                                    stripped.split_once(";base64,")
+                                                {
                                                     new_arr.push(serde_json::json!({
                                                         "type": "image",
                                                         "source": {
@@ -5239,8 +5881,13 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
         }
     }
     if !system_text.is_empty() {
-        anthropic_body["system"] = Value::String(system_text);
+        anthropic_body["system"] = json!([{
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"}
+        }]);
     }
+    apply_joycode_anthropic_cache_breakpoints(&mut messages);
     anthropic_body["messages"] = Value::Array(messages);
 
     // Convert tools: OpenAI function format -> Anthropic tool format
@@ -5251,7 +5898,10 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
                 if let Some(func) = tool.get("function") {
                     let name = func.get("name").cloned().unwrap_or(json!(""));
                     let description = func.get("description").cloned().unwrap_or(json!(""));
-                    let input_schema = func.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}}));
+                    let input_schema = func
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or(json!({"type": "object", "properties": {}}));
                     anthropic_tools.push(json!({
                         "name": name,
                         "description": description,
@@ -5265,7 +5915,8 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
         }
     }
 
-    let max_tokens = body.get("max_tokens")
+    let max_tokens = body
+        .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(4000);
@@ -5277,7 +5928,11 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
         }
     }
 
-    let model_lower = body.get("model").and_then(Value::as_str).unwrap_or("").to_lowercase();
+    let model_lower = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
     if model_lower.contains("claude-3-7") || model_lower.contains("claude-3.7") {
         anthropic_body["thinking"] = serde_json::json!({
             "type": "disabled"
@@ -5285,6 +5940,62 @@ pub fn openai_to_anthropic_request(body: Value) -> Value {
     }
 
     anthropic_body
+}
+
+fn apply_joycode_anthropic_cache_breakpoints(messages: &mut [Value]) {
+    let cache_start = messages.len().saturating_sub(2);
+    for message in &mut messages[cache_start..] {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(text) => {
+                *content = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"}
+                }]);
+            }
+            Value::Array(blocks) => {
+                if let Some(last_block) = blocks.last_mut()
+                    && let Some(last_block) = last_block.as_object_mut()
+                {
+                    last_block.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn anthropic_usage_to_openai_usage(usage: Option<&Value>) -> Value {
+    let usage = usage.unwrap_or(&Value::Null);
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_read + cache_creation;
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation
+    })
 }
 
 pub fn anthropic_to_openai_response(body: Value) -> Value {
@@ -5300,7 +6011,7 @@ pub fn anthropic_to_openai_response(body: Value) -> Value {
 
     let id = body.get("id").and_then(Value::as_str).unwrap_or("");
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    
+
     let mut text_content = String::new();
     if let Some(content_array) = body.get("content").and_then(Value::as_array) {
         for block in content_array {
@@ -5311,14 +6022,9 @@ pub fn anthropic_to_openai_response(body: Value) -> Value {
             }
         }
     }
-    
-    let mut prompt_tokens = 0;
-    let mut completion_tokens = 0;
-    if let Some(usage) = body.get("usage") {
-        prompt_tokens = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-        completion_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-    }
-    
+
+    let usage = anthropic_usage_to_openai_usage(body.get("usage"));
+
     serde_json::json!({
         "id": id,
         "object": "chat.completion",
@@ -5334,17 +6040,17 @@ pub fn anthropic_to_openai_response(body: Value) -> Value {
                 "finish_reason": "stop"
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
+        "usage": usage
     })
 }
 
 pub struct AnthropicToOpenAiSseTranslator {
     buffer: String,
     tool_blocks: std::collections::HashMap<u32, (String, String)>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 impl Default for AnthropicToOpenAiSseTranslator {
@@ -5352,57 +6058,125 @@ impl Default for AnthropicToOpenAiSseTranslator {
         Self {
             buffer: String::new(),
             tool_blocks: std::collections::HashMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         }
     }
 }
 
 impl AnthropicToOpenAiSseTranslator {
+    fn update_usage(&mut self, usage: &Value) {
+        if let Some(value) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.input_tokens = value;
+        }
+        if let Some(value) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = value;
+        }
+        if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.cache_read_input_tokens = value;
+        }
+        if let Some(value) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_creation_input_tokens = value;
+        }
+    }
+
+    fn openai_usage(&self) -> Value {
+        anthropic_usage_to_openai_usage(Some(&json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens
+        })))
+    }
+
+    fn usage_chunk(&self) -> Value {
+        json!({
+            "id": "chatcmpl-anthropic",
+            "object": "chat.completion.chunk",
+            "created": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
+            "model": "claude",
+            "choices": [],
+            "usage": self.openai_usage()
+        })
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
         let mut output = String::new();
-        
+
         while let Some(block) = take_sse_block(&mut self.buffer) {
             if block.trim().is_empty() {
                 continue;
             }
-            
+
             for line in block.lines() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
-                
+
                 let mut rest = if let Some(stripped) = line.strip_prefix("data:") {
                     stripped.trim()
                 } else {
                     line
                 };
-                
+
                 let mut is_json_data = false;
                 if let Some(stripped) = rest.strip_prefix("data:") {
                     rest = stripped.trim();
                     is_json_data = true;
                 }
-                
+
                 if rest == "[DONE]" {
                     output.push_str("data: [DONE]\n\n");
                     continue;
                 }
-                
+
                 if is_json_data {
                     let Ok(anthropic_val) = serde_json::from_str::<Value>(rest) else {
                         continue;
                     };
-                    
+
                     if let Some(event_type) = anthropic_val.get("type").and_then(Value::as_str) {
                         match event_type {
+                            "message_start" => {
+                                if let Some(usage) = anthropic_val
+                                    .get("message")
+                                    .and_then(|message| message.get("usage"))
+                                {
+                                    self.update_usage(usage);
+                                    output.push_str(&format!("data: {}\n\n", self.usage_chunk()));
+                                }
+                            }
                             "content_block_start" => {
-                                if let Some(index) = anthropic_val.get("index").and_then(Value::as_u64) {
-                                    if let Some(content_block) = anthropic_val.get("content_block") {
-                                        if content_block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                                            let id = content_block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                                            let name = content_block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                                            self.tool_blocks.insert(index as u32, (id.clone(), name.clone()));
+                                if let Some(index) =
+                                    anthropic_val.get("index").and_then(Value::as_u64)
+                                {
+                                    if let Some(content_block) = anthropic_val.get("content_block")
+                                    {
+                                        if content_block.get("type").and_then(Value::as_str)
+                                            == Some("tool_use")
+                                        {
+                                            let id = content_block
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let name = content_block
+                                                .get("name")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            self.tool_blocks
+                                                .insert(index as u32, (id.clone(), name.clone()));
 
                                             let openai_chunk = serde_json::json!({
                                                 "id": "chatcmpl-anthropic",
@@ -5428,16 +6202,27 @@ impl AnthropicToOpenAiSseTranslator {
                                                     }
                                                 ]
                                             });
-                                            output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                            output.push_str(&format!(
+                                                "data: {}\n\n",
+                                                openai_chunk.to_string()
+                                            ));
                                         }
                                     }
                                 }
                             }
                             "content_block_delta" => {
-                                let delta_type = anthropic_val.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str).unwrap_or("");
+                                let delta_type = anthropic_val
+                                    .get("delta")
+                                    .and_then(|d| d.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
                                 if delta_type == "thinking_delta" {
                                     // Anthropic thinking block → OpenAI reasoning_content
-                                    if let Some(thinking) = anthropic_val.get("delta").and_then(|d| d.get("thinking")).and_then(Value::as_str) {
+                                    if let Some(thinking) = anthropic_val
+                                        .get("delta")
+                                        .and_then(|d| d.get("thinking"))
+                                        .and_then(Value::as_str)
+                                    {
                                         let openai_chunk = serde_json::json!({
                                             "id": "chatcmpl-anthropic",
                                             "object": "chat.completion.chunk",
@@ -5452,10 +6237,17 @@ impl AnthropicToOpenAiSseTranslator {
                                                 }
                                             ]
                                         });
-                                        output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                        output.push_str(&format!(
+                                            "data: {}\n\n",
+                                            openai_chunk.to_string()
+                                        ));
                                     }
                                 } else if delta_type == "text_delta" || delta_type == "text" {
-                                    if let Some(text) = anthropic_val.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+                                    if let Some(text) = anthropic_val
+                                        .get("delta")
+                                        .and_then(|d| d.get("text"))
+                                        .and_then(Value::as_str)
+                                    {
                                         // Anthropic text block → OpenAI content
                                         let openai_chunk = serde_json::json!({
                                             "id": "chatcmpl-anthropic",
@@ -5471,11 +6263,20 @@ impl AnthropicToOpenAiSseTranslator {
                                                 }
                                             ]
                                         });
-                                        output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                        output.push_str(&format!(
+                                            "data: {}\n\n",
+                                            openai_chunk.to_string()
+                                        ));
                                     }
                                 } else if delta_type == "input_json_delta" {
-                                    if let Some(partial_json) = anthropic_val.get("delta").and_then(|d| d.get("partial_json")).and_then(Value::as_str) {
-                                        if let Some(index) = anthropic_val.get("index").and_then(Value::as_u64) {
+                                    if let Some(partial_json) = anthropic_val
+                                        .get("delta")
+                                        .and_then(|d| d.get("partial_json"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        if let Some(index) =
+                                            anthropic_val.get("index").and_then(Value::as_u64)
+                                        {
                                             let openai_chunk = serde_json::json!({
                                                 "id": "chatcmpl-anthropic",
                                                 "object": "chat.completion.chunk",
@@ -5497,13 +6298,22 @@ impl AnthropicToOpenAiSseTranslator {
                                                     }
                                                 ]
                                             });
-                                            output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
+                                            output.push_str(&format!(
+                                                "data: {}\n\n",
+                                                openai_chunk.to_string()
+                                            ));
                                         }
                                     }
                                 }
                             }
                             "message_delta" => {
-                                let stop_reason = anthropic_val.get("delta").and_then(|d| d.get("stop_reason")).and_then(Value::as_str);
+                                if let Some(usage) = anthropic_val.get("usage") {
+                                    self.update_usage(usage);
+                                }
+                                let stop_reason = anthropic_val
+                                    .get("delta")
+                                    .and_then(|d| d.get("stop_reason"))
+                                    .and_then(Value::as_str);
                                 let finish_reason = if stop_reason == Some("tool_use") {
                                     "tool_calls"
                                 } else {
@@ -5520,7 +6330,8 @@ impl AnthropicToOpenAiSseTranslator {
                                             "delta": {},
                                             "finish_reason": finish_reason
                                         }
-                                    ]
+                                    ],
+                                    "usage": self.openai_usage()
                                 });
                                 output.push_str(&format!("data: {}\n\n", openai_chunk.to_string()));
                             }
@@ -5528,7 +6339,11 @@ impl AnthropicToOpenAiSseTranslator {
                                 output.push_str("data: [DONE]\n\n");
                             }
                             "error" => {
-                                let error_msg = anthropic_val.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("Unknown Anthropic error");
+                                let error_msg = anthropic_val
+                                    .get("error")
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Unknown Anthropic error");
                                 let openai_error = serde_json::json!({
                                     "error": {
                                         "message": error_msg,
@@ -5543,7 +6358,7 @@ impl AnthropicToOpenAiSseTranslator {
                 }
             }
         }
-        
+
         output.into_bytes()
     }
 }
@@ -5556,7 +6371,8 @@ pub struct LatestUsageInfo {
     pub conversation_id: String,
 }
 
-static LATEST_USAGE: std::sync::OnceLock<std::sync::Mutex<Option<LatestUsageInfo>>> = std::sync::OnceLock::new();
+static LATEST_USAGE: std::sync::OnceLock<std::sync::Mutex<Option<LatestUsageInfo>>> =
+    std::sync::OnceLock::new();
 
 pub fn set_latest_usage(info: LatestUsageInfo) {
     let mutex = LATEST_USAGE.get_or_init(|| Mutex::new(None));
@@ -5567,7 +6383,11 @@ pub fn set_latest_usage(info: LatestUsageInfo) {
 
 pub fn get_model_context_limit(model: &str) -> u32 {
     let model_lower = model.to_lowercase();
-    if model_lower.contains("sonnet") || model_lower.contains("haiku") || model_lower.contains("opus") || model_lower.contains("claude-3") {
+    if model_lower.contains("sonnet")
+        || model_lower.contains("haiku")
+        || model_lower.contains("opus")
+        || model_lower.contains("claude-3")
+    {
         200_000
     } else if model_lower.contains("deepseek") {
         64_000
@@ -5629,7 +6449,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut outer_hasher = Sha256::new();
     outer_hasher.update(&opad);
     outer_hasher.update(&inner_hash);
-    
+
     let result = outer_hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
@@ -5645,7 +6465,7 @@ pub fn sign_joycode_gateway_url(base_url: &str, function_id: &str) -> String {
     let string_to_sign = format!("joycode_ide&{}&{}", function_id, t);
     let key = b"0691a3f0b37b4a85aeb63ad0fc7db3ed";
     let sign_bytes = hmac_sha256(key, string_to_sign.as_bytes());
-    
+
     let mut sign = String::with_capacity(64);
     for byte in sign_bytes {
         sign.push_str(&format!("{:02x}", byte));
@@ -5706,7 +6526,9 @@ fn get_jetbrains_options_xml_paths() -> Vec<std::path::PathBuf> {
                         if let Ok(xml_entries) = std::fs::read_dir(options_dir) {
                             for xml_entry in xml_entries.flatten() {
                                 let filename = xml_entry.file_name().to_string_lossy().to_string();
-                                if filename.contains("JoyCoderSettings") && filename.ends_with(".xml") {
+                                if filename.contains("JoyCoderSettings")
+                                    && filename.ends_with(".xml")
+                                {
                                     paths.push(xml_entry.path());
                                 }
                             }
@@ -5726,7 +6548,9 @@ fn get_jetbrains_options_xml_paths() -> Vec<std::path::PathBuf> {
                         if let Ok(xml_entries) = std::fs::read_dir(options_dir) {
                             for xml_entry in xml_entries.flatten() {
                                 let filename = xml_entry.file_name().to_string_lossy().to_string();
-                                if filename.contains("JoyCoderSettings") && filename.ends_with(".xml") {
+                                if filename.contains("JoyCoderSettings")
+                                    && filename.ends_with(".xml")
+                                {
                                     paths.push(xml_entry.path());
                                 }
                             }
@@ -5755,8 +6579,12 @@ pub fn get_latest_ptkey(fallback: &str) -> String {
     let mut add_candidate = |key: String| {
         let trimmed = key.trim().to_string();
         if !trimmed.is_empty() {
-            let ts = parse_ptkey_timestamp(&trimmed).unwrap_or_else(|| "00000000000000".to_string());
-            candidates.push(KeyCandidate { key: trimmed, timestamp: ts });
+            let ts =
+                parse_ptkey_timestamp(&trimmed).unwrap_or_else(|| "00000000000000".to_string());
+            candidates.push(KeyCandidate {
+                key: trimmed,
+                timestamp: ts,
+            });
         }
     };
 
@@ -5770,8 +6598,10 @@ pub fn get_latest_ptkey(fallback: &str) -> String {
     // 2. Check VS Code state.vscdb paths
     let mut vscdb_paths = Vec::new();
     if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        vscdb_paths.push(home.join("Library/Application Support/Code/User/globalStorage/state.vscdb"));
-        vscdb_paths.push(home.join("Library/Application Support/JoyCode/User/globalStorage/state.vscdb"));
+        vscdb_paths
+            .push(home.join("Library/Application Support/Code/User/globalStorage/state.vscdb"));
+        vscdb_paths
+            .push(home.join("Library/Application Support/JoyCode/User/globalStorage/state.vscdb"));
     }
     if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
         vscdb_paths.push(appdata.join("Code/User/globalStorage/state.vscdb"));
@@ -5782,14 +6612,23 @@ pub fn get_latest_ptkey(fallback: &str) -> String {
         if db_path.exists() {
             if let Ok(conn) = rusqlite::Connection::open_with_flags(
                 &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             ) {
-                if let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = 'JoyCoder.joycoder-fe'") {
+                if let Ok(mut stmt) =
+                    conn.prepare("SELECT value FROM ItemTable WHERE key = 'JoyCoder.joycoder-fe'")
+                {
                     if let Ok(mut rows) = stmt.query([]) {
                         if let Ok(Some(row)) = rows.next() {
                             if let Ok(value_str) = row.get::<_, String>(0) {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value_str) {
-                                    if let Some(ptkey) = parsed.get("jdhLoginInfo").and_then(|info| info.get("ptKey")).and_then(serde_json::Value::as_str) {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&value_str)
+                                {
+                                    if let Some(ptkey) = parsed
+                                        .get("jdhLoginInfo")
+                                        .and_then(|info| info.get("ptKey"))
+                                        .and_then(serde_json::Value::as_str)
+                                    {
                                         add_candidate(ptkey.to_string());
                                     }
                                 }

@@ -722,11 +722,12 @@ impl LaunchHooks for DefaultLaunchHooks {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                     app_running = is_macos_app_running(app_dir).await;
                     if app_running {
-                        let process_name = if app_name == "ChatGPT" { "ChatGPT" } else { "Codex" };
-                        let _ = Command::new("killall")
-                            .arg(process_name)
-                            .output()
-                            .await;
+                        let process_name = if app_name == "ChatGPT" {
+                            "ChatGPT"
+                        } else {
+                            "Codex"
+                        };
+                        let _ = Command::new("killall").arg(process_name).output().await;
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                     app_running = false;
@@ -1227,7 +1228,8 @@ async fn handle_models_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let mut upstream = match crate::protocol_proxy::open_models_proxy_request(request_user_agent).await
+    let mut upstream = match crate::protocol_proxy::open_models_proxy_request(request_user_agent)
+        .await
     {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -1332,9 +1334,7 @@ async fn handle_protocol_proxy_connection(
             remote_addr_text,
         );
         // 记录上游错误 body 到诊断日志，便于后续排查
-        let body_preview = String::from_utf8_lossy(
-            &upstream_body[..upstream_body.len().min(1024)]
-        );
+        let body_preview = String::from_utf8_lossy(&upstream_body[..upstream_body.len().min(1024)]);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "launcher.upstream_error_body",
             serde_json::json!({
@@ -1370,8 +1370,11 @@ async fn handle_protocol_proxy_connection(
             return Ok(());
         }
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeResponses {
+            let session_context = upstream.joycode_session_context.take();
             let mut normalizer =
-                crate::protocol_proxy::JoycodeResponsesSseNormalizer::default();
+                crate::protocol_proxy::JoycodeResponsesSseNormalizer::with_session_context(
+                    session_context,
+                );
             let mut bytes_stream = upstream.response.unwrap().bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 match chunk {
@@ -1402,11 +1405,12 @@ async fn handle_protocol_proxy_connection(
             .as_ref()
             .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
             .unwrap_or_default();
-        let mut anthropic_translator = if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeAnthropic {
-            Some(crate::protocol_proxy::AnthropicToOpenAiSseTranslator::default())
-        } else {
-            None
-        };
+        let mut anthropic_translator =
+            if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeAnthropic {
+                Some(crate::protocol_proxy::AnthropicToOpenAiSseTranslator::default())
+            } else {
+                None
+            };
         let mut bytes_stream = upstream.response.unwrap().bytes_stream();
         let mut stream_failed = false;
         while let Some(chunk) = bytes_stream.next().await {
@@ -1473,6 +1477,12 @@ async fn handle_protocol_proxy_connection(
         crate::protocol_proxy::UpstreamWireApi::Responses
             | crate::protocol_proxy::UpstreamWireApi::JoycodeResponses
     ) {
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::JoycodeResponses {
+            crate::protocol_proxy::record_joycode_non_stream_response(
+                upstream.joycode_session_context.as_ref(),
+                &upstream_body,
+            );
+        }
         write_http_response(
             stream,
             "200 OK",
@@ -1970,7 +1980,9 @@ fn runtime_evaluate_result_is_true(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-static CUSTOM_BRIDGE_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<crate::routes::BridgeContext>>> = std::sync::OnceLock::new();
+static CUSTOM_BRIDGE_CONTEXT: std::sync::OnceLock<
+    std::sync::Mutex<Option<crate::routes::BridgeContext>>,
+> = std::sync::OnceLock::new();
 
 pub fn register_custom_bridge_context(ctx: crate::routes::BridgeContext) {
     let mutex = CUSTOM_BRIDGE_CONTEXT.get_or_init(|| std::sync::Mutex::new(None));
