@@ -6490,7 +6490,8 @@ pub struct JoycodeCredentials {
     pub login_type: String,
 }
 
-const JOYCODE_EDITOR_LOGIN_INFO_KEY: &str = "JoyCode.joycoder-editor/jdhLoginInfo";
+const JOYCODE_EDITOR_STATE_KEY: &str = "JoyCode.joycoder-editor";
+const JOYCODE_EDITOR_LOGIN_INFO_PATH_KEY: &str = "JoyCode.joycoder-editor/jdhLoginInfo";
 const JOYCODE_LEGACY_STATE_KEY: &str = "JoyCoder.joycoder-fe";
 
 fn parse_ptkey_timestamp(key: &str) -> Option<String> {
@@ -6627,7 +6628,8 @@ fn get_joycode_credentials_from_vscdb(path: &std::path::Path) -> Vec<KeyCandidat
 
     let mut candidates = Vec::new();
     for (storage_key, source_priority) in [
-        (JOYCODE_EDITOR_LOGIN_INFO_KEY, 30),
+        (JOYCODE_EDITOR_STATE_KEY, 40),
+        (JOYCODE_EDITOR_LOGIN_INFO_PATH_KEY, 30),
         (JOYCODE_LEGACY_STATE_KEY, 20),
     ] {
         let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = ?1") else {
@@ -6678,6 +6680,31 @@ fn add_key_candidate(
     });
 }
 
+fn resolve_joycode_credentials(
+    mut candidates: Vec<KeyCandidate>,
+    fallback: &str,
+) -> JoycodeCredentials {
+    candidates.sort_by(|a, b| {
+        b.source_priority
+            .cmp(&a.source_priority)
+            .then_with(|| b.timestamp.cmp(&a.timestamp))
+    });
+    if let Some(newest) = candidates.first() {
+        JoycodeCredentials {
+            pt_key: newest.key.clone(),
+            login_type: newest
+                .login_type
+                .clone()
+                .unwrap_or_else(|| get_logintype_for_ptkey(&newest.key).to_string()),
+        }
+    } else {
+        JoycodeCredentials {
+            pt_key: fallback.to_string(),
+            login_type: get_logintype_for_ptkey(fallback).to_string(),
+        }
+    }
+}
+
 pub fn get_latest_joycode_credentials(fallback: &str) -> JoycodeCredentials {
     use std::path::PathBuf;
 
@@ -6712,25 +6739,7 @@ pub fn get_latest_joycode_credentials(fallback: &str) -> JoycodeCredentials {
     // Also parse fallback key
     add_key_candidate(&mut candidates, fallback.to_string(), None, 0);
 
-    candidates.sort_by(|a, b| {
-        b.timestamp
-            .cmp(&a.timestamp)
-            .then_with(|| b.source_priority.cmp(&a.source_priority))
-    });
-    if let Some(newest) = candidates.first() {
-        JoycodeCredentials {
-            pt_key: newest.key.clone(),
-            login_type: newest
-                .login_type
-                .clone()
-                .unwrap_or_else(|| get_logintype_for_ptkey(&newest.key).to_string()),
-        }
-    } else {
-        JoycodeCredentials {
-            pt_key: fallback.to_string(),
-            login_type: get_logintype_for_ptkey(fallback).to_string(),
-        }
-    }
+    resolve_joycode_credentials(candidates, fallback)
 }
 
 pub fn get_latest_ptkey(fallback: &str) -> String {
@@ -6758,7 +6767,7 @@ mod joycode_credentials_tests {
     }
 
     #[test]
-    fn reads_latest_editor_storage_key_with_login_type() {
+    fn reads_latest_editor_state_with_login_type_and_prefers_it_over_legacy() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("state.vscdb");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -6770,17 +6779,26 @@ mod joycode_credentials_tests {
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
             (
-                JOYCODE_EDITOR_LOGIN_INFO_KEY,
-                r#"{"pt_key":"PIN.token.20260818123456","loginType":"PIN_JD_CLOUD"}"#,
+                JOYCODE_EDITOR_STATE_KEY,
+                r#"{"jdhLoginInfo":{"pt_key":"PIN.phone-token","ptKey":"PIN.phone-token","loginType":"PIN_JD_CLOUD"}}"#,
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            (
+                JOYCODE_LEGACY_STATE_KEY,
+                r#"{"jdhLoginInfo":{"ptKey":"BJ.token.20260818123456"}}"#,
             ),
         )
         .unwrap();
         drop(conn);
 
         let candidates = get_joycode_credentials_from_vscdb(&db_path);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].key, "PIN.token.20260818123456");
-        assert_eq!(candidates[0].login_type.as_deref(), Some("PIN_JD_CLOUD"));
+        assert_eq!(candidates.len(), 2);
+        let credentials = resolve_joycode_credentials(candidates, "fallback-token");
+        assert_eq!(credentials.pt_key, "PIN.phone-token");
+        assert_eq!(credentials.login_type, "PIN_JD_CLOUD");
     }
 
     #[test]
