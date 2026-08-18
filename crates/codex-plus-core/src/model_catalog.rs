@@ -529,14 +529,12 @@ pub async fn fetch_relay_profile_model_ids(
             )
         };
         let client = crate::http_client::proxied_client(&profile.user_agent)?;
-        let resolved_key = crate::protocol_proxy::get_latest_ptkey(profile.api_key.trim());
+        let credentials =
+            crate::protocol_proxy::get_latest_joycode_credentials(profile.api_key.trim());
         let upstream = client
             .post(&endpoint)
-            .header("ptKey", &resolved_key)
-            .header(
-                "loginType",
-                crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key),
-            )
+            .header("ptKey", &credentials.pt_key)
+            .header("loginType", &credentials.login_type)
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
             .header(

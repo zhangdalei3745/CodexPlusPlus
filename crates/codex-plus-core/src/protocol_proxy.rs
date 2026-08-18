@@ -1807,11 +1807,11 @@ pub async fn open_models_proxy_request_with_settings(
             &relay.user_agent,
             original_user_agent,
         ))?;
-        let resolved_key = get_latest_ptkey(resolved_api_key.trim());
+        let credentials = get_latest_joycode_credentials(resolved_api_key.trim());
         let upstream = client
             .post(&endpoint)
-            .header("ptKey", &resolved_key)
-            .header("loginType", get_logintype_for_ptkey(&resolved_key))
+            .header("ptKey", &credentials.pt_key)
+            .header("loginType", &credentials.login_type)
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
             .header("clientVersion", JOYCODE_CLIENT_VERSION)
@@ -1972,10 +1972,10 @@ pub async fn open_chat_completions_proxy_request(
     .post(chat_completions_url_for_relay(&relay));
 
     if relay.protocol == RelayProtocol::Joycode {
-        let resolved_key = get_latest_ptkey(resolved_api_key.trim());
+        let credentials = get_latest_joycode_credentials(resolved_api_key.trim());
         request_builder = request_builder
-            .header("ptKey", &resolved_key)
-            .header("loginType", get_logintype_for_ptkey(&resolved_key))
+            .header("ptKey", &credentials.pt_key)
+            .header("loginType", &credentials.login_type)
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -2164,10 +2164,10 @@ fn upstream_request_builder(
 ) -> reqwest::RequestBuilder {
     let mut builder = client.post(endpoint);
     if protocol == RelayProtocol::Joycode {
-        let resolved_key = get_latest_ptkey(api_key);
+        let credentials = get_latest_joycode_credentials(api_key);
         builder = builder
-            .header("ptKey", &resolved_key)
-            .header("loginType", get_logintype_for_ptkey(&resolved_key))
+            .header("ptKey", &credentials.pt_key)
+            .header("loginType", &credentials.login_type)
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
             .header("clientVersion", JOYCODE_CLIENT_VERSION)
@@ -6480,7 +6480,18 @@ pub fn sign_joycode_gateway_url(base_url: &str, function_id: &str) -> String {
 struct KeyCandidate {
     key: String,
     timestamp: String,
+    login_type: Option<String>,
+    source_priority: u8,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoycodeCredentials {
+    pub pt_key: String,
+    pub login_type: String,
+}
+
+const JOYCODE_EDITOR_LOGIN_INFO_KEY: &str = "JoyCode.joycoder-editor/jdhLoginInfo";
+const JOYCODE_LEGACY_STATE_KEY: &str = "JoyCoder.joycoder-fe";
 
 fn parse_ptkey_timestamp(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split('.').collect();
@@ -6571,27 +6582,111 @@ pub fn get_logintype_for_ptkey(ptkey: &str) -> &'static str {
     }
 }
 
-pub fn get_latest_ptkey(fallback: &str) -> String {
+fn parse_joycode_login_info(value: &Value) -> Option<(String, Option<String>)> {
+    match value {
+        Value::Object(object) => {
+            let pt_key = object
+                .get("pt_key")
+                .or_else(|| object.get("ptKey"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|key| !key.is_empty());
+            if let Some(pt_key) = pt_key {
+                let login_type = object
+                    .get("loginType")
+                    .or_else(|| object.get("login_type"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|login_type| !login_type.is_empty())
+                    .map(str::to_string);
+                return Some((pt_key.to_string(), login_type));
+            }
+
+            object
+                .get("jdhLoginInfo")
+                .and_then(parse_joycode_login_info)
+        }
+        Value::String(raw) => serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|parsed| parse_joycode_login_info(&parsed))
+            .or_else(|| {
+                let pt_key = raw.trim();
+                (!pt_key.is_empty()).then(|| (pt_key.to_string(), None))
+            }),
+        _ => None,
+    }
+}
+
+fn get_joycode_credentials_from_vscdb(path: &std::path::Path) -> Vec<KeyCandidate> {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for (storage_key, source_priority) in [
+        (JOYCODE_EDITOR_LOGIN_INFO_KEY, 30),
+        (JOYCODE_LEGACY_STATE_KEY, 20),
+    ] {
+        let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = ?1") else {
+            continue;
+        };
+        let Ok(mut rows) = stmt.query([storage_key]) else {
+            continue;
+        };
+        let Ok(Some(row)) = rows.next() else {
+            continue;
+        };
+        let Ok(value_str) = row.get::<_, String>(0) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&value_str) else {
+            continue;
+        };
+        let Some((key, login_type)) = parse_joycode_login_info(&parsed) else {
+            continue;
+        };
+        let timestamp = parse_ptkey_timestamp(&key).unwrap_or_else(|| "00000000000000".to_string());
+        candidates.push(KeyCandidate {
+            key,
+            timestamp,
+            login_type,
+            source_priority,
+        });
+    }
+    candidates
+}
+
+fn add_key_candidate(
+    candidates: &mut Vec<KeyCandidate>,
+    key: String,
+    login_type: Option<String>,
+    source_priority: u8,
+) {
+    let trimmed = key.trim().to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+    let timestamp = parse_ptkey_timestamp(&trimmed).unwrap_or_else(|| "00000000000000".to_string());
+    candidates.push(KeyCandidate {
+        key: trimmed,
+        timestamp,
+        login_type,
+        source_priority,
+    });
+}
+
+pub fn get_latest_joycode_credentials(fallback: &str) -> JoycodeCredentials {
     use std::path::PathBuf;
 
     let mut candidates: Vec<KeyCandidate> = Vec::new();
 
-    let mut add_candidate = |key: String| {
-        let trimmed = key.trim().to_string();
-        if !trimmed.is_empty() {
-            let ts =
-                parse_ptkey_timestamp(&trimmed).unwrap_or_else(|| "00000000000000".to_string());
-            candidates.push(KeyCandidate {
-                key: trimmed,
-                timestamp: ts,
-            });
-        }
-    };
-
     // 1. Check JetBrains XML paths
     for xml_path in get_jetbrains_options_xml_paths() {
         if let Some(key) = get_ptkey_from_jetbrains_xml(&xml_path) {
-            add_candidate(key);
+            add_key_candidate(&mut candidates, key, None, 10);
         }
     }
 
@@ -6610,43 +6705,97 @@ pub fn get_latest_ptkey(fallback: &str) -> String {
 
     for db_path in vscdb_paths {
         if db_path.exists() {
-            if let Ok(conn) = rusqlite::Connection::open_with_flags(
-                &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ) {
-                if let Ok(mut stmt) =
-                    conn.prepare("SELECT value FROM ItemTable WHERE key = 'JoyCoder.joycoder-fe'")
-                {
-                    if let Ok(mut rows) = stmt.query([]) {
-                        if let Ok(Some(row)) = rows.next() {
-                            if let Ok(value_str) = row.get::<_, String>(0) {
-                                if let Ok(parsed) =
-                                    serde_json::from_str::<serde_json::Value>(&value_str)
-                                {
-                                    if let Some(ptkey) = parsed
-                                        .get("jdhLoginInfo")
-                                        .and_then(|info| info.get("ptKey"))
-                                        .and_then(serde_json::Value::as_str)
-                                    {
-                                        add_candidate(ptkey.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            candidates.extend(get_joycode_credentials_from_vscdb(&db_path));
         }
     }
 
     // Also parse fallback key
-    add_candidate(fallback.to_string());
+    add_key_candidate(&mut candidates, fallback.to_string(), None, 0);
 
-    candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    candidates.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| b.source_priority.cmp(&a.source_priority))
+    });
     if let Some(newest) = candidates.first() {
-        newest.key.clone()
+        JoycodeCredentials {
+            pt_key: newest.key.clone(),
+            login_type: newest
+                .login_type
+                .clone()
+                .unwrap_or_else(|| get_logintype_for_ptkey(&newest.key).to_string()),
+        }
     } else {
-        fallback.to_string()
+        JoycodeCredentials {
+            pt_key: fallback.to_string(),
+            login_type: get_logintype_for_ptkey(fallback).to_string(),
+        }
+    }
+}
+
+pub fn get_latest_ptkey(fallback: &str) -> String {
+    get_latest_joycode_credentials(fallback).pt_key
+}
+
+#[cfg(test)]
+mod joycode_credentials_tests {
+    use super::*;
+
+    #[test]
+    fn parses_latest_editor_phone_login_credentials() {
+        let value = json!({
+            "pt_key": "PIN.token.20260818123456",
+            "loginType": "PIN_JD_CLOUD"
+        });
+
+        assert_eq!(
+            parse_joycode_login_info(&value),
+            Some((
+                "PIN.token.20260818123456".to_string(),
+                Some("PIN_JD_CLOUD".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn reads_latest_editor_storage_key_with_login_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            (
+                JOYCODE_EDITOR_LOGIN_INFO_KEY,
+                r#"{"pt_key":"PIN.token.20260818123456","loginType":"PIN_JD_CLOUD"}"#,
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        let candidates = get_joycode_credentials_from_vscdb(&db_path);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].key, "PIN.token.20260818123456");
+        assert_eq!(candidates[0].login_type.as_deref(), Some("PIN_JD_CLOUD"));
+    }
+
+    #[test]
+    fn keeps_legacy_nested_storage_compatible() {
+        let value = json!({
+            "jdhLoginInfo": {
+                "ptKey": "BJ.token.20260818123456"
+            }
+        });
+
+        assert_eq!(
+            parse_joycode_login_info(&value),
+            Some(("BJ.token.20260818123456".to_string(), None))
+        );
+        assert_eq!(get_logintype_for_ptkey("BJ.token"), "ERP");
+        assert_eq!(get_logintype_for_ptkey("PIN.token"), "N_PIN_PC");
     }
 }

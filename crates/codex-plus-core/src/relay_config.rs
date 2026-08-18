@@ -546,13 +546,10 @@ pub async fn test_relay_profile(
     let payload = relay_profile_test_payload(profile.protocol, test_model);
     let mut request_builder = client.post(&endpoint);
     if profile.protocol == RelayProtocol::Joycode {
-        let resolved_key = crate::protocol_proxy::get_latest_ptkey(api_key);
+        let credentials = crate::protocol_proxy::get_latest_joycode_credentials(api_key);
         request_builder = request_builder
-            .header("ptKey", &resolved_key)
-            .header(
-                "loginType",
-                crate::protocol_proxy::get_logintype_for_ptkey(&resolved_key),
-            )
+            .header("ptKey", &credentials.pt_key)
+            .header("loginType", &credentials.login_type)
             .header("x-ms-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("client", "JoyCodeIDE")
             .header(
