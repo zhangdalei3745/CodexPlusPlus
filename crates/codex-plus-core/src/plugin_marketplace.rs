@@ -831,7 +831,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated"]["source"].as_str(),
-            Some(format!(r"\\?\{}", home.join(".tmp").join("plugins").display()).as_str())
+            Some(windows_extended_path(&home.join(".tmp").join("plugins")).as_str())
         );
         assert_eq!(
             parsed["marketplaces"]["openai-api-curated"]["source_type"].as_str(),
@@ -839,7 +839,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-api-curated"]["source"].as_str(),
-            Some(format!(r"\\?\{}", home.join(".tmp").join("plugins").display()).as_str())
+            Some(windows_extended_path(&home.join(".tmp").join("plugins")).as_str())
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source_type"].as_str(),
@@ -847,13 +847,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(windows_extended_path(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
@@ -890,14 +884,13 @@ mod tests {
         assert_eq!(
             parsed["marketplaces"]["role-specific-plugins"]["source"].as_str(),
             Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp")
+                windows_extended_path(
+                    &home
+                        .join(".tmp")
                         .join("marketplaces")
-                        .join("role-specific-plugins")
-                        .display()
+                        .join("role-specific-plugins"),
                 )
-                .as_str()
+                .as_str(),
             )
         );
         for plugin in [
@@ -1009,13 +1002,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(windows_extended_path(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
@@ -1050,13 +1037,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(windows_extended_path(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 

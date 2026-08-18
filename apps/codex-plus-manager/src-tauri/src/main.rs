@@ -2,7 +2,11 @@
 
 fn main() {
     for arg in std::env::args() {
-        if arg.starts_with("codexplusplus://") {
+        if arg.starts_with("dreamskin://") {
+            if codex_plus_manager_lib::handle_dream_skin_url(&arg) {
+                codex_plus_manager_lib::focus_existing_manager_window();
+            }
+        } else if arg.starts_with("codexplusplus://") {
             match codex_plus_core::provider_import::save_pending_provider_import_from_url(&arg) {
                 Ok(request) => {
                     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -12,7 +16,7 @@ fn main() {
                             "baseUrl": request.base_url
                         }),
                     );
-                    focus_existing_manager_window();
+                    codex_plus_manager_lib::focus_existing_manager_window();
                 }
                 Err(error) => {
                     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -32,23 +36,3 @@ fn main() {
     }
     codex_plus_manager_lib::run();
 }
-
-#[cfg(windows)]
-fn focus_existing_manager_window() {
-    let current_process_id = std::process::id();
-    for process in codex_plus_core::windows_enumerate_processes() {
-        if process.process_id == current_process_id {
-            continue;
-        }
-        if process
-            .exe_file
-            .eq_ignore_ascii_case("codex-plus-plus-manager.exe")
-        {
-            let _ = codex_plus_core::windows_activate_process_window(process.process_id);
-            break;
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn focus_existing_manager_window() {}

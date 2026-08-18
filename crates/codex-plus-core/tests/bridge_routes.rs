@@ -31,9 +31,14 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/user-scripts/reload", json!({})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
+        ("/manager/open-transient", json!({})),
         ("/backend/status", json!({})),
         ("/codex-model-catalog", json!({})),
         ("/codex-config-model", json!({})),
+        (
+            "/llm-proxy",
+            json!({"url": "http://example.com", "method": "POST"}),
+        ),
         ("/ads", json!({})),
         ("/zed-remote/status", json!({})),
         (
@@ -84,18 +89,6 @@ async fn bridge_routes_cover_all_current_paths() {
             json!({"session_id": "s1", "title": "First"}),
         ),
         ("/archived-thread", json!({"title": "Archived"})),
-        (
-            "/move-thread-workspace",
-            json!({"session_id": "s1", "title": "First", "target_cwd": "/new"}),
-        ),
-        (
-            "/thread-sort-key",
-            json!({"session_id": "s1", "title": "First"}),
-        ),
-        (
-            "/thread-sort-keys",
-            json!({"sessions": [{"session_id": "s1", "title": "First"}]}),
-        ),
     ];
 
     for (path, payload) in cases {
@@ -105,6 +98,64 @@ async fn bridge_routes_cover_all_current_paths() {
             "{path} should be routed"
         );
     }
+}
+
+#[tokio::test]
+async fn llm_proxy_rejects_local_addresses() {
+    let ctx = test_context();
+
+    let result = handle_bridge_request(
+        ctx,
+        "/llm-proxy",
+        json!({
+            "url": "https://127.0.0.1/v1/chat/completions",
+            "method": "POST",
+            "headers": {"Authorization": "Bearer sk-test"},
+            "body": "{}"
+        }),
+    )
+    .await;
+
+    assert_eq!(result["status"], json!("failed"));
+    assert_eq!(result["message"], json!("Base URL 不得指向本机或私有网络"));
+}
+
+#[tokio::test]
+async fn llm_proxy_requires_https() {
+    let ctx = test_context();
+
+    let result = handle_bridge_request(
+        ctx,
+        "/llm-proxy",
+        json!({
+            "url": "http://api.example.com/v1/chat/completions",
+            "method": "POST",
+            "body": "{}"
+        }),
+    )
+    .await;
+
+    assert_eq!(result["status"], json!("failed"));
+    assert_eq!(result["message"], json!("Base URL 必须使用 HTTPS"));
+}
+
+#[tokio::test]
+async fn llm_proxy_rejects_non_post_methods() {
+    let ctx = test_context();
+
+    let result = handle_bridge_request(
+        ctx,
+        "/llm-proxy",
+        json!({
+            "url": "https://api.example.com/v1/chat/completions",
+            "method": "GET",
+            "body": "{}"
+        }),
+    )
+    .await;
+
+    assert_eq!(result["status"], json!("failed"));
+    assert_eq!(result["message"], json!("LLM Bridge 仅支持 POST 请求"));
 }
 
 #[tokio::test]
@@ -367,8 +418,12 @@ async fn runtime_status_devtools_repair_and_ads_routes_are_dispatched() {
         json!({"status": "ok", "opened": "manager"})
     );
     assert_eq!(
+        handle_bridge_request(ctx.clone(), "/manager/open-transient", json!({})).await,
+        json!({"status": "ok", "opened": "manager-transient"})
+    );
+    assert_eq!(
         handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await,
-        json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION})
+        json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION, "hideOfficialUsageAlert": false})
     );
     assert_eq!(
         handle_bridge_request(ctx.clone(), "/ads", json!({})).await,
@@ -450,6 +505,29 @@ async fn runtime_status_devtools_repair_and_ads_routes_are_dispatched() {
 }
 
 #[tokio::test]
+async fn backend_status_includes_active_official_usage_alert_setting() {
+    let settings = BackendSettings {
+        active_relay_id: "official".to_string(),
+        relay_profiles: vec![codex_plus_core::settings::RelayProfile {
+            id: "official".to_string(),
+            relay_mode: codex_plus_core::settings::RelayMode::Official,
+            hide_official_usage_alert: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let ctx = BridgeContext::new(
+        Arc::new(FakeSettings::with_settings(settings)),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(ctx, "/backend/status", json!({})).await;
+
+    assert_eq!(result["hideOfficialUsageAlert"], true);
+}
+
+#[tokio::test]
 async fn data_routes_forward_payloads_to_data_service() {
     let ctx = test_context();
 
@@ -520,33 +598,6 @@ async fn data_routes_forward_payloads_to_data_service() {
         )
         .await,
         json!({"session_id": "archived-1", "title": "Archived"})
-    );
-    assert_eq!(
-        handle_bridge_request(
-            ctx.clone(),
-            "/move-thread-workspace",
-            json!({"session_id": "s1", "title": "First", "target_cwd": "/new"}),
-        )
-        .await,
-        json!({"status": "moved", "session_id": "s1", "target_cwd": "/new"})
-    );
-    assert_eq!(
-        handle_bridge_request(
-            ctx.clone(),
-            "/thread-sort-key",
-            json!({"session_id": "s1", "title": "First"}),
-        )
-        .await,
-        json!({"status": "ok", "session_id": "s1", "updated_at": 123})
-    );
-    assert_eq!(
-        handle_bridge_request(
-            ctx,
-            "/thread-sort-keys",
-            json!({"sessions": [{"session_id": "s1", "title": "First"}, null, {"session_id": "s2"}]}),
-        )
-        .await,
-        json!({"status": "ok", "sort_keys": [{"session_id": "s1"}, {"session_id": "s2"}]})
     );
 }
 
@@ -623,6 +674,41 @@ async fn user_script_manager_scans_and_persists_inventory_shape() {
         .unwrap(),
         json!({"enabled": false, "scripts": {}})
     );
+}
+
+#[tokio::test]
+async fn user_script_inventory_merges_renderer_runtime_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("loaded.js"), "window.loaded = true;").unwrap();
+    std::fs::write(user_dir.join("failed.js"), "throw new Error('boom');").unwrap();
+    let manager =
+        UserScriptManager::new(builtin_dir, user_dir, temp.path().join("user_scripts.json"));
+    let runtime_status = json!({
+        "user:loaded.js": {"status": "loaded", "error": ""},
+        "user:failed.js": {"status": "failed", "error": "boom"}
+    });
+
+    let inventory = manager
+        .inventory_with_runtime_status(Some(&runtime_status))
+        .unwrap();
+    let scripts = inventory["scripts"].as_array().unwrap();
+    let loaded = scripts
+        .iter()
+        .find(|script| script["key"] == "user:loaded.js")
+        .unwrap();
+    let failed = scripts
+        .iter()
+        .find(|script| script["key"] == "user:failed.js")
+        .unwrap();
+
+    assert_eq!(loaded["status"], "loaded");
+    assert_eq!(loaded["error"], "");
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["error"], "boom");
 }
 
 #[tokio::test]
@@ -712,7 +798,7 @@ async fn core_runtime_reload_evaluates_enabled_user_bundle_and_status_is_ok() {
 
     assert_eq!(
         status,
-        json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION})
+        json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION, "hideOfficialUsageAlert": false})
     );
     assert_eq!(reloaded["scripts"][0]["key"], "builtin:demo.js");
     let evaluated = evaluated.lock().unwrap();
@@ -1030,7 +1116,6 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppSessionDelete",
             "codexAppMarkdownExport",
             "codexAppForceChineseLocale",
-            "codexAppProjectMove",
             "codexAppThreadIdBadge",
             "codexAppConversationView",
             "codexAppThreadScrollRestore",
@@ -1110,6 +1195,10 @@ impl BridgeRuntimeService for FakeRuntime {
 
     async fn open_manager(&self) -> anyhow::Result<Value> {
         Ok(json!({"status": "ok", "opened": "manager"}))
+    }
+
+    async fn open_transient_manager(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "opened": "manager-transient"}))
     }
 
     async fn backend_status(&self) -> anyhow::Result<Value> {
@@ -1323,28 +1412,6 @@ impl BridgeDataService for FakeData {
             title,
         }))
     }
-
-    async fn move_thread_workspace(
-        &self,
-        session: SessionRef,
-        target_cwd: String,
-    ) -> anyhow::Result<Value> {
-        Ok(json!({"status": "moved", "session_id": session.session_id, "target_cwd": target_cwd}))
-    }
-
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        Ok(json!({"status": "ok", "session_id": session.session_id, "updated_at": 123}))
-    }
-
-    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
-        Ok(json!({
-            "status": "ok",
-            "sort_keys": sessions
-                .into_iter()
-                .map(|session| json!({"session_id": session.session_id}))
-                .collect::<Vec<_>>()
-        }))
-    }
 }
 
 #[derive(Clone)]
@@ -1383,6 +1450,10 @@ impl LaunchHooks for ContextHooks {
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1436,7 +1507,11 @@ impl LaunchHooks for ContextHooks {
         self.event(format!("status:{status}"));
     }
 
-    async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+    async fn wait_for_codex_exit(
+        &self,
+        _launch: &CodexLaunch,
+        _debug_port: u16,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

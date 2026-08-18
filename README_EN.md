@@ -41,8 +41,8 @@ For first-time setup, open the manager, verify the detected app path, configure 
   </a>
 </p>
 <p align="center">
-  <a href="https://jojocode.com/"><strong>JOJO Code | Official Codex++ Relay</strong></a><br>
-  The official Codex++ relay service, focused on stable access and cost-effective pricing. JOJO Code supports the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, team collaboration, and long-running project workflows.
+  <a href="https://jojocode.com/"><strong>JOJO Code</strong></a><br>
+  JOJO Code provides stable access and cost-effective pricing. It supports the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, team collaboration, and long-running project workflows.
 </p>
 
 <p align="center">
@@ -59,7 +59,7 @@ For first-time setup, open the manager, verify the detected app path, configure 
         <img src="docs/images/sponsor-jojocode.png" alt="JOJO Code" width="150">
       </a>
     </td>
-    <td><a href="https://jojocode.com/"><strong>JOJO Code | Official Codex++ Relay</strong></a><br>Thanks to JOJO Code for sponsoring this project. JOJO Code is the official Codex++ relay service with cost-effective pricing and stable, easy-to-configure Codex API access. It supports the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, quick setup, team collaboration, and continuous use.</td>
+    <td><a href="https://jojocode.com/"><strong>JOJO Code</strong></a><br>Thanks to JOJO Code for sponsoring this project. JOJO Code provides cost-effective pricing and stable, easy-to-configure Codex API access. It supports the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, quick setup, team collaboration, and continuous use.</td>
   </tr>
   <tr>
     <td align="center">
@@ -87,11 +87,11 @@ For first-time setup, open the manager, verify the detected app path, configure 
   </tr>
   <tr>
     <td align="center">
-      <a href="https://www.0029.org/?promo=AFF11F">
-        <img src="docs/images/sponsor-0029.svg" alt="0029 Cloud Bridge" width="150">
+      <a href="https://www.quya.org/?promo=CODEX">
+        <img src="docs/images/sponsor-0029.svg" alt="quya.org Cloud Bridge" width="150">
       </a>
     </td>
-    <td><a href="https://www.0029.org/?promo=AFF11F"><strong>0029 Cloud Bridge | Codex API Relay Station (gpt5.5 gpt-image-2)</strong></a><br>Supports individual and enterprise access. Monthly plans and pay-as-you-go billing are available, with Pro/Plus account pools, stable site-wide APIs, and 24/7 technical support.</td>
+    <td><a href="https://www.quya.org/?promo=CODEX"><strong>quya.org Cloud Bridge | One-stop AI Relay Platform</strong></a><br>quya.org Cloud Bridge (formerly 0029.org) is a one-stop relay platform integrating the latest Claude Code, Codex, and Gemini models, providing stable, efficient, and cost-effective AI relay services. It offers flexible monthly plans and pay-as-you-go billing, direct access in China without extra network setup, and fast responses. Individual and enterprise access is supported, with prices as low as 0.12% of the official rate.</td>
   </tr>
   <tr>
     <td align="center">
@@ -127,11 +127,11 @@ For first-time setup, open the manager, verify the detected app path, configure 
   </tr>
   <tr>
     <td align="center">
-      <a href="https://hb-api.online/register?aff=8KA2ZKWNHND8">
+      <a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8">
         <img src="docs/images/sponsor-baikewei-ai.jpg" alt="Baikewei AI" width="150">
       </a>
     </td>
-    <td><a href="https://hb-api.online/register?aff=8KA2ZKWNHND8"><strong>Baikewei AI</strong></a><br>Baikewei AI is an all-in-one large-model API platform for developers, teams, and AI tool users. It supports Claude, OpenAI, Gemini, Codex, and other mainstream model capabilities, with stable relay access, flexible billing, usage statistics, balance management, and APIs for Claude Code, Codex, image generation, automation scripts, and intelligent applications. New users can claim free credit and start integrating immediately.</td>
+    <td><a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8"><strong>Baikewei AI</strong></a><br>Baikewei AI is an all-in-one large-model API platform for developers, teams, and AI tool users. It supports Claude, OpenAI, Gemini, Codex, and other mainstream model capabilities, with stable relay access, flexible billing, usage statistics, balance management, and APIs for Claude Code, Codex, image generation, automation scripts, and intelligent applications. New users can claim free credit and start integrating immediately.</td>
   </tr>
   <tr>
     <td align="center">
@@ -154,13 +154,6 @@ WeChat: <a href="https://docs.qq.com/doc/DQ2VOanZTTFZJcUpZ#">get the latest grou
 Telegram: <https://t.me/CodexPlusPlus>
 
 Friendly link: <a href="https://linux.do">LINUX DO</a>
-
-If Codex++ helps you, you can support its continued maintenance.
-
-<p align="center">
-  <img src="docs/images/sponsor-alipay.jpg" alt="Alipay sponsor QR code" width="220">
-  <img src="docs/images/sponsor-wechat.jpg" alt="WeChat sponsor QR code" width="220">
-</p>
 
 ## Current Features
 

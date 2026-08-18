@@ -61,6 +61,8 @@ pub struct RelayProfile {
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
+    #[serde(rename = "hideOfficialUsageAlert", default)]
+    pub hide_official_usage_alert: bool,
     #[serde(rename = "testModel", default)]
     pub test_model: String,
     #[serde(rename = "configContents", default)]
@@ -87,12 +89,48 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub model_windows: String,
+    #[serde(rename = "modelVlm", default, skip_serializing_if = "String::is_empty")]
+    pub model_vlm: String,
+    #[serde(
+        rename = "vlmApiKey",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub vlm_api_key: String,
+    #[serde(rename = "vlmModel", default)]
+    pub vlm_model: String,
+    #[serde(rename = "vlmBaseUrl", default)]
+    pub vlm_base_url: String,
     #[serde(
         rename = "userAgent",
         default,
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
+    #[serde(rename = "sub2apiEnabled", default)]
+    pub sub2api_enabled: bool,
+    #[serde(
+        rename = "sub2apiMultiplier",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub sub2api_multiplier: String,
+    #[serde(rename = "modelRoutes", default, skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<RelayModelRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayModelRoute {
+    pub model: String,
+    #[serde(rename = "targetRelayId")]
+    pub target_relay_id: String,
+    #[serde(
+        rename = "targetModel",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub target_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -137,6 +175,7 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
@@ -148,8 +187,23 @@ impl Default for RelayProfile {
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
+            model_vlm: String::new(),
+            vlm_api_key: String::new(),
+            vlm_model: String::new(),
+            vlm_base_url: String::new(),
             user_agent: String::new(),
+            sub2api_enabled: false,
+            sub2api_multiplier: String::new(),
+            model_routes: Vec::new(),
         }
+    }
+}
+
+impl RelayProfile {
+    pub fn has_model_routes(&self) -> bool {
+        self.model_routes
+            .iter()
+            .any(|route| !route.model.trim().is_empty() && !route.target_relay_id.trim().is_empty())
     }
 }
 
@@ -181,6 +235,127 @@ pub enum RelayMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DreamSkinColors {
+    pub background: String,
+    pub panel: String,
+    pub panel_alt: String,
+    pub accent: String,
+    pub accent_alt: String,
+    pub secondary: String,
+    pub highlight: String,
+    pub text: String,
+    pub muted: String,
+    pub line: String,
+}
+
+impl Default for DreamSkinColors {
+    fn default() -> Self {
+        Self {
+            background: "#F7F4F5".to_string(),
+            panel: "#FFFFFF".to_string(),
+            panel_alt: "#FFF7F8".to_string(),
+            accent: "#E25563".to_string(),
+            accent_alt: "#F07A86".to_string(),
+            secondary: "#F3A8AF".to_string(),
+            highlight: "#C93D4C".to_string(),
+            text: "#2B2224".to_string(),
+            muted: "#8A7A7D".to_string(),
+            line: "rgba(196, 120, 128, .22)".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DreamSkinThemeConfig {
+    #[serde(default = "default_dream_skin_schema_version")]
+    pub schema_version: u8,
+    #[serde(default = "default_dream_skin_id")]
+    pub id: String,
+    #[serde(default = "default_dream_skin_name")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub style_preset: String,
+    #[serde(default = "default_dream_skin_brand_subtitle")]
+    pub brand_subtitle: String,
+    #[serde(default = "default_dream_skin_tagline")]
+    pub tagline: String,
+    #[serde(default = "default_dream_skin_project_prefix")]
+    pub project_prefix: String,
+    #[serde(default = "default_dream_skin_project_label")]
+    pub project_label: String,
+    #[serde(default = "default_dream_skin_status_text")]
+    pub status_text: String,
+    #[serde(default = "default_dream_skin_quote")]
+    pub quote: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colors: Option<DreamSkinColors>,
+    #[serde(flatten)]
+    pub extra_fields: Map<String, Value>,
+}
+
+impl Default for DreamSkinThemeConfig {
+    fn default() -> Self {
+        let mut extra_fields = Map::new();
+        #[cfg(windows)]
+        {
+            extra_fields.insert(
+                "image".to_string(),
+                Value::String("dream-reference.jpg".to_string()),
+            );
+            extra_fields.insert("appearance".to_string(), Value::String("auto".to_string()));
+            extra_fields.insert(
+                "art".to_string(),
+                serde_json::json!({
+                    "focusX": 0.72,
+                    "focusY": 0.45,
+                    "safeArea": "left",
+                    "taskMode": "ambient"
+                }),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            extra_fields.insert(
+                "image".to_string(),
+                Value::String("portal-hero.png".to_string()),
+            );
+            extra_fields.insert(
+                "promoTitle".to_string(),
+                Value::String("感谢 Passion8 赞助".to_string()),
+            );
+            extra_fields.insert(
+                "promoSub".to_string(),
+                Value::String("passion8.cc".to_string()),
+            );
+            extra_fields.insert(
+                "promoUrl".to_string(),
+                Value::String("https://passion8.cc/register?aff=TuPe".to_string()),
+            );
+        }
+        Self {
+            schema_version: default_dream_skin_schema_version(),
+            id: default_dream_skin_id(),
+            name: default_dream_skin_name(),
+            style_preset: String::new(),
+            brand_subtitle: default_dream_skin_brand_subtitle(),
+            tagline: default_dream_skin_tagline(),
+            project_prefix: default_dream_skin_project_prefix(),
+            project_label: default_dream_skin_project_label(),
+            status_text: default_dream_skin_status_text(),
+            quote: default_dream_skin_quote(),
+            colors: if cfg!(windows) {
+                None
+            } else {
+                Some(DreamSkinColors::default())
+            },
+            extra_fields,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
@@ -198,12 +373,8 @@ pub struct BackendSettings {
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
     pub enhancements_enabled: bool,
-    #[serde(rename = "computerUseGuardEnabled", default)]
-    pub computer_use_guard_enabled: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
-    #[serde(rename = "codexAppPluginAutoExpand", default = "default_true")]
-    pub codex_app_plugin_auto_expand: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
     pub codex_app_model_whitelist_unlock: bool,
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
@@ -216,8 +387,6 @@ pub struct BackendSettings {
     pub codex_app_force_chinese_locale: bool,
     #[serde(rename = "codexAppFastStartup", default)]
     pub codex_app_fast_startup: bool,
-    #[serde(rename = "codexAppProjectMove", default = "default_true")]
-    pub codex_app_project_move: bool,
     #[serde(rename = "codexAppThreadIdBadge", default)]
     pub codex_app_thread_id_badge: bool,
     #[serde(rename = "codexAppConversationView", default)]
@@ -298,8 +467,48 @@ pub struct BackendSettings {
         deserialize_with = "deserialize_image_overlay_fit_mode"
     )]
     pub codex_app_image_overlay_fit_mode: String,
+    #[serde(rename = "codexAppDreamSkinEnabled", default)]
+    pub codex_app_dream_skin_enabled: bool,
+    #[serde(rename = "codexAppDreamSkinPaused", default)]
+    pub codex_app_dream_skin_paused: bool,
+    #[serde(
+        rename = "codexAppDreamSkinTheme",
+        default = "default_dream_skin_theme",
+        deserialize_with = "deserialize_dream_skin_theme"
+    )]
+    pub codex_app_dream_skin_theme: String,
+    #[serde(rename = "codexAppDreamSkinThemeConfig", default)]
+    pub codex_app_dream_skin_theme_config: DreamSkinThemeConfig,
+    #[serde(rename = "codexAppDreamSkinImagePath", default)]
+    pub codex_app_dream_skin_image_path: String,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
+    #[serde(rename = "weixinConnectEnabled", default)]
+    pub weixin_connect_enabled: bool,
+    #[serde(
+        rename = "weixinConnectBaseUrl",
+        default = "default_weixin_connect_base_url"
+    )]
+    pub weixin_connect_base_url: String,
+    #[serde(rename = "weixinConnectToken", default)]
+    pub weixin_connect_token: String,
+    #[serde(rename = "weixinConnectAccountId", default)]
+    pub weixin_connect_account_id: String,
+    #[serde(rename = "weixinConnectAllowFrom", default)]
+    pub weixin_connect_allow_from: String,
+    #[serde(rename = "weixinConnectRouteTag", default)]
+    pub weixin_connect_route_tag: String,
+    #[serde(rename = "weixinConnectWorkDir", default)]
+    pub weixin_connect_work_dir: String,
+    #[serde(rename = "weixinConnectModel", default)]
+    pub weixin_connect_model: String,
+    #[serde(
+        rename = "weixinConnectSandbox",
+        default = "default_weixin_connect_sandbox"
+    )]
+    pub weixin_connect_sandbox: String,
+    #[serde(rename = "weixinConnectCodexPath", default)]
+    pub weixin_connect_codex_path: String,
     #[serde(rename = "launchMode", default)]
     pub launch_mode: LaunchMode,
     #[serde(rename = "relayBaseUrl", default = "default_relay_base_url")]
@@ -333,16 +542,13 @@ impl Default for BackendSettings {
             provider_sync_last_selected_provider: String::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
-            computer_use_guard_enabled: false,
             codex_app_plugin_marketplace_unlock: true,
-            codex_app_plugin_auto_expand: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: true,
             codex_app_fast_startup: false,
-            codex_app_project_move: true,
             codex_app_thread_id_badge: false,
             codex_app_conversation_view: false,
             codex_app_thread_scroll_restore: true,
@@ -369,7 +575,22 @@ impl Default for BackendSettings {
             codex_app_image_overlay_path: String::new(),
             codex_app_image_overlay_opacity: default_image_overlay_opacity(),
             codex_app_image_overlay_fit_mode: default_image_overlay_fit_mode(),
+            codex_app_dream_skin_enabled: false,
+            codex_app_dream_skin_paused: false,
+            codex_app_dream_skin_theme: default_dream_skin_theme(),
+            codex_app_dream_skin_theme_config: DreamSkinThemeConfig::default(),
+            codex_app_dream_skin_image_path: String::new(),
             codex_goals_enabled: false,
+            weixin_connect_enabled: false,
+            weixin_connect_base_url: default_weixin_connect_base_url(),
+            weixin_connect_token: String::new(),
+            weixin_connect_account_id: String::new(),
+            weixin_connect_allow_from: String::new(),
+            weixin_connect_route_tag: String::new(),
+            weixin_connect_work_dir: String::new(),
+            weixin_connect_model: String::new(),
+            weixin_connect_sandbox: default_weixin_connect_sandbox(),
+            weixin_connect_codex_path: String::new(),
             launch_mode: LaunchMode::Patch,
             relay_base_url: default_relay_base_url(),
             relay_api_key: String::new(),
@@ -406,13 +627,16 @@ impl BackendSettings {
                     self.relay_base_url.clone()
                 },
                 api_key: self.relay_api_key.clone(),
-                protocol: if self.relay_base_url.contains("jd.com") || self.relay_base_url.contains("joycode") {
+                protocol: if self.relay_base_url.contains("jd.com")
+                    || self.relay_base_url.contains("joycode")
+                {
                     RelayProtocol::Joycode
                 } else {
                     RelayProtocol::Responses
                 },
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
+                hide_official_usage_alert: false,
                 test_model: String::new(),
                 config_contents: String::new(),
                 auth_contents: String::new(),
@@ -424,7 +648,14 @@ impl BackendSettings {
                 model_insert_mode: RelayModelInsertMode::Patch,
                 model_list: String::new(),
                 model_windows: String::new(),
+                model_vlm: String::new(),
+                vlm_api_key: String::new(),
+                vlm_model: String::new(),
+                vlm_base_url: String::new(),
                 user_agent: String::new(),
+                sub2api_enabled: false,
+                sub2api_multiplier: String::new(),
+                model_routes: Vec::new(),
             };
         }
 
@@ -455,13 +686,16 @@ impl BackendSettings {
                 self.relay_base_url.clone()
             },
             api_key: self.relay_api_key.clone(),
-            protocol: if self.relay_base_url.contains("jd.com") || self.relay_base_url.contains("joycode") {
+            protocol: if self.relay_base_url.contains("jd.com")
+                || self.relay_base_url.contains("joycode")
+            {
                 RelayProtocol::Joycode
             } else {
                 RelayProtocol::Responses
             },
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
@@ -473,7 +707,14 @@ impl BackendSettings {
             model_insert_mode: RelayModelInsertMode::Patch,
             model_list: String::new(),
             model_windows: String::new(),
+            model_vlm: String::new(),
+            vlm_api_key: String::new(),
+            vlm_model: String::new(),
+            vlm_base_url: String::new(),
             user_agent: String::new(),
+            sub2api_enabled: false,
+            sub2api_multiplier: String::new(),
+            model_routes: Vec::new(),
         }
     }
 
@@ -508,6 +749,7 @@ impl BackendSettings {
                 self.active_relay_profile().protocol,
                 RelayProtocol::ChatCompletions | RelayProtocol::Joycode
             )
+            || self.active_relay_profile().has_model_routes()
     }
 }
 
@@ -550,6 +792,109 @@ fn normalize_image_overlay_fit_mode(value: &str) -> String {
     }
 }
 
+pub fn default_dream_skin_theme() -> String {
+    "pink".to_string()
+}
+
+fn default_dream_skin_schema_version() -> u8 {
+    1
+}
+
+#[cfg(windows)]
+fn default_dream_skin_id() -> String {
+    "preset-arina-hashimoto".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_dream_skin_id() -> String {
+    "custom-1784123441349".to_string()
+}
+
+#[cfg(windows)]
+fn default_dream_skin_name() -> String {
+    "桥本有菜".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_dream_skin_name() -> String {
+    "Dream Skin".to_string()
+}
+
+pub fn resolve_dream_skin_style_preset(id: &str, style_preset: &str) -> String {
+    let style_preset = style_preset.trim();
+    if !style_preset.is_empty() && style_preset != "dream-original" {
+        return style_preset.to_string();
+    }
+
+    match id.trim() {
+        "caishen-lite" => "caishen-lite",
+        "caishen-max" => "caishen-max",
+        "caishen-readable" => "caishen-readable",
+        "export-night" => "export-night",
+        "global-founder-bright" => "global-founder-bright",
+        "mythic-guardian-noir" => "mythic-guardian-noir",
+        "codex-snow-skin" => "codex-snow",
+        "glass-vision" => "glass-vision",
+        "preset-midnight-aurora" => "midnight-aurora",
+        "preset-amber-dusk" => "amber-dusk",
+        "preset-forest-mist" => "forest-mist",
+        "preset-cyber-neon" => "cyber-neon",
+        "preset-sakura-dawn" => "sakura-dawn",
+        _ => "dream-original",
+    }
+    .to_string()
+}
+
+fn default_dream_skin_brand_subtitle() -> String {
+    "CODEX DREAM SKIN".to_string()
+}
+
+#[cfg(windows)]
+fn default_dream_skin_tagline() -> String {
+    "把柔光与玫瑰带进今天的工作台。".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_dream_skin_tagline() -> String {
+    "把喜欢的画面变成可交互的 Codex 工作台。".to_string()
+}
+
+fn default_dream_skin_project_prefix() -> String {
+    "选择项目 · ".to_string()
+}
+
+fn default_dream_skin_project_label() -> String {
+    "◉  选择项目".to_string()
+}
+
+#[cfg(windows)]
+fn default_dream_skin_status_text() -> String {
+    "DREAM SKIN ONLINE".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_dream_skin_status_text() -> String {
+    "THEME ONLINE".to_string()
+}
+
+#[cfg(windows)]
+fn default_dream_skin_quote() -> String {
+    "MAKE SOMETHING WONDERFUL".to_string()
+}
+
+#[cfg(not(windows))]
+fn default_dream_skin_quote() -> String {
+    "Make something wonderful".to_string()
+}
+
+fn normalize_dream_skin_theme(value: &str) -> String {
+    match value.trim() {
+        "pink" | "luckyGod" | "redWhite" | "clearGlass" | "inspiration" | "purpleNight"
+        | "miku" | "blackGold" => value.trim().to_string(),
+        _ => default_dream_skin_theme(),
+    }
+}
+
 pub fn clamp_stepwise_max_items(value: u8) -> u8 {
     value.min(default_stepwise_max_items())
 }
@@ -572,6 +917,14 @@ pub fn default_true() -> bool {
 
 pub fn default_relay_base_url() -> String {
     String::new()
+}
+
+fn default_weixin_connect_base_url() -> String {
+    crate::connect::DEFAULT_WEIXIN_BASE_URL.to_string()
+}
+
+fn default_weixin_connect_sandbox() -> String {
+    "read-only".to_string()
 }
 
 pub fn default_active_relay_id() -> String {
@@ -616,6 +969,15 @@ where
     Ok(Option::<String>::deserialize(deserializer)?
         .map(|value| normalize_image_overlay_fit_mode(&value))
         .unwrap_or_else(default_image_overlay_fit_mode))
+}
+
+fn deserialize_dream_skin_theme<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|value| normalize_dream_skin_theme(&value))
+        .unwrap_or_else(default_dream_skin_theme))
 }
 
 fn deserialize_stepwise_max_items<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -674,7 +1036,9 @@ struct SettingsCacheEntry {
     settings: BackendSettings,
 }
 
-static SETTINGS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SettingsCacheEntry>>> = std::sync::OnceLock::new();
+static SETTINGS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SettingsCacheEntry>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
@@ -703,7 +1067,8 @@ impl SettingsStore {
         };
 
         if let Some(mtime) = current_mtime {
-            let cache = SETTINGS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let cache = SETTINGS_CACHE
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(entry) = guard.get(&self.path) {
                 if entry.mtime == mtime {
@@ -711,16 +1076,18 @@ impl SettingsStore {
                 }
             }
 
-            let contents = fs::read_to_string(&self.path).with_context(|| {
-                format!("failed to read settings {}", self.path.display())
-            })?;
+            let contents = fs::read_to_string(&self.path)
+                .with_context(|| format!("failed to read settings {}", self.path.display()))?;
             let settings = normalize_settings_config_sections(
                 serde_json::from_str(&contents).unwrap_or_default(),
             );
-            guard.insert(self.path.clone(), SettingsCacheEntry {
-                mtime,
-                settings: settings.clone(),
-            });
+            guard.insert(
+                self.path.clone(),
+                SettingsCacheEntry {
+                    mtime,
+                    settings: settings.clone(),
+                },
+            );
             Ok(settings)
         } else {
             Ok(BackendSettings::default())
@@ -777,6 +1144,8 @@ impl SettingsStore {
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    target.remove("codexAppPluginAutoExpand");
+    target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
     }
@@ -805,21 +1174,13 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
-    if let Some(value) = source
-        .get("computerUseGuardEnabled")
-        .and_then(Value::as_bool)
-    {
-        target.insert("computerUseGuardEnabled".to_string(), Value::Bool(value));
-    }
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
-    merge_bool_setting(target, source, "codexAppPluginAutoExpand");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     merge_bool_setting(target, source, "codexAppFastStartup");
-    merge_bool_setting(target, source, "codexAppProjectMove");
     merge_bool_setting(target, source, "codexAppThreadIdBadge");
     merge_bool_setting(target, source, "codexAppConversationView");
     merge_bool_setting(target, source, "codexAppThreadScrollRestore");
@@ -944,8 +1305,46 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             Value::String(normalize_image_overlay_fit_mode(value)),
         );
     }
+    merge_bool_setting(target, source, "codexAppDreamSkinEnabled");
+    merge_bool_setting(target, source, "codexAppDreamSkinPaused");
+    if let Some(value) = source.get("codexAppDreamSkinTheme").and_then(Value::as_str) {
+        target.insert(
+            "codexAppDreamSkinTheme".to_string(),
+            Value::String(normalize_dream_skin_theme(value)),
+        );
+    }
+    if let Some(value) = source.get("codexAppDreamSkinThemeConfig")
+        && serde_json::from_value::<DreamSkinThemeConfig>(value.clone()).is_ok()
+    {
+        target.insert("codexAppDreamSkinThemeConfig".to_string(), value.clone());
+    }
+    if let Some(value) = source
+        .get("codexAppDreamSkinImagePath")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "codexAppDreamSkinImagePath".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
+    }
+    merge_bool_setting(target, source, "weixinConnectEnabled");
+    for key in [
+        "weixinConnectBaseUrl",
+        "weixinConnectToken",
+        "weixinConnectAccountId",
+        "weixinConnectAllowFrom",
+        "weixinConnectRouteTag",
+        "weixinConnectWorkDir",
+        "weixinConnectModel",
+        "weixinConnectSandbox",
+        "weixinConnectCodexPath",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            target.insert(key.to_string(), Value::String(value.trim().to_string()));
+        }
     }
     if let Some(value) = source.get("launchMode").and_then(Value::as_str) {
         if matches!(value, "patch" | "relay") {
@@ -1135,6 +1534,15 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
     settings.codex_app_image_overlay_fit_mode =
         normalize_image_overlay_fit_mode(&settings.codex_app_image_overlay_fit_mode);
+    settings.codex_app_dream_skin_theme =
+        normalize_dream_skin_theme(&settings.codex_app_dream_skin_theme);
+    if settings.codex_app_dream_skin_theme_config == DreamSkinThemeConfig::default()
+        && settings.codex_app_dream_skin_theme != default_dream_skin_theme()
+    {
+        settings.codex_app_dream_skin_theme_config.id = settings.codex_app_dream_skin_theme.clone();
+    }
+    settings.codex_app_dream_skin_image_path =
+        settings.codex_app_dream_skin_image_path.trim().to_string();
     settings.codex_app_stepwise_base_url = settings
         .codex_app_stepwise_base_url
         .trim()
@@ -1148,6 +1556,27 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
             settings.codex_app_stepwise_api_key_env.trim().to_string()
         };
     settings.codex_app_stepwise_model = settings.codex_app_stepwise_model.trim().to_string();
+    settings.weixin_connect_base_url = settings
+        .weixin_connect_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if settings.weixin_connect_base_url.is_empty() {
+        settings.weixin_connect_base_url = default_weixin_connect_base_url();
+    }
+    settings.weixin_connect_token = settings.weixin_connect_token.trim().to_string();
+    settings.weixin_connect_account_id = settings.weixin_connect_account_id.trim().to_string();
+    settings.weixin_connect_allow_from = settings.weixin_connect_allow_from.trim().to_string();
+    settings.weixin_connect_route_tag = settings.weixin_connect_route_tag.trim().to_string();
+    settings.weixin_connect_work_dir = settings.weixin_connect_work_dir.trim().to_string();
+    settings.weixin_connect_model = settings.weixin_connect_model.trim().to_string();
+    settings.weixin_connect_sandbox = match settings.weixin_connect_sandbox.trim() {
+        "workspace-write" => "workspace-write",
+        "danger-full-access" => "danger-full-access",
+        _ => "read-only",
+    }
+    .to_string();
+    settings.weixin_connect_codex_path = settings.weixin_connect_codex_path.trim().to_string();
     settings.codex_app_stepwise_max_items =
         clamp_stepwise_max_items(settings.codex_app_stepwise_max_items);
     settings.codex_app_stepwise_max_input_chars =
@@ -1207,7 +1636,7 @@ fn normalize_text_config(contents: String) -> String {
     }
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -1216,13 +1645,50 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let temp_path = temp_path_for(path);
     fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::rename(source, target)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
     Ok(())
 }
 
@@ -1255,14 +1721,25 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_existing_file_and_removes_temp_file() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!dir.join("settings.json.tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn settings_default_matches_expected_behavior() {
         let settings = BackendSettings::default();
         assert!(!settings.provider_sync_enabled);
         assert!(settings.relay_profiles_enabled);
         assert!(settings.enhancements_enabled);
-        assert!(!settings.computer_use_guard_enabled);
         assert!(settings.codex_app_plugin_marketplace_unlock);
-        assert!(settings.codex_app_plugin_auto_expand);
         assert!(!settings.codex_app_thread_id_badge);
         assert!(settings.codex_app_force_chinese_locale);
         assert!(!settings.codex_goals_enabled);
@@ -1294,6 +1771,13 @@ mod tests {
         assert_eq!(settings.codex_app_stepwise_max_input_chars, 6000);
         assert_eq!(settings.codex_app_stepwise_max_output_tokens, 500);
         assert_eq!(settings.codex_app_stepwise_timeout_ms, 8000);
+        assert!(!settings.weixin_connect_enabled);
+        assert_eq!(
+            settings.weixin_connect_base_url,
+            crate::connect::DEFAULT_WEIXIN_BASE_URL
+        );
+        assert!(settings.weixin_connect_token.is_empty());
+        assert_eq!(settings.weixin_connect_sandbox, "read-only");
     }
 
     #[test]
@@ -1341,7 +1825,8 @@ mod tests {
         .unwrap();
 
         assert!(settings.codex_app_plugin_marketplace_unlock);
-        assert!(!settings.codex_app_plugin_auto_expand);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("codexAppPluginAutoExpand").is_none());
 
         let legacy_settings: BackendSettings = serde_json::from_str(
             r#"{
@@ -1351,7 +1836,6 @@ mod tests {
         .unwrap();
 
         assert!(legacy_settings.codex_app_plugin_marketplace_unlock);
-        assert!(legacy_settings.codex_app_plugin_auto_expand);
     }
 
     #[test]
@@ -1378,6 +1862,7 @@ mod tests {
 
         assert_eq!(profile.relay_mode, RelayMode::Official);
         assert!(!profile.official_mix_api_key);
+        assert!(!profile.hide_official_usage_alert);
         assert!(profile.test_model.is_empty());
     }
 
@@ -1394,6 +1879,33 @@ mod tests {
         assert!(profile.auto_compact_limit.is_empty());
         assert_eq!(profile.model_insert_mode, RelayModelInsertMode::Patch);
         assert!(profile.model_list.is_empty());
+        assert!(profile.model_routes.is_empty());
+        assert!(!profile.has_model_routes());
+    }
+
+    #[test]
+    fn relay_profile_model_routes_roundtrip_in_camel_case() {
+        let profile: RelayProfile = serde_json::from_str(
+            r#"{
+                "id":"relay-a",
+                "name":"供应商 A",
+                "modelRoutes":[{
+                    "model":"gpt-5.6-luna",
+                    "targetRelayId":"relay-b",
+                    "targetModel":"provider-luna"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(profile.has_model_routes());
+        assert_eq!(profile.model_routes[0].model, "gpt-5.6-luna");
+        assert_eq!(profile.model_routes[0].target_relay_id, "relay-b");
+        assert_eq!(profile.model_routes[0].target_model, "provider-luna");
+
+        let saved = serde_json::to_value(profile).unwrap();
+        assert_eq!(saved["modelRoutes"][0]["targetRelayId"], "relay-b");
+        assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
     }
 
     #[test]
@@ -1516,6 +2028,7 @@ base_url = "http://127.0.0.1:57321/v1"
                 name: "官方".to_string(),
                 relay_mode: RelayMode::Official,
                 official_mix_api_key: false,
+                hide_official_usage_alert: false,
                 model: "gpt-5.5".to_string(),
                 base_url: "https://relay.example/v1".to_string(),
                 api_key: "sk-test".to_string(),
@@ -1554,6 +2067,7 @@ requires_openai_auth = true
                 name: "官方混入".to_string(),
                 relay_mode: RelayMode::Official,
                 official_mix_api_key: true,
+                hide_official_usage_alert: false,
                 model: "gpt-5.5".to_string(),
                 base_url: "https://relay.example/v1".to_string(),
                 api_key: "sk-mix".to_string(),
@@ -1616,6 +2130,7 @@ experimental_bearer_token = "sk-mix"
                     name: "官方混入".to_string(),
                     relay_mode: RelayMode::Official,
                     official_mix_api_key: true,
+                    hide_official_usage_alert: false,
                     config_contents: r#"model_provider = "custom"
 
 [model_providers.other]
@@ -1751,6 +2266,55 @@ experimental_bearer_token = "sk-existing""#
         store.save(&settings).unwrap();
 
         assert_eq!(store.load().unwrap(), settings);
+    }
+
+    #[test]
+    fn settings_store_model_routes_restore_target_credentials() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let profile = |id: &str, base_url: &str, api_key: &str| RelayProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            relay_mode: RelayMode::PureApi,
+            upstream_base_url: base_url.to_string(),
+            config_contents: format!(
+                "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"{base_url}\"\n"
+            ),
+            auth_contents: format!(r#"{{"OPENAI_API_KEY":"{api_key}"}}"#),
+            ..RelayProfile::default()
+        };
+        let mut source = profile("source", "https://source.example/v1", "sk-source");
+        source.model_routes = vec![RelayModelRoute {
+            model: "gpt-5.6-luna".to_string(),
+            target_relay_id: "target".to_string(),
+            target_model: String::new(),
+        }];
+        let settings = BackendSettings {
+            active_relay_id: "source".to_string(),
+            relay_profiles: vec![
+                source,
+                profile("target", "https://target.example/v1", "sk-target"),
+            ],
+            ..BackendSettings::default()
+        };
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert!(loaded.active_relay_uses_protocol_proxy());
+        assert_eq!(
+            loaded.relay_profiles[0].base_url,
+            "https://source.example/v1"
+        );
+        assert_eq!(
+            loaded.relay_profiles[1].base_url,
+            "https://target.example/v1"
+        );
+        assert_eq!(loaded.relay_profiles[1].api_key, "sk-target");
+        assert_eq!(
+            loaded.relay_profiles[0].model_routes[0].target_relay_id,
+            "target"
+        );
     }
 
     #[test]
@@ -1901,6 +2465,58 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
+    fn settings_store_update_persists_dream_skin_settings() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "codexAppDreamSkinEnabled": true,
+                "codexAppDreamSkinTheme": "miku",
+                "codexAppDreamSkinImagePath": " C:\\Users\\me\\Pictures\\dream.webp "
+            }))
+            .unwrap();
+
+        assert!(updated.codex_app_dream_skin_enabled);
+        assert_eq!(updated.codex_app_dream_skin_theme, "miku");
+        assert_eq!(
+            updated.codex_app_dream_skin_image_path,
+            r"C:\Users\me\Pictures\dream.webp"
+        );
+        assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn settings_store_defaults_invalid_dream_skin_theme_to_pink() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "codexAppDreamSkinTheme": "unknown"
+            }))
+            .unwrap();
+
+        assert_eq!(updated.codex_app_dream_skin_theme, "pink");
+    }
+
+    #[test]
+    fn legacy_market_theme_ids_resolve_to_layout_presets() {
+        assert_eq!(
+            resolve_dream_skin_style_preset("preset-cyber-neon", "dream-original"),
+            "cyber-neon"
+        );
+        assert_eq!(
+            resolve_dream_skin_style_preset("codex-snow-skin", ""),
+            "codex-snow"
+        );
+        assert_eq!(
+            resolve_dream_skin_style_preset("custom-theme", "dream-original"),
+            "dream-original"
+        );
+    }
+
+    #[test]
     fn settings_store_update_persists_stepwise_settings() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -1936,6 +2552,42 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.codex_app_stepwise_max_input_chars, 24000);
         assert_eq!(updated.codex_app_stepwise_max_output_tokens, 100);
         assert_eq!(updated.codex_app_stepwise_timeout_ms, 60000);
+        assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn settings_store_update_persists_weixin_connect_settings() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        let updated = store
+            .update(json!({
+                "weixinConnectEnabled": true,
+                "weixinConnectBaseUrl": "https://ilink.example.test/",
+                "weixinConnectToken": " token ",
+                "weixinConnectAccountId": " bot-1 ",
+                "weixinConnectAllowFrom": " user@im.wechat ",
+                "weixinConnectRouteTag": " route ",
+                "weixinConnectWorkDir": " /workspace ",
+                "weixinConnectModel": " gpt-test ",
+                "weixinConnectSandbox": "workspace-write",
+                "weixinConnectCodexPath": " /usr/local/bin/codex "
+            }))
+            .unwrap();
+
+        assert!(updated.weixin_connect_enabled);
+        assert_eq!(
+            updated.weixin_connect_base_url,
+            "https://ilink.example.test"
+        );
+        assert_eq!(updated.weixin_connect_token, "token");
+        assert_eq!(updated.weixin_connect_account_id, "bot-1");
+        assert_eq!(updated.weixin_connect_allow_from, "user@im.wechat");
+        assert_eq!(updated.weixin_connect_route_tag, "route");
+        assert_eq!(updated.weixin_connect_work_dir, "/workspace");
+        assert_eq!(updated.weixin_connect_model, "gpt-test");
+        assert_eq!(updated.weixin_connect_sandbox, "workspace-write");
+        assert_eq!(updated.weixin_connect_codex_path, "/usr/local/bin/codex");
         assert_eq!(store.load().unwrap(), updated);
     }
 
@@ -2159,6 +2811,29 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(saved["providerSyncEnabled"], json!(true));
         assert_eq!(saved["codexExtraArgs"], Value::Null);
         assert_eq!(saved["customField"], json!({"nested": true}));
+    }
+
+    #[test]
+    fn settings_store_update_removes_obsolete_setting_fields() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        std::fs::write(
+            &path,
+            r#"{"providerSyncEnabled":false,"codexAppPluginAutoExpand":true,"computerUseGuardEnabled":true,"customField":1}"#,
+        )
+        .unwrap();
+
+        store
+            .update(json!({
+                "providerSyncEnabled": true
+            }))
+            .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert!(saved.get("codexAppPluginAutoExpand").is_none());
+        assert!(saved.get("computerUseGuardEnabled").is_none());
+        assert_eq!(saved["customField"], json!(1));
     }
 
     #[test]

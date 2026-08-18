@@ -1,5 +1,8 @@
+use std::future::Future;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,12 +19,15 @@ use tokio::sync::Mutex;
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
 
-#[cfg(windows)]
-const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
-#[cfg_attr(not(windows), allow(dead_code))]
-const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
+///
+/// Callers that install a custom [`crate::routes::BridgeContext`] should configure this callback
+/// before starting the watchdog. Without one, the watchdog falls back to the core bridge injector.
+pub type BridgeReinjector =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexLaunch {
@@ -113,7 +119,10 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let result = self.hooks.wait_for_codex_exit(&self.launch).await;
+        let result = self
+            .hooks
+            .wait_for_codex_exit(&self.launch, self.debug_port)
+            .await;
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
@@ -132,10 +141,14 @@ pub trait LaunchHooks: Send + Sync {
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
-    async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
-        Ok(())
+    fn has_pending_remote_control_session_recoveries(&self) -> bool {
+        false
     }
-    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+    fn remote_control_session_recovery_is_safe_to_run(&self) -> bool {
+        true
+    }
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()>;
+    async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
         Ok(())
     }
     async fn ensure_plugin_marketplace_config(
@@ -200,14 +213,12 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
     async fn write_status(&self, status: &str);
-    async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
+    async fn wait_for_codex_exit(
+        &self,
+        launch: &CodexLaunch,
+        debug_port: u16,
+    ) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
     async fn terminate_codex(&self, launch: &CodexLaunch);
 }
@@ -217,8 +228,7 @@ pub struct DefaultLaunchHooks {
     child: Mutex<Option<Child>>,
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
-    computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
-    computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
+    bridge_reinjector: Mutex<Option<BridgeReinjector>>,
 }
 
 struct HelperRuntime {
@@ -227,11 +237,6 @@ struct HelperRuntime {
 }
 
 struct BridgeWatchdogRuntime {
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-struct ComputerUseGuardWatchdogRuntime {
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -258,9 +263,31 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        let home = crate::relay_config::default_codex_home_dir();
         if settings.provider_sync_enabled {
+            crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
+            crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
+                &home,
+                "launcher.after_provider_sync",
+            );
         }
+        if hooks.has_pending_remote_control_session_recoveries()
+            && hooks.remote_control_session_recovery_is_safe_to_run()
+        {
+            hooks.run_remote_control_session_recovery().await?;
+        } else if hooks.has_pending_remote_control_session_recoveries() {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.remote_control_session_finalization_deferred",
+                serde_json::json!({"reason": "desktop_writer_active"}),
+            );
+        }
+        crate::dream_skin::sync_default_dream_skin_base_theme(
+            settings.enhancements_enabled
+                && settings.codex_app_dream_skin_enabled
+                && !settings.codex_app_dream_skin_paused,
+            &settings.codex_app_dream_skin_theme_config,
+        )?;
         if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.plugin_marketplace_config_failed_nonfatal",
@@ -269,10 +296,6 @@ where
                 }),
             );
         }
-        if settings.computer_use_guard_enabled {
-            hooks.ensure_computer_use_config(&settings).await?;
-        }
-        let home = crate::relay_config::default_codex_home_dir();
         match crate::codex_sqlite::sanitize_historical_model_suffixes(&home) {
             Ok(result) if result.updated > 0 => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -293,7 +316,8 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
+            || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
@@ -307,9 +331,6 @@ where
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
-        if settings.computer_use_guard_enabled {
-            hooks.start_computer_use_guard_watchdog(&settings).await?;
-        }
 
         let mut injection_degraded = false;
         if settings.enhancements_enabled {
@@ -385,6 +406,11 @@ where
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
+}
+
+fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
+    let profile = settings.active_relay_profile();
+    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
@@ -468,6 +494,11 @@ impl DefaultLaunchHooks {
     pub fn shared() -> Arc<dyn LaunchHooks> {
         Arc::new(Self::default())
     }
+
+    /// Configures the launcher-specific callback used by subsequent watchdog reinjections.
+    pub async fn set_bridge_reinjector(&self, reinjector: BridgeReinjector) {
+        *self.bridge_reinjector.lock().await = Some(reinjector);
+    }
 }
 
 fn helper_bind_host() -> String {
@@ -508,6 +539,16 @@ impl LaunchHooks for DefaultLaunchHooks {
         anyhow::bail!("provider sync requires launcher hooks with codex-plus-data integration")
     }
 
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Remote Control session recovery requires launcher hooks with codex-plus-data integration"
+        )
+    }
+
+    fn remote_control_session_recovery_is_safe_to_run(&self) -> bool {
+        crate::watcher::find_session_index_cleanup_blocking_processes().is_empty()
+    }
+
     async fn apply_active_relay_profile(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         if !settings.relay_profiles_enabled {
             return Ok(());
@@ -530,31 +571,15 @@ impl LaunchHooks for DefaultLaunchHooks {
         {
             let auth_contents = (!profile.auth_contents.trim().is_empty())
                 .then_some(profile.auth_contents.as_str());
-            crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
-                &home,
-                auth_contents,
-                settings.computer_use_guard_enabled,
-            )?;
+            crate::relay_config::clear_relay_config_to_home_with_auth(&home, auth_contents)?;
             return Ok(());
         }
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
+        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
             &home,
             &profile,
             &common_config,
-            settings.computer_use_guard_enabled,
         )?;
         crate::protocol_proxy::init_model_lists_from_profile(&profile);
-        Ok(())
-    }
-
-    async fn ensure_computer_use_config(&self, settings: &BackendSettings) -> anyhow::Result<()> {
-        if !settings.computer_use_guard_enabled {
-            return Ok(());
-        }
-        let home = crate::relay_config::default_codex_home_dir();
-        let artifacts = crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home)?;
-        crate::computer_use_guard::ensure_computer_use_config_with_artifacts(&home, &artifacts)?;
-        *self.computer_use_guard_artifacts.lock().await = Some(artifacts);
         Ok(())
     }
 
@@ -806,18 +831,37 @@ impl LaunchHooks for DefaultLaunchHooks {
         retry_injection(debug_port, helper_port).await
     }
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+        let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             #[cfg(windows)]
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
+            let mut observed_browser_id: Option<String> = None;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = interval.tick() => {
+                        let current_browser_id = match crate::cdp::browser_identity(debug_port).await {
+                            Ok(identity) => identity.browser_id().ok(),
+                            Err(_) => None,
+                        };
+                        let identity_changed = current_browser_id
+                            .as_deref()
+                            .is_some_and(|current| {
+                                browser_identity_changed(observed_browser_id.as_deref(), current)
+                            });
+                        if let Some(current) = current_browser_id {
+                            observed_browser_id = Some(current);
+                        }
                         let (pet_result, _) = tokio::join!(
                             sync_pet_real_mouse_overlay(debug_port, helper_port),
-                            check_and_reinject_bridge(debug_port, helper_port),
+                            check_and_reinject_bridge_inner(
+                                debug_port,
+                                helper_port,
+                                identity_changed,
+                                bridge_reinjector.clone(),
+                            ),
                         );
                         record_pet_overlay_sync_result(debug_port, helper_port, pet_result);
                     }
@@ -841,61 +885,13 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        #[cfg(windows)]
-        {
-            if !settings.computer_use_guard_enabled {
-                return Ok(());
-            }
-            let home = crate::relay_config::default_codex_home_dir();
-            let artifacts = self.computer_use_guard_artifacts.lock().await.clone();
-            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                run_post_launch_computer_use_guard(home, artifacts, &mut shutdown_rx).await;
-            });
-            if let Some(runtime) = self
-                .computer_use_guard_watchdog
-                .lock()
-                .await
-                .replace(ComputerUseGuardWatchdogRuntime { shutdown, task })
-            {
-                let _ = runtime.shutdown.send(());
-                let _ = runtime.task.await;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = &settings;
-            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
-                            crate::computer_use_guard::kill_orphaned_computer_use_processes();
-                        }
-                    }
-                }
-            });
-            if let Some(runtime) = self
-                .computer_use_guard_watchdog
-                .lock()
-                .await
-                .replace(ComputerUseGuardWatchdogRuntime { shutdown, task })
-            {
-                let _ = runtime.shutdown.send(());
-                let _ = runtime.task.await;
-            }
-        }
-        Ok(())
-    }
-
     async fn write_status(&self, _status: &str) {}
 
-    async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()> {
+    async fn wait_for_codex_exit(
+        &self,
+        launch: &CodexLaunch,
+        debug_port: u16,
+    ) -> anyhow::Result<()> {
         match launch {
             CodexLaunch::Process { .. } => {
                 if let Some(mut child) = self.child.lock().await.take() {
@@ -904,13 +900,24 @@ impl LaunchHooks for DefaultLaunchHooks {
             }
             CodexLaunch::PackagedActivation { process_id, .. } => {
                 if let Some(process_id) = process_id {
-                    wait_for_windows_process_id(*process_id).await?;
+                    if let Err(error) = wait_for_windows_process_id(*process_id).await {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_process_wait_failed_nonfatal",
+                            serde_json::json!({
+                                "process_id": process_id,
+                                "message": error.to_string()
+                            }),
+                        );
+                    }
                 }
             }
         }
         let mut empty_streak = 0u32;
         loop {
-            if crate::watcher::find_codex_processes().is_empty() {
+            let has_codex_process = !crate::watcher::find_codex_processes().is_empty();
+            let cdp_available = should_probe_launcher_cdp(cfg!(windows), has_codex_process)
+                && crate::cdp::endpoint_available(debug_port);
+            if !launcher_target_alive(has_codex_process, cdp_available) {
                 empty_streak = empty_streak.saturating_add(1);
                 if empty_streak >= 3 {
                     break;
@@ -924,10 +931,6 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn shutdown_helper(&self, _helper_port: u16) {
-        if let Some(runtime) = self.computer_use_guard_watchdog.lock().await.take() {
-            let _ = runtime.shutdown.send(());
-            let _ = runtime.task.await;
-        }
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -977,15 +980,33 @@ async fn handle_helper_connection(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    let request_bytes = read_http_request(&mut stream).await?;
-    let request = String::from_utf8_lossy(&request_bytes);
-    let request_line = request.lines().next().unwrap_or_default();
+    let request = match read_http_request(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                &mut stream,
+                error.status(),
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let request_headers = String::from_utf8_lossy(&request.headers);
+    let request_line = request_headers.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
-    let request_body = http_request_body(&request);
-    let request_user_agent = header_value_from_request(&request, "user-agent");
+    let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
+    let request_content_type = header_value_from_headers(&request_headers, "content-type");
+    let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -995,14 +1016,15 @@ async fn handle_helper_connection(
             "path": path,
             "request_line": request_line,
             "remote_addr": remote_addr_text,
-            "body_bytes": request_body.len()
+            "body_bytes": request.body.len()
         }),
     );
 
-    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
-        return handle_protocol_proxy_connection(
+    if crate::protocol_proxy::is_audio_transcriptions_proxy_path(path) && method == "POST" {
+        return handle_audio_transcriptions_proxy_connection(
             &mut stream,
-            request_body,
+            &request.body,
+            request_content_type.as_deref(),
             request_user_agent.as_deref(),
             method,
             path,
@@ -1010,10 +1032,72 @@ async fn handle_helper_connection(
         )
         .await;
     }
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "GET" {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "upgrade_required",
+            "message": "WebSocket transport is not supported by the local protocol proxy; retry with HTTP."
+        }))?;
+        write_http_response(
+            &mut stream,
+            "426 Upgrade Required",
+            "application/json; charset=utf-8",
+            &body,
+        )
+        .await?;
+        log_helper_response(
+            "helper.responses_websocket_upgrade_required",
+            method,
+            path,
+            "426 Upgrade Required",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
+        let request_body = match decode_protocol_proxy_request_body(
+            &request.body,
+            request_content_encoding.as_deref(),
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": error.to_string()
+                }))?;
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.protocol_proxy_decode_failed",
+                    method,
+                    path,
+                    "400 Bad Request",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        };
+        return handle_protocol_proxy_connection(
+            &mut stream,
+            &request_body,
+            request_user_agent.as_deref(),
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
+    let request_body = String::from_utf8_lossy(&request.body);
     if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
         return handle_chat_completions_proxy_connection(
             &mut stream,
-            request_body,
+            &request_body,
             request_user_agent.as_deref(),
             method,
             path,
@@ -1041,6 +1125,9 @@ async fn handle_helper_connection(
                 "status": "ok",
                 "message": "后端已连接",
                 "version": crate::version::VERSION,
+                "hideOfficialUsageAlert": crate::assets::hide_official_usage_alert_config(
+                    &crate::settings::SettingsStore::default().load().unwrap_or_default()
+                ),
                 "transport": "http-helper"
             }))?,
             "application/json; charset=utf-8".to_string(),
@@ -1049,7 +1136,7 @@ async fn handle_helper_connection(
     } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
         if method == "POST" {
             let detail =
-                serde_json::from_str::<serde_json::Value>(request_body).unwrap_or_else(|error| {
+                serde_json::from_str::<serde_json::Value>(&request_body).unwrap_or_else(|error| {
                     serde_json::json!({
                         "parse_error": error.to_string(),
                         "raw": request_body
@@ -1100,6 +1187,17 @@ async fn handle_helper_connection(
                 "helper.latest_token_usage_ok",
             )
         }
+    } else if path == "/dream-skin/image" && matches!(method, "GET" | "OPTIONS") {
+        if method == "OPTIONS" {
+            (
+                "200 OK".to_string(),
+                Vec::new(),
+                "application/octet-stream".to_string(),
+                "helper.dream_skin_image_options",
+            )
+        } else {
+            dream_skin_image_response()
+        }
     } else {
         (
             "404 Not Found".to_string(),
@@ -1138,6 +1236,30 @@ async fn handle_helper_connection(
     Ok(())
 }
 
+fn decode_protocol_proxy_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> anyhow::Result<String> {
+    let encoding = content_encoding.unwrap_or_default().trim();
+    let decoded = if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        body.to_vec()
+    } else if encoding.eq_ignore_ascii_case("zstd") {
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
+        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        let mut decoded = Vec::new();
+        limited.read_to_end(&mut decoded)?;
+        if decoded.len() > MAX_HTTP_BODY_BYTES {
+            anyhow::bail!("解压后的请求体超过大小限制");
+        }
+        decoded
+    } else {
+        anyhow::bail!("不支持的 Content-Encoding：{encoding}");
+    };
+
+    String::from_utf8(decoded)
+        .map_err(|error| anyhow::anyhow!("Responses 请求体不是 UTF-8：{error}"))
+}
+
 fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
     let not_found = || {
         (
@@ -1168,6 +1290,47 @@ fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
             bytes,
             content_type.to_string(),
             "helper.overlay_image_ok",
+        ),
+        Err(_) => not_found(),
+    }
+}
+
+fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
+    let not_found = || {
+        (
+            "404 Not Found".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": "皮肤图片未启用或图片不可用"
+            }))
+            .unwrap_or_default(),
+            "application/json; charset=utf-8".to_string(),
+            "helper.dream_skin_image_not_found",
+        )
+    };
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    if !settings.codex_app_dream_skin_enabled {
+        return not_found();
+    }
+    let image_path = PathBuf::from(settings.codex_app_dream_skin_image_path.trim());
+    if image_path.as_os_str().is_empty() || !image_path.is_file() {
+        let (content_type, image) = crate::assets::dream_skin_default_image();
+        return (
+            "200 OK".to_string(),
+            image.to_vec(),
+            content_type.to_string(),
+            "helper.dream_skin_default_image_ok",
+        );
+    }
+    let Some(content_type) = overlay_image_content_type(&image_path) else {
+        return not_found();
+    };
+    match std::fs::read(&image_path) {
+        Ok(bytes) => (
+            "200 OK".to_string(),
+            bytes,
+            content_type.to_string(),
+            "helper.dream_skin_image_ok",
         ),
         Err(_) => not_found(),
     }
@@ -1286,9 +1449,10 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let mut upstream = match crate::protocol_proxy::open_responses_proxy_request(
+    let mut upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path(
         request_body,
         request_user_agent,
+        path,
     )
     .await
     {
@@ -1522,6 +1686,70 @@ async fn handle_protocol_proxy_connection(
     stream.shutdown().await?;
     Ok(())
 }
+async fn handle_audio_transcriptions_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &[u8],
+    request_content_type: Option<&str>,
+    request_user_agent: Option<&str>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let mut upstream = match crate::protocol_proxy::open_audio_transcriptions_proxy_request(
+        request_body,
+        request_content_type.unwrap_or_default(),
+        request_user_agent,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.audio_transcriptions_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let status = upstream.status();
+    let is_success = upstream.is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+    let body = upstream.bytes().await?;
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.audio_transcriptions_proxy_ok"
+        } else {
+            "helper.audio_transcriptions_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
 async fn handle_chat_completions_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
@@ -1655,7 +1883,7 @@ fn log_helper_response(
 
 #[cfg(test)]
 mod computer_use_tests {
-    use super::{header_value_from_request, overlay_image_content_type};
+    use super::{header_value_from_headers, overlay_image_content_type};
     use std::path::Path;
 
     #[test]
@@ -1680,17 +1908,167 @@ mod computer_use_tests {
         let request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Codex/26.614\r\nContent-Length: 2\r\n\r\n{}";
 
         assert_eq!(
-            header_value_from_request(request, "user-agent").as_deref(),
+            header_value_from_headers(request, "user-agent").as_deref(),
             Some("Codex/26.614")
         );
     }
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+struct HttpRequest {
+    headers: Vec<u8>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HttpRequestReadError {
+    status: &'static str,
+    message: String,
+}
+
+impl HttpRequestReadError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: "400 Bad Request",
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: "413 Payload Too Large",
+            message: format!("HTTP 请求体超过 {MAX_HTTP_BODY_BYTES} 字节限制"),
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        self.status
+    }
+}
+
+impl std::fmt::Display for HttpRequestReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpRequestReadError {}
+
+impl From<std::io::Error> for HttpRequestReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::bad_request(format!("读取 HTTP 请求失败: {error}"))
+    }
+}
+
+#[derive(Debug)]
+enum HttpBodyFraming {
+    Empty,
+    ContentLength(usize),
+    Chunked,
+}
+
+#[derive(Debug)]
+enum ChunkedBody {
+    Incomplete,
+    Complete(Vec<u8>),
+}
+
+#[derive(Debug)]
+enum ChunkedBodyScan {
+    Incomplete,
+    Complete,
+}
+
+#[derive(Default)]
+struct ChunkedScanState {
+    position: usize,
+    decoded_len: usize,
+    complete: bool,
+}
+
+impl ChunkedScanState {
+    fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+        if self.complete {
+            return Ok(ChunkedBodyScan::Complete);
+        }
+        loop {
+            let chunk_start = self.position;
+            let Some(line_end_offset) = encoded[chunk_start..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            else {
+                if encoded.len().saturating_sub(chunk_start) > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+                }
+                return Ok(ChunkedBodyScan::Incomplete);
+            };
+            if line_end_offset > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+            }
+            let line_end = chunk_start + line_end_offset;
+            let size_text = std::str::from_utf8(&encoded[chunk_start..line_end])
+                .map_err(|_| HttpRequestReadError::bad_request("chunk size 不是有效 ASCII"))?;
+            let size_token = size_text.split(';').next().unwrap_or_default().trim();
+            let chunk_size = usize::from_str_radix(size_token, 16)
+                .map_err(|_| HttpRequestReadError::bad_request("chunk size 无效"))?;
+            let data_start = line_end + 2;
+
+            if chunk_size == 0 {
+                let mut trailer_start = data_start;
+                loop {
+                    let Some(trailer_end_offset) = encoded[trailer_start..]
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                    else {
+                        if encoded.len().saturating_sub(data_start) > MAX_HTTP_HEADER_BYTES {
+                            return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                        }
+                        return Ok(ChunkedBodyScan::Incomplete);
+                    };
+                    if trailer_start + trailer_end_offset - data_start > MAX_HTTP_HEADER_BYTES {
+                        return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                    }
+                    if trailer_end_offset == 0 {
+                        self.position = trailer_start + 2;
+                        self.complete = true;
+                        return Ok(ChunkedBodyScan::Complete);
+                    }
+                    trailer_start += trailer_end_offset + 2;
+                }
+            }
+            let next_decoded_len = self
+                .decoded_len
+                .checked_add(chunk_size)
+                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            if next_decoded_len > MAX_HTTP_BODY_BYTES {
+                return Err(HttpRequestReadError::payload_too_large());
+            }
+            let chunk_end = data_start
+                .checked_add(chunk_size)
+                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            if encoded.len() < chunk_end + 2 {
+                return Ok(ChunkedBodyScan::Incomplete);
+            }
+            if &encoded[chunk_end..chunk_end + 2] != b"\r\n" {
+                return Err(HttpRequestReadError::bad_request("chunk 数据后缺少 CRLF"));
+            }
+            self.decoded_len = next_decoded_len;
+            self.position = chunk_end + 2;
+        }
+    }
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<HttpRequest, HttpRequestReadError> {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
     let mut header_end = None;
-    let mut content_length = 0_usize;
+    let mut framing = HttpBodyFraming::Empty;
+    let mut chunked_scan = ChunkedScanState::default();
 
     loop {
         let read = stream.read(&mut chunk).await?;
@@ -1701,50 +2079,192 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result
         if header_end.is_none() {
             header_end = find_header_end(&buffer);
             if let Some(end) = header_end {
-                content_length = content_length_from_headers(&buffer[..end]).unwrap_or(0);
+                if end > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
+                }
+                framing = http_body_framing(&buffer[..end])?;
+            } else if buffer.len() > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
             }
         }
         if let Some(end) = header_end {
-            if buffer.len() >= end + 4 + content_length {
-                break;
+            let body = &buffer[end + 4..];
+            if body.len() > MAX_HTTP_ENCODED_BODY_BYTES {
+                return Err(HttpRequestReadError::payload_too_large());
             }
-        }
-        if buffer.len() > 32 * 1024 * 1024 {
-            anyhow::bail!("HTTP 请求过大");
+            match framing {
+                HttpBodyFraming::Empty => break,
+                HttpBodyFraming::ContentLength(content_length) => {
+                    if content_length > MAX_HTTP_BODY_BYTES {
+                        return Err(HttpRequestReadError::payload_too_large());
+                    }
+                    if body.len() >= content_length {
+                        break;
+                    }
+                }
+                HttpBodyFraming::Chunked => match chunked_scan.advance(body)? {
+                    ChunkedBodyScan::Incomplete => {}
+                    ChunkedBodyScan::Complete => break,
+                },
+            }
         }
     }
 
-    Ok(buffer)
+    let header_end =
+        header_end.ok_or_else(|| HttpRequestReadError::bad_request("HTTP 请求头不完整"))?;
+    let headers = buffer[..header_end].to_vec();
+    let encoded_body = &buffer[header_end + 4..];
+    let body = match framing {
+        HttpBodyFraming::Empty => Vec::new(),
+        HttpBodyFraming::ContentLength(content_length) => {
+            content_length_body(encoded_body, content_length)?
+        }
+        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body)? {
+            ChunkedBody::Complete(body) => body,
+            ChunkedBody::Incomplete => {
+                return Err(HttpRequestReadError::bad_request(
+                    "chunked HTTP 请求体不完整",
+                ));
+            }
+        },
+    };
+
+    Ok(HttpRequest { headers, body })
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn content_length_from_headers(headers: &[u8]) -> Option<usize> {
+fn http_body_framing(headers: &[u8]) -> Result<HttpBodyFraming, HttpRequestReadError> {
     let text = String::from_utf8_lossy(headers);
-    text.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
+    let mut content_length = None;
+    let mut transfer_encoding: Option<String> = None;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| HttpRequestReadError::bad_request("Content-Length 无效"))?;
+            if content_length
+                .replace(parsed)
+                .is_some_and(|existing| existing != parsed)
+            {
+                return Err(HttpRequestReadError::bad_request(
+                    "存在冲突的 Content-Length 请求头",
+                ));
+            }
+        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            let value = value.trim().to_ascii_lowercase();
+            if let Some(existing) = transfer_encoding.as_mut() {
+                existing.push(',');
+                existing.push_str(&value);
+            } else {
+                transfer_encoding = Some(value);
+            }
         }
-    })
+    }
+
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err(HttpRequestReadError::bad_request(
+            "Transfer-Encoding 与 Content-Length 不能同时使用",
+        ));
+    }
+    match transfer_encoding.as_deref() {
+        Some("chunked") => Ok(HttpBodyFraming::Chunked),
+        Some(_) => Err(HttpRequestReadError::bad_request(
+            "仅支持 Transfer-Encoding: chunked",
+        )),
+        None => Ok(content_length
+            .map(HttpBodyFraming::ContentLength)
+            .unwrap_or(HttpBodyFraming::Empty)),
+    }
 }
 
-fn http_request_body(request: &str) -> &str {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or_default()
+fn content_length_body(
+    encoded: &[u8],
+    content_length: usize,
+) -> Result<Vec<u8>, HttpRequestReadError> {
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(HttpRequestReadError::payload_too_large());
+    }
+    if encoded.len() < content_length {
+        return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
+    }
+    Ok(encoded[..content_length].to_vec())
 }
 
-fn header_value_from_request(request: &str, header_name: &str) -> Option<String> {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(headers, _)| headers)
-        .unwrap_or(request)
+fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
+    let mut decoded = Vec::new();
+    let mut position = 0;
+    loop {
+        let Some(line_end_offset) = encoded[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            if encoded.len().saturating_sub(position) > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+            }
+            return Ok(ChunkedBody::Incomplete);
+        };
+        if line_end_offset > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+        }
+        let line_end = position + line_end_offset;
+        let size_text = std::str::from_utf8(&encoded[position..line_end])
+            .map_err(|_| HttpRequestReadError::bad_request("chunk size 不是有效 ASCII"))?;
+        let size_token = size_text.split(';').next().unwrap_or_default().trim();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| HttpRequestReadError::bad_request("chunk size 无效"))?;
+        position = line_end + 2;
+
+        if chunk_size == 0 {
+            loop {
+                let Some(trailer_end_offset) = encoded[position..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                else {
+                    if encoded.len().saturating_sub(line_end + 2) > MAX_HTTP_HEADER_BYTES {
+                        return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                    }
+                    return Ok(ChunkedBody::Incomplete);
+                };
+                if position + trailer_end_offset - (line_end + 2) > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                }
+                if trailer_end_offset == 0 {
+                    return Ok(ChunkedBody::Complete(decoded));
+                }
+                position += trailer_end_offset + 2;
+            }
+        }
+        if decoded.len().saturating_add(chunk_size) > MAX_HTTP_BODY_BYTES {
+            return Err(HttpRequestReadError::payload_too_large());
+        }
+        let chunk_end = position
+            .checked_add(chunk_size)
+            .ok_or_else(HttpRequestReadError::payload_too_large)?;
+        if encoded.len() < chunk_end + 2 {
+            return Ok(ChunkedBody::Incomplete);
+        }
+        if &encoded[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(HttpRequestReadError::bad_request("chunk 数据后缺少 CRLF"));
+        }
+        decoded.extend_from_slice(&encoded[position..chunk_end]);
+        position = chunk_end + 2;
+    }
+}
+
+#[cfg(test)]
+fn scan_chunked_body(encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+    ChunkedScanState::default().advance(encoded)
+}
+
+fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
+    headers
         .lines()
         .skip(1)
         .find_map(|line| {
@@ -1905,18 +2425,43 @@ async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()
 }
 
 pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
-    let healthy = match bridge_health_ok(debug_port).await {
-        Ok(healthy) => healthy,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "bridge.health_check_failed",
-                serde_json::json!({
-                    "debug_port": debug_port,
-                    "helper_port": helper_port,
-                    "message": error.to_string()
-                }),
-            );
-            false
+    check_and_reinject_bridge_inner(debug_port, helper_port, false, None).await
+}
+
+pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
+    previous.is_some_and(|previous| previous != current)
+}
+
+fn launcher_target_alive(has_codex_process: bool, cdp_available: bool) -> bool {
+    has_codex_process || cdp_available
+}
+
+fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool {
+    is_windows && !has_codex_process
+}
+
+async fn check_and_reinject_bridge_inner(
+    debug_port: u16,
+    helper_port: u16,
+    browser_identity_changed: bool,
+    bridge_reinjector: Option<BridgeReinjector>,
+) -> bool {
+    let healthy = if browser_identity_changed {
+        false
+    } else {
+        match bridge_health_ok(debug_port).await {
+            Ok(healthy) => healthy,
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "bridge.health_check_failed",
+                    serde_json::json!({
+                        "debug_port": debug_port,
+                        "helper_port": helper_port,
+                        "message": error.to_string()
+                    }),
+                );
+                false
+            }
         }
     };
     if healthy {
@@ -1927,10 +2472,14 @@ pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> boo
         "bridge.reinject_start",
         serde_json::json!({
             "debug_port": debug_port,
-            "helper_port": helper_port
+            "helper_port": helper_port,
+            "browser_identity_changed": browser_identity_changed
         }),
     );
-    match retry_injection(debug_port, helper_port).await {
+    let default_reinjector: BridgeReinjector =
+        Arc::new(move || Box::pin(async move { retry_injection(debug_port, helper_port).await }));
+    let reinject_result = run_bridge_reinjector(bridge_reinjector, default_reinjector).await;
+    match reinject_result {
         Ok(()) => {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "bridge.reinject_ok",
@@ -1952,6 +2501,16 @@ pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> boo
             );
             false
         }
+    }
+}
+
+async fn run_bridge_reinjector(
+    bridge_reinjector: Option<BridgeReinjector>,
+    default_reinjector: BridgeReinjector,
+) -> anyhow::Result<()> {
+    match bridge_reinjector {
+        Some(reinject) => reinject().await,
+        None => default_reinjector().await,
     }
 }
 
@@ -2049,22 +2608,24 @@ async fn confirmed_pet_overlay_targets(
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
         };
-        if pet_overlay_supports_v2_cursor(websocket_url).await {
+        if pet_overlay_supports_v2_cursor(websocket_url)
+            .await
+            .unwrap_or(false)
+        {
             confirmed.push(target);
         }
     }
     Ok(confirmed)
 }
 
-async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> bool {
-    crate::bridge::evaluate_script_with_await_promise(
+async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> anyhow::Result<bool> {
+    let result = crate::bridge::evaluate_script_with_await_promise(
         websocket_url,
-        crate::assets::pet_real_mouse_capability_probe_script(),
+        &crate::assets::pet_real_mouse_capability_probe_script(),
         true,
     )
-    .await
-    .as_ref()
-    .is_ok_and(runtime_evaluate_result_is_true)
+    .await?;
+    Ok(runtime_evaluate_result_is_true(&result))
 }
 
 async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyhow::Result<()> {
@@ -2078,8 +2639,17 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
         };
-        let supports_v2 = enabled && pet_overlay_supports_v2_cursor(websocket_url).await;
-        let script = if supports_v2 {
+        let script = if !enabled {
+            crate::assets::pet_real_mouse_stop_script()
+        } else if pet_overlay_supports_v2_cursor(websocket_url)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to probe pet overlay capability in target {} ({})",
+                    target.id, target.url
+                )
+            })?
+        {
             crate::assets::pet_real_mouse_script()
         } else {
             crate::assets::pet_real_mouse_stop_script()
@@ -2127,15 +2697,6 @@ async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
                 );
             }
         }
-        for target in &targets {
-            if let Some(websocket_url) = target.web_socket_debugger_url.as_deref() {
-                let _ = crate::bridge::evaluate_script(
-                    websocket_url,
-                    crate::assets::pet_real_mouse_stop_script(),
-                )
-                .await;
-            }
-        }
         drivers.abort_all();
         while drivers.join_next().await.is_some() {}
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2173,9 +2734,13 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
     )
     .await;
 
-    let _ =
-        crate::bridge::evaluate_script(websocket_url, crate::assets::pet_real_mouse_stop_script())
-            .await;
+    if result.is_ok() {
+        let _ = crate::bridge::evaluate_script(
+            websocket_url,
+            crate::assets::pet_real_mouse_stop_script(),
+        )
+        .await;
+    }
     match result {
         Ok(()) => {
             PET_CURSOR_DRIVER_FAILED.store(false, Ordering::Relaxed);
@@ -2342,119 +2907,6 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
             .eq_ignore_ascii_case("true")
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn post_launch_guard_artifacts_ready(
-    artifacts: &crate::computer_use_guard::GuardArtifacts,
-) -> bool {
-    artifacts.notify_exe.is_some()
-        && artifacts.marketplace_path.is_some()
-        && (!artifacts.runtime_exports_needed || artifacts.sky_package_json.is_some())
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn should_stop_post_launch_computer_use_guard(
-    stable_unchanged_attempts: usize,
-    artifacts: &crate::computer_use_guard::GuardArtifacts,
-) -> bool {
-    stable_unchanged_attempts >= POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS
-        && post_launch_guard_artifacts_ready(artifacts)
-}
-
-#[cfg(windows)]
-async fn run_post_launch_computer_use_guard(
-    home: PathBuf,
-    mut artifacts: Option<crate::computer_use_guard::GuardArtifacts>,
-    shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut previous_delay = 0_u64;
-    let mut stable_unchanged_attempts = 0_usize;
-    for (index, delay) in POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS
-        .iter()
-        .copied()
-        .enumerate()
-    {
-        let wait_seconds = delay.saturating_sub(previous_delay);
-        previous_delay = delay;
-        if wait_seconds > 0 {
-            tokio::select! {
-                _ = &mut *shutdown_rx => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {}
-            }
-        }
-        let attempt = index + 1;
-        let resolved_artifacts = match artifacts.take() {
-            Some(artifacts) => artifacts,
-            None => match crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    stable_unchanged_attempts = 0;
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "computer_use_guard.post_launch_failed",
-                        serde_json::json!({
-                            "attempt": attempt,
-                            "delay_seconds": delay,
-                            "phase": "resolve_artifacts",
-                            "message": error.to_string()
-                        }),
-                    );
-                    continue;
-                }
-            },
-        };
-        let artifacts_ready = post_launch_guard_artifacts_ready(&resolved_artifacts);
-        artifacts = artifacts_ready.then_some(resolved_artifacts.clone());
-        match crate::computer_use_guard::ensure_computer_use_config_with_artifacts(
-            &home,
-            &resolved_artifacts,
-        ) {
-            Ok(result) => {
-                if !result.changed && artifacts_ready {
-                    stable_unchanged_attempts += 1;
-                } else {
-                    stable_unchanged_attempts = 0;
-                }
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "computer_use_guard.post_launch_ok",
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "delay_seconds": delay,
-                        "changed": result.changed,
-                        "stable_unchanged_attempts": stable_unchanged_attempts,
-                        "notify_exe": result
-                            .notify_exe
-                            .map(|path| path.to_string_lossy().to_string())
-                    }),
-                );
-                if should_stop_post_launch_computer_use_guard(
-                    stable_unchanged_attempts,
-                    &resolved_artifacts,
-                ) {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "computer_use_guard.post_launch_stable_stop",
-                        serde_json::json!({
-                            "attempt": attempt,
-                            "delay_seconds": delay,
-                            "stable_unchanged_attempts": stable_unchanged_attempts
-                        }),
-                    );
-                    return;
-                }
-            }
-            Err(error) => {
-                stable_unchanged_attempts = 0;
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "computer_use_guard.post_launch_failed",
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "delay_seconds": delay,
-                        "message": error.to_string()
-                    }),
-                );
-            }
-        }
-    }
-}
-
 #[cfg(windows)]
 async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || wait_for_windows_process_id_blocking(process_id))
@@ -2607,8 +3059,7 @@ pub async fn activate_packaged_app(
 #[cfg(windows)]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
     use windows::Win32::System::Com::{
-        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     };
     use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
     use windows::core::HSTRING;
@@ -2627,7 +3078,7 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 
         let result: windows::core::Result<u32> = (|| {
             let manager: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?;
             let process_id = manager.ActivateApplication(
                 &HSTRING::from(app_user_model_id),
                 &HSTRING::from(arguments),
@@ -2646,52 +3097,403 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
-    #[test]
-    fn post_launch_guard_stops_after_stable_ready_artifacts() {
-        let artifacts = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-
-        assert!(!should_stop_post_launch_computer_use_guard(2, &artifacts));
-        assert!(should_stop_post_launch_computer_use_guard(3, &artifacts));
+    fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
+        Arc::new(move || {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
     }
 
     #[test]
-    fn post_launch_guard_keeps_retrying_until_artifacts_are_ready() {
-        let missing_notify = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: None,
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-        let missing_marketplace = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: None,
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-        let missing_runtime_package = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: true,
-        };
+    fn launcher_stays_alive_while_injected_cdp_endpoint_is_available() {
+        assert!(launcher_target_alive(false, true));
+    }
 
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_notify
+    #[test]
+    fn launcher_only_probes_cdp_for_unrecognized_windows_processes() {
+        assert!(should_probe_launcher_cdp(true, false));
+        assert!(!should_probe_launcher_cdp(true, true));
+        assert!(!should_probe_launcher_cdp(false, false));
+    }
+
+    #[tokio::test]
+    async fn bridge_reinjector_prefers_launcher_callback() {
+        let launcher_calls = Arc::new(AtomicUsize::new(0));
+        let default_calls = Arc::new(AtomicUsize::new(0));
+
+        run_bridge_reinjector(
+            Some(counted_reinjector(launcher_calls.clone())),
+            counted_reinjector(default_calls.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bridge_reinjector_falls_back_to_core_callback() {
+        let default_calls = Arc::new(AtomicUsize::new(0));
+
+        run_bridge_reinjector(None, counted_reinjector(default_calls.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(default_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn http_body_framing_rejects_ambiguous_or_unsupported_headers() {
+        let conflict = http_body_framing(
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked",
+        )
+        .unwrap_err();
+        assert_eq!(conflict.status(), "400 Bad Request");
+
+        let unsupported =
+            http_body_framing(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip").unwrap_err();
+        assert_eq!(unsupported.status(), "400 Bad Request");
+
+        let multiple = http_body_framing(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked",
+        )
+        .unwrap_err();
+        assert_eq!(multiple.status(), "400 Bad Request");
+    }
+
+    #[test]
+    fn chunked_decoder_accepts_exact_body_limit_and_rejects_one_byte_more() {
+        let mut exact = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES).into_bytes();
+        exact.resize(exact.len() + MAX_HTTP_BODY_BYTES, b'a');
+        exact.extend_from_slice(b"\r\n0\r\n\r\n");
+        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact).unwrap() else {
+            panic!("expected complete chunked body");
+        };
+        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+
+        let oversized = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES + 1).into_bytes();
+        let error = decode_chunked_body(&oversized).unwrap_err();
+        assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[test]
+    fn chunked_decoder_handles_extensions_trailers_and_every_partial_prefix() {
+        let encoded = b"3;name=value\r\n\x00\x80\xff\r\n2\r\nAB\r\n0\r\nX-Trace: yes\r\n\r\n";
+        for prefix_len in 0..encoded.len() {
+            assert!(matches!(
+                scan_chunked_body(&encoded[..prefix_len]).unwrap(),
+                ChunkedBodyScan::Incomplete
+            ));
+        }
+
+        assert!(matches!(
+            scan_chunked_body(encoded).unwrap(),
+            ChunkedBodyScan::Complete
         ));
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_marketplace
-        ));
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_runtime_package
-        ));
+        let ChunkedBody::Complete(decoded) = decode_chunked_body(encoded).unwrap() else {
+            panic!("expected complete chunked body");
+        };
+        assert_eq!(decoded, [0x00, 0x80, 0xff, b'A', b'B']);
+    }
+
+    #[test]
+    fn chunked_decoder_rejects_oversized_size_lines_and_trailers() {
+        let oversized_size_line = vec![b'f'; MAX_HTTP_HEADER_BYTES + 1];
+        let error = scan_chunked_body(&oversized_size_line).unwrap_err();
+        assert_eq!(error.status(), "400 Bad Request");
+
+        let mut oversized_trailer = b"0\r\nX-Large: ".to_vec();
+        oversized_trailer.resize(MAX_HTTP_HEADER_BYTES + 16, b'a');
+        let error = scan_chunked_body(&oversized_trailer).unwrap_err();
+        assert_eq!(error.status(), "400 Bad Request");
+    }
+
+    #[test]
+    fn content_length_body_accepts_exact_limit_and_rejects_one_byte_more() {
+        let exact = vec![b'a'; MAX_HTTP_BODY_BYTES];
+        assert_eq!(
+            content_length_body(&exact, MAX_HTTP_BODY_BYTES)
+                .unwrap()
+                .len(),
+            MAX_HTTP_BODY_BYTES
+        );
+
+        let error = content_length_body(&[], MAX_HTTP_BODY_BYTES + 1).unwrap_err();
+        assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[tokio::test]
+    async fn helper_returns_400_for_ambiguous_body_framing() {
+        let response = send_raw_helper_request(
+            b"POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_413_before_reading_oversized_content_length_body() {
+        let request = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        let response = send_raw_helper_request(request.as_bytes()).await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413 Payload Too Large"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_400_for_oversized_headers() {
+        let mut request = b"GET /backend/status HTTP/1.1\r\nX-Large: ".to_vec();
+        request.resize(MAX_HTTP_HEADER_BYTES + 1, b'a');
+        request.extend_from_slice(b"\r\n\r\n");
+        let response = send_raw_helper_request(&request).await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_426_for_responses_websocket_upgrade() {
+        let response = send_raw_helper_request(
+            b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 426 Upgrade Required"));
+    }
+
+    #[test]
+    fn protocol_proxy_request_body_decodes_zstd() {
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+
+        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+
+        assert_eq!(decoded.as_bytes(), body);
+        assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
+    }
+
+    #[tokio::test]
+    async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "remote-control",
+                "name": "Remote Control Relay",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-upstream",
+                "protocol": "responses",
+                "relayMode": "official",
+                "officialMixApiKey": true
+            }],
+            "activeRelayId": "remote-control"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let response_body = br#"{"id":"resp_remote","object":"response"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+            request
+        });
+
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        );
+        client.write_all(headers.as_bytes()).await.unwrap();
+        client.write_all(&compressed).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        let upstream_request = upstream.await.unwrap();
+        let header_end = find_header_end(&upstream_request).unwrap();
+        let upstream_headers =
+            String::from_utf8_lossy(&upstream_request[..header_end]).to_ascii_lowercase();
+        assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
+        assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
+        assert!(!upstream_headers.contains("chatgpt-secret"));
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
+        assert_eq!(upstream_body["model"], "gpt-5.6-sol");
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        helper.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn helper_decodes_fragmented_chunked_binary_multipart_body() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfiles": [{
+                "id": "audio",
+                "name": "Audio",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-test",
+                "protocol": "chatCompletions",
+                "relayMode": "mixedApi"
+            }],
+            "activeRelayId": "audio"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let boundary = "codex-binary-boundary";
+        let mut multipart = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"binary.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .into_bytes();
+        multipart.extend_from_slice(&[0x00, 0x80, 0xff, b'A', b'B']);
+        multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let expected_body = multipart.clone();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let header_end = find_header_end(&request).unwrap();
+            let body = request[header_end + 4..].to_vec();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"text\":\"ok\"}",
+                )
+                .await
+                .unwrap();
+            body
+        });
+
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let headers = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {helper_addr}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        for fragment in headers.as_bytes().chunks(7) {
+            client.write_all(fragment).await.unwrap();
+        }
+        for fragment in multipart.chunks(11) {
+            let chunk_header = format!("{:X}\r\n", fragment.len());
+            client.write_all(chunk_header.as_bytes()).await.unwrap();
+            client.write_all(fragment).await.unwrap();
+            client.write_all(b"\r\n").await.unwrap();
+        }
+        client.write_all(b"0\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        assert_eq!(upstream.await.unwrap(), expected_body);
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
     }
 }

@@ -11,7 +11,9 @@ const TRAY_ID: &str = "codex_plus_tray";
 
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
 const TRAY_MENU_SHOW: &str = "tray_show_main";
+const TRAY_MENU_DREAM_SKIN_APPLY: &str = "tray_apply_dream_skin";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
+const DREAM_SKIN_DEBUG_PORT: u16 = 9229;
 
 pub fn run() {
     install_panic_logger();
@@ -24,8 +26,21 @@ pub fn run() {
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
+    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load()
+        && let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+            settings.enhancements_enabled
+                && settings.codex_app_dream_skin_enabled
+                && !settings.codex_app_dream_skin_paused,
+            &settings.codex_app_dream_skin_theme_config,
+        )
+    {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.dream_skin_base_theme_sync_failed",
+            serde_json::json!({ "message": error.to_string() }),
+        );
+    }
     let show_update = commands::startup_should_show_update();
-    let run_result = tauri::Builder::default()
+    let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let url = if show_update {
@@ -43,7 +58,8 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
-            register_main_window_events(main_window);
+            commands::start_weixin_connect_from_saved_settings();
+            register_main_window_events(main_window, startup_is_transient());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -54,6 +70,33 @@ pub fn run() {
             commands::restart_codex_plus,
             commands::load_settings,
             commands::save_settings,
+            commands::weixin_connect_qr_start,
+            commands::weixin_connect_qr_status,
+            commands::weixin_connect_status,
+            commands::weixin_connect_start,
+            commands::weixin_connect_stop,
+            commands::dream_skin_status,
+            commands::import_dream_skin_image,
+            commands::reset_dream_skin_image,
+            commands::reset_dream_skin_theme,
+            commands::apply_dream_skin,
+            commands::restore_dream_skin,
+            commands::verify_dream_skin,
+            commands::list_dream_skin_themes,
+            commands::refresh_dream_skin_market,
+            commands::refresh_dream_skin_community,
+            commands::load_pending_dream_skin_community,
+            commands::confirm_pending_dream_skin_community,
+            commands::dismiss_pending_dream_skin_community,
+            commands::install_dream_skin_market_theme,
+            commands::install_dream_skin_community_theme,
+            commands::import_dream_skin_theme_package,
+            commands::load_dream_skin_theme,
+            commands::create_dream_skin_theme,
+            commands::save_dream_skin_theme,
+            commands::rename_dream_skin_theme,
+            commands::delete_dream_skin_theme,
+            commands::activate_dream_skin_theme,
             commands::load_ccs_providers,
             commands::import_ccs_providers,
             commands::load_pending_provider_import,
@@ -65,6 +108,8 @@ pub fn run() {
             commands::forget_zed_remote_project,
             commands::delete_local_session,
             commands::load_provider_sync_targets,
+            commands::preview_session_index_cleanup,
+            commands::apply_session_index_cleanup,
             commands::sync_providers_now,
             commands::load_ads,
             commands::refresh_script_market,
@@ -87,6 +132,7 @@ pub fn run() {
             commands::enable_watcher,
             commands::disable_watcher,
             commands::read_latest_logs,
+            commands::clear_logs,
             commands::copy_diagnostics,
             commands::reset_settings,
             commands::reset_image_overlay_settings,
@@ -105,10 +151,10 @@ pub fn run() {
             commands::delete_context_entry,
             commands::extract_relay_common_config,
             commands::test_relay_profile,
-            commands::measure_relay_latency,
             commands::diagnose_relay_profile,
             commands::test_stepwise_settings,
             commands::fetch_relay_profile_models,
+            commands::fetch_sub2api_billing,
             commands::switch_relay_profile,
             commands::apply_relay_injection,
             commands::apply_pure_api_injection,
@@ -117,21 +163,62 @@ pub fn run() {
             manager_hide_to_tray,
             update_tray_labels
         ])
-        .run(tauri::generate_context!());
-    if let Err(error) = run_result {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "manager.run_failed",
-            serde_json::json!({
-                "error": error.to_string()
-            }),
-        );
+        .build(tauri::generate_context!());
+    match app_result {
+        Ok(app) => app.run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    if handle_dream_skin_url(url.as_str()) {
+                        show_main_window(app_handle);
+                    }
+                }
+            }
+        }),
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.run_failed",
+                serde_json::json!({
+                    "error": error.to_string()
+                }),
+            );
+        }
+    }
+}
+
+pub fn handle_dream_skin_url(url: &str) -> bool {
+    if !url.starts_with("dreamskin://") {
+        return false;
+    }
+    match codex_plus_core::dream_skin_community::save_pending_community_link(url) {
+        Ok(version_id) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_link.pending",
+                serde_json::json!({ "versionId": version_id }),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_link.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            false
+        }
     }
 }
 
 fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW, "显示主窗口", true, None::<&str>)?;
+    let apply_skin_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_DREAM_SKIN_APPLY,
+        "应用 Dream Skin",
+        true,
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出程序", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+    let tray_menu = Menu::with_items(app, &[&show_item, &apply_skin_item, &quit_item])?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&tray_menu)
@@ -139,6 +226,11 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             TRAY_MENU_SHOW => {
                 show_main_window(app);
+            }
+            TRAY_MENU_DREAM_SKIN_APPLY => {
+                tauri::async_runtime::spawn(async {
+                    record_tray_dream_skin_result("apply", apply_dream_skin_from_tray().await);
+                });
             }
             TRAY_MENU_QUIT => {
                 APP_EXITING.store(true, Ordering::SeqCst);
@@ -169,10 +261,14 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) {
+fn register_main_window_events<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    transient: bool,
+) {
     let event_window = window.clone();
     let minimized_window = event_window.clone();
     let close_event_window = event_window.clone();
+    let close_event_app = event_window.app_handle().clone();
 
     event_window.on_window_event(move |event| match event {
         WindowEvent::Resized(_) => {
@@ -185,11 +281,21 @@ fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R
                 return;
             }
 
+            if transient {
+                APP_EXITING.store(true, Ordering::SeqCst);
+                close_event_app.exit(0);
+                return;
+            }
+
             api.prevent_close();
             let _ = close_event_window.hide();
         }
         _ => {}
     });
+}
+
+fn startup_is_transient() -> bool {
+    std::env::args().any(|arg| arg == "--transient")
 }
 
 #[tauri::command]
@@ -207,14 +313,22 @@ fn manager_hide_to_tray<R: tauri::Runtime>(window: tauri::WebviewWindow<R>) {
 fn update_tray_labels<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     show_label: String,
+    apply_skin_label: String,
     quit_label: String,
     window_title: String,
 ) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let show_item = MenuItem::with_id(&app, TRAY_MENU_SHOW, &show_label, true, None::<&str>);
+        let apply_skin_item = MenuItem::with_id(
+            &app,
+            TRAY_MENU_DREAM_SKIN_APPLY,
+            &apply_skin_label,
+            true,
+            None::<&str>,
+        );
         let quit_item = MenuItem::with_id(&app, TRAY_MENU_QUIT, &quit_label, true, None::<&str>);
-        if let (Ok(show), Ok(quit)) = (show_item, quit_item) {
-            if let Ok(menu) = Menu::with_items(&app, &[&show, &quit]) {
+        if let (Ok(show), Ok(apply_skin), Ok(quit)) = (show_item, apply_skin_item, quit_item) {
+            if let Ok(menu) = Menu::with_items(&app, &[&show, &apply_skin, &quit]) {
                 let _ = tray.set_menu(Some(menu));
             }
         }
@@ -224,11 +338,70 @@ fn update_tray_labels<R: tauri::Runtime>(
     }
 }
 
+async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
+    let store = codex_plus_core::settings::SettingsStore::default();
+    let current = store.load()?;
+    if !current.enhancements_enabled {
+        anyhow::bail!("Codex enhancements are disabled");
+    }
+    let settings = store.update(serde_json::json!({
+        "codexAppDreamSkinEnabled": true,
+        "codexAppDreamSkinPaused": false
+    }))?;
+    debug_assert!(settings.enhancements_enabled);
+    codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+        true,
+        &settings.codex_app_dream_skin_theme_config,
+    )?;
+    codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
+        DREAM_SKIN_DEBUG_PORT,
+        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+    )
+    .await?;
+    Ok(())
+}
+
+fn record_tray_dream_skin_result(action: &str, result: anyhow::Result<()>) {
+    let (event, detail) = match result {
+        Ok(()) => (
+            "manager.tray_dream_skin_ok",
+            serde_json::json!({ "action": action }),
+        ),
+        Err(error) => (
+            "manager.tray_dream_skin_failed",
+            serde_json::json!({ "action": action, "error": error.to_string() }),
+        ),
+    };
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(event, detail);
+}
+
 fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     if let Some(window) = app_handle.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+/// Restores and focuses an existing manager window on Windows.
+///
+/// This is a no-op on other platforms.
+pub fn focus_existing_manager_window() {
+    #[cfg(windows)]
+    {
+        let current_process_id = std::process::id();
+        for process in codex_plus_core::windows_enumerate_processes() {
+            if process.process_id == current_process_id {
+                continue;
+            }
+            if process
+                .exe_file
+                .eq_ignore_ascii_case("codex-plus-plus-manager.exe")
+            {
+                let _ = codex_plus_core::windows_activate_process_window(process.process_id);
+                break;
+            }
+        }
     }
 }
 
@@ -273,22 +446,19 @@ fn acquire_single_instance_guard() -> Option<codex_plus_core::ports::LoopbackPor
             }
             Some(guard)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "manager.already_running",
                 serde_json::json!({
                     "guard_port": codex_plus_core::ports::manager_guard_port()
                 }),
             );
-            None
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.already_running",
-                serde_json::json!({
-                    "guard_port": codex_plus_core::ports::manager_guard_port()
-                }),
-            );
+            focus_existing_manager_window();
             None
         }
         Err(error) => {

@@ -1,4 +1,8 @@
 (() => {
+  // The launcher targets the Codex app page, but keep a renderer-side guard
+  // so this bundle cannot create UI in embedded browser documents.
+  const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
+  if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
   function installCodexPlusFastStartup() {
@@ -94,11 +98,148 @@
 
   function installCodexPlusForceChineseLocale() {
     const config = window.__CODEX_PLUS_FORCE_CHINESE_LOCALE__;
-    if (!config || config.enabled !== true) return;
-    if (window.__codexPlusForceChineseLocaleInstalled === "1") return;
-    window.__codexPlusForceChineseLocaleInstalled = "1";
+    if (!config) return;
+    const enabled = config.enabled === true;
     const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
+    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
+    if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
+    window.__codexPlusForceChineseLocaleInstalled = installationKey;
     const languages = [locale, "zh", "en-US", "en"];
+    const managedLocaleStorageKey = "codexPlus.forceChineseLocale.managed.v1";
+    const localeReloadStorageKey = "codexPlus.forceChineseLocale.reload.v1";
+
+    const readManagedLocale = () => {
+      try {
+        const value = JSON.parse(window.localStorage.getItem(managedLocaleStorageKey) || "null");
+        return value && typeof value === "object" ? value : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const writeManagedLocale = (value) => {
+      try {
+        if (value) {
+          window.localStorage.setItem(managedLocaleStorageKey, JSON.stringify(value));
+        } else {
+          window.localStorage.removeItem(managedLocaleStorageKey);
+        }
+      } catch {
+      }
+    };
+
+    const waitForElectronBridge = () => new Promise((resolve) => {
+      const startedAt = Date.now();
+      const check = () => {
+        const bridge = window.electronBridge;
+        if (bridge && typeof bridge.sendMessageFromView === "function") {
+          resolve(bridge);
+          return;
+        }
+        if (Date.now() - startedAt >= 5000) {
+          resolve(null);
+          return;
+        }
+        window.setTimeout(check, 50);
+      };
+      check();
+    });
+
+    const callCodexSettingApi = (bridge, method, params) => new Promise((resolve, reject) => {
+      const requestId = typeof crypto?.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `codex-plus-locale-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      let timeout;
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        window.removeEventListener("message", onMessage);
+      };
+      const onMessage = (event) => {
+        const message = event?.data;
+        if (!message || message.type !== "fetch-response" || message.requestId !== requestId) return;
+        cleanup();
+        if (message.responseType !== "success") {
+          reject(new Error(message.error || `Codex ${method} failed`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(message.bodyJsonString || "null"));
+        } catch (error) {
+          reject(error);
+        }
+      };
+      window.addEventListener("message", onMessage);
+      timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error(`Codex ${method} timed out`));
+      }, 5000);
+      const message = {
+        type: "fetch",
+        requestId,
+        method: "POST",
+        url: `vscode://codex/${method}`,
+        body: JSON.stringify({ params }),
+      };
+      Promise.resolve(bridge.sendMessageFromView(message)).catch((error) => {
+        cleanup();
+        reject(error);
+      });
+    });
+
+    const reloadAfterLocaleChange = (value) => {
+      const marker = JSON.stringify(value);
+      try {
+        if (window.sessionStorage.getItem(localeReloadStorageKey) === marker) return;
+        window.sessionStorage.setItem(localeReloadStorageKey, marker);
+      } catch {
+      }
+      window.location.reload();
+    };
+
+    const clearLocaleReloadMarker = () => {
+      try {
+        window.sessionStorage.removeItem(localeReloadStorageKey);
+      } catch {
+      }
+    };
+
+    const syncOfficialLocaleSetting = async () => {
+      const managed = readManagedLocale();
+      if (!enabled && !managed) return;
+      const bridge = await waitForElectronBridge();
+      if (!bridge) return;
+      const response = await callCodexSettingApi(bridge, "get-setting", { key: "localeOverride" });
+      const currentValue = response?.value ?? null;
+
+      if (enabled) {
+        if (currentValue === locale) {
+          clearLocaleReloadMarker();
+          return;
+        }
+        if (!managed) {
+          writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
+        }
+        await callCodexSettingApi(bridge, "set-setting", { key: "localeOverride", value: locale });
+        reloadAfterLocaleChange(locale);
+        return;
+      }
+
+      if (currentValue !== managed.appliedLocale) {
+        writeManagedLocale(null);
+        clearLocaleReloadMarker();
+        return;
+      }
+      const previousValue = managed.previousValue ?? null;
+      await callCodexSettingApi(bridge, "set-setting", {
+        key: "localeOverride",
+        value: previousValue,
+      });
+      writeManagedLocale(null);
+      reloadAfterLocaleChange(previousValue);
+    };
+
+    syncOfficialLocaleSetting().catch(() => {});
+    if (!enabled) return;
 
     const defineNavigatorGetter = (name, value) => {
       try {
@@ -237,8 +378,6 @@
   const helperBase = window.__CODEX_SESSION_DELETE_HELPER__ || "http://127.0.0.1:57321";
   const buttonClass = "codex-delete-button";
   const exportButtonClass = "codex-export-button";
-  const projectMoveButtonClass = "codex-project-move-button";
-  const projectMoveOverlayClass = "codex-project-move-overlay";
   const actionButtonClass = "codex-session-action-button";
   const actionGroupClass = "codex-session-actions";
   const moreButtonClass = "codex-session-more-button";
@@ -256,23 +395,14 @@
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const upstreamBranchSelectionKey = "codexUpstreamBranchSelection";
   const upstreamProjectContextKey = "codexUpstreamProjectContext";
-  const zedRemoteOpenVersion = "1";
   const zedRemoteOpenInMenuVersion = "1";
   const zedRemoteOpenInMenuActivationWindowMs = 600;
-  const projectMoveProjectionKey = "codexProjectMoveProjection";
-  const legacyProjectMoveOverridesKey = "codexProjectMoveOverrides";
-  const projectMoveProjectionTtlMs = 24 * 60 * 60 * 1000;
-  const projectMoveProjectionSettleMs = 5 * 60 * 1000;
-  const projectMoveRefreshDelaysMs = [50, 250, 750, 1500];
-  const chatsSortRefreshIntervalMs = 1500;
-  const chatsSortDbRefreshIntervalMs = 5000;
   const styleId = "codex-delete-style";
   const codexDeleteStyleVersion = "14";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
-  const codexProjectMoveVersion = "1";
   const codexActionGroupVersion = "5";
   const codexArchiveRowActionsVersion = "1";
   const codexArchiveDeleteAllVersion = "2";
@@ -330,12 +460,10 @@
   const codexThreadServiceTierKey = "codexThreadServiceTierOverrides";
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
-  const codexServiceTierRequestOverrideVersion = "3";
-  const codexAppServerModelRequestPatchVersion = "1";
-  const codexPluginMarketplaceUnlockVersion = "12";
-  const codexPluginAutoExpandVersion = "1";
-  const codexPluginAutoExpandMaxClicks = 80;
-  const codexPluginAutoExpandClickDelayMs = 90;
+  const codexServiceTierRequestOverrideVersion = "8";
+  const codexAppServerModelRequestPatchVersion = "5";
+  const codexRemoteSessionRecoveryVersion = "4";
+  const codexPluginMarketplaceUnlockVersion = "15";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -346,12 +474,9 @@
   const codexThreadScrollListenerVersion = "4";
   const codexThreadScrollUserIntentVersion = "dispatcher:2";
   const codexPlusImageOverlayId = "codex-plus-image-overlay";
-  window.__codexProjectMoveRuntimeId = (window.__codexProjectMoveRuntimeId || 0) + 1;
-  const codexProjectMoveRuntimeId = window.__codexProjectMoveRuntimeId;
-  clearTimeout(window.__codexProjectMoveProjectionTimer);
-  clearTimeout(window.__codexProjectMoveChatsSortTimer);
-  window.__codexProjectMoveProjectionTimer = null;
-  window.__codexProjectMoveChatsSortTimer = null;
+  const codexPlusDreamSkinStyleId = "codex-dream-skin-style";
+  const codexPlusDreamSkinPlatform = String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || "macos");
+  const codexPlusDreamSkinRevision = String(window.__CODEX_PLUS_DREAM_SKIN_REVISION__ || "1");
   clearTimeout(window.__codexThreadScrollSaveTimer);
   window.__codexThreadScrollSaveTimer = null;
   (window.__codexThreadScrollRestoreTimers || []).forEach((timer) => clearTimeout(timer));
@@ -443,7 +568,7 @@
   const selectors = {
     sidebarThread: "[data-app-action-sidebar-thread-id]",
     threadTitle: "[data-thread-title]",
-    appHeader: ".app-header-tint",
+    appHeader: '[class*="ApplicationMenuTopBar"], .app-header-tint',
     nativeMenuBar: "[class*=\"ms-auto\"][class*=\"flex\"][class*=\"items-center\"]",
     headerContextMenuSurface: '[data-testid="app-shell-header-context-menu-surface"]',
     archiveNav: 'button[aria-label="已归档对话"], button[aria-label="Archived conversations"]',
@@ -689,6 +814,7 @@
       .codex-project-move-item-path { margin-top: 2px; color: #6b7280; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .codex-project-move-empty { padding: 18px 12px; color: #6b7280; text-align: center; }
       .codex-project-move-hidden { display: none !important; }
+      [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
       [data-codex-project-move-injected-list="true"] { display: flex; flex-direction: column; }
       .codex-archive-delete-all {
         border: 1px solid #ef4444;
@@ -762,7 +888,7 @@
         background: #dc2626;
         color: #ffffff;
       }
-      /* Dark theme overrides for delete-confirm and project-move dialogs.
+      /* Dark theme overrides for delete-confirm dialogs.
          Triggered either by Codex applying a "dark" class / data-theme="dark"
          on its document root, or by the OS-level prefers-color-scheme hint.
          Palette matches the existing Codex++ dark modal (.codex-plus-modal-content). */
@@ -798,45 +924,6 @@
         background: #dc2626;
         color: #ffffff;
       }
-      html.dark .${projectMoveOverlayClass},
-      html[data-theme="dark"] .${projectMoveOverlayClass},
-      :root[data-theme="dark"] .${projectMoveOverlayClass} {
-        background: rgba(0,0,0,.55);
-      }
-      html.dark .codex-project-move-panel,
-      html[data-theme="dark"] .codex-project-move-panel,
-      :root[data-theme="dark"] .codex-project-move-panel {
-        border-color: rgba(255,255,255,.12);
-        background: #2b2b2b;
-        color: #f3f4f6;
-        box-shadow: 0 18px 60px rgba(0,0,0,.55);
-      }
-      html.dark .codex-project-move-header,
-      html[data-theme="dark"] .codex-project-move-header,
-      :root[data-theme="dark"] .codex-project-move-header {
-        border-bottom-color: rgba(255,255,255,.1);
-      }
-      html.dark .codex-project-move-item,
-      html[data-theme="dark"] .codex-project-move-item,
-      :root[data-theme="dark"] .codex-project-move-item {
-        color: #f3f4f6;
-      }
-      html.dark .codex-project-move-item:hover,
-      html.dark .codex-project-move-item:focus-visible,
-      html[data-theme="dark"] .codex-project-move-item:hover,
-      html[data-theme="dark"] .codex-project-move-item:focus-visible,
-      :root[data-theme="dark"] .codex-project-move-item:hover,
-      :root[data-theme="dark"] .codex-project-move-item:focus-visible {
-        background: rgba(255,255,255,.08);
-      }
-      html.dark .codex-project-move-item-path,
-      html[data-theme="dark"] .codex-project-move-item-path,
-      :root[data-theme="dark"] .codex-project-move-item-path,
-      html.dark .codex-project-move-empty,
-      html[data-theme="dark"] .codex-project-move-empty,
-      :root[data-theme="dark"] .codex-project-move-empty {
-        color: #9ca3af;
-      }
       @media (prefers-color-scheme: dark) {
         html:not(.light):not([data-theme="light"]) .codex-delete-confirm-overlay {
           background: rgba(0,0,0,.55);
@@ -859,29 +946,6 @@
           border-color: #ef4444;
           background: #dc2626;
           color: #ffffff;
-        }
-        html:not(.light):not([data-theme="light"]) .${projectMoveOverlayClass} {
-          background: rgba(0,0,0,.55);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-panel {
-          border-color: rgba(255,255,255,.12);
-          background: #2b2b2b;
-          color: #f3f4f6;
-          box-shadow: 0 18px 60px rgba(0,0,0,.55);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-header {
-          border-bottom-color: rgba(255,255,255,.1);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item {
-          color: #f3f4f6;
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item:hover,
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item:focus-visible {
-          background: rgba(255,255,255,.08);
-        }
-        html:not(.light):not([data-theme="light"]) .codex-project-move-item-path,
-        html:not(.light):not([data-theme="light"]) .codex-project-move-empty {
-          color: #9ca3af;
         }
       }
       #${codexPlusMenuId}.${codexPlusMenuFloatingClass} {
@@ -950,7 +1014,6 @@
         pointer-events: auto;
         -webkit-app-region: no-drag;
       }
-      .codex-plus-modal-content[data-codex-plus-active-tab="support"] { width: min(820px, calc(100vw - 48px)); }
       .codex-plus-modal-header {
         display: flex;
         align-items: center;
@@ -1141,31 +1204,25 @@
       .codex-plus-ad-card { border: 1px solid rgba(96,165,250,.26); border-radius: 16px; background: linear-gradient(135deg, rgba(37,99,235,.18), rgba(255,255,255,.05)); box-shadow: 0 14px 36px rgba(0,0,0,.22); }
       .codex-plus-ad-image { display: block; width: calc(100% - 28px); aspect-ratio: 16 / 5; margin: 14px 14px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: #080808; object-fit: cover; }
       .codex-plus-ad-content { padding: 14px; }
-      .codex-plus-ad-title { margin: 0; color: #f8fafc; font-size: 17px; line-height: 1.35; }
-      .codex-plus-ad-description { margin: 6px 0 10px; color: #dbeafe; font-size: 13px; line-height: 1.55; }
-      .codex-plus-ad-highlights { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+      .codex-plus-ad-title { margin: 0; overflow: hidden; color: #f8fafc; font-size: 17px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      .codex-plus-ad-description { display: -webkit-box; margin: 6px 0 10px; overflow: hidden; color: #dbeafe; font-size: 13px; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-height: 1.55; }
+      .codex-plus-ad-highlights { display: flex; flex-wrap: wrap; gap: 6px; max-height: 56px; margin-bottom: 12px; overflow: hidden; }
       .codex-plus-ad-highlights span { border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: rgba(255,255,255,.08); color: #f3f4f6; font-size: 12px; padding: 4px 8px; }
       .codex-plus-ad-link { display: inline-flex; align-items: center; justify-content: center; border-radius: 9px; background: #2563eb; color: #ffffff; font-size: 13px; font-weight: 650; text-decoration: none; padding: 8px 12px; }
       .codex-plus-ad-empty { border: 1px dashed rgba(255,255,255,.16); border-radius: 12px; color: #9ca3af; font-size: 13px; padding: 12px; text-align: center; }
-      .codex-plus-sponsor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-      .codex-plus-sponsor-card { border: 1px solid rgba(255,255,255,.1); border-radius: 12px; padding: 10px; background: rgba(255,255,255,.04); text-align: center; }
-      .codex-plus-sponsor-card-title { color: #f3f4f6; font-size: 13px; margin-bottom: 8px; }
-      .codex-plus-sponsor-qr { display: block; width: 100%; max-width: 340px; border-radius: 8px; margin: 0 auto; background: white; }
     `;
     document.documentElement.appendChild(style);
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false };
+    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
-    pluginAutoExpand: "codexAppPluginAutoExpand",
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
-    projectMove: "codexAppProjectMove",
     threadIdBadge: "codexAppThreadIdBadge",
     conversationView: "codexAppConversationView",
     threadScrollRestore: "codexAppThreadScrollRestore",
@@ -1176,14 +1233,19 @@
     petRealMouseLook: "codexAppPetRealMouseLook",
     stepwise: "codexAppStepwiseEnabled",
     pasteFix: "codexAppPasteFix",
+    dreamSkinEnabled: "codexAppDreamSkinEnabled",
+    dreamSkinPaused: "codexAppDreamSkinPaused",
+    dreamSkinThemeConfig: "codexAppDreamSkinThemeConfig",
+    dreamSkinImagePath: "codexAppDreamSkinImagePath",
   };
   const codexPlusBackendMappedSettings = new Set(Object.keys(codexPlusBackendSettingMap));
 
   function backendCodexPlusSettings() {
     const settings = {};
     Object.entries(codexPlusBackendSettingMap).forEach(([localKey, backendKey]) => {
-      if (typeof codexPlusBackendSettings[backendKey] === "boolean") {
-        settings[localKey] = codexPlusBackendSettings[backendKey];
+      const value = codexPlusBackendSettings[backendKey];
+      if (typeof value === "boolean" || typeof value === "string" || (value && typeof value === "object" && !Array.isArray(value))) {
+        settings[localKey] = value;
       }
     });
     return settings;
@@ -1194,12 +1256,10 @@
     if (codexPlusBackendSettings.enhancementsEnabled === false) {
       return {
         pluginMarketplaceUnlock: false,
-        pluginAutoExpand: false,
         modelWhitelistUnlock: false,
         sessionDelete: false,
         markdownExport: false,
         pasteFix: false,
-        projectMove: false,
         threadIdBadge: false,
         conversationView: false,
         conversationViewMaxWidth: conversationViewDefaultWidth,
@@ -1210,24 +1270,767 @@
         serviceTierControls: false,
         petRealMouseLook: false,
         stepwise: false,
+        dreamSkinEnabled: false,
+        dreamSkinPaused: false,
+        dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {},
+        dreamSkinImagePath: "",
       };
     }
     try {
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
       }
       return settings;
     } catch {
       const settings = { ...defaultCodexPlusSettings(), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
       }
       return settings;
     }
   }
+
+  // Dream skin runtime is adapted from Fei-Away/Codex-Dream-Skin's renderer injection.
+  function dreamSkinStylePreset(id, stylePreset) {
+    const preset = String(stylePreset || "").trim();
+    if (preset && preset !== "dream-original") return preset;
+    return ({
+      "caishen-lite": "caishen-lite",
+      "caishen-max": "caishen-max",
+      "caishen-readable": "caishen-readable",
+      "export-night": "export-night",
+      "global-founder-bright": "global-founder-bright",
+      "mythic-guardian-noir": "mythic-guardian-noir",
+      "codex-snow-skin": "codex-snow",
+      "glass-vision": "glass-vision",
+      "preset-midnight-aurora": "midnight-aurora",
+      "preset-amber-dusk": "amber-dusk",
+      "preset-forest-mist": "forest-mist",
+      "preset-cyber-neon": "cyber-neon",
+      "preset-sakura-dawn": "sakura-dawn",
+    })[String(id || "").trim()] || "dream-original";
+  }
+
+  function dreamSkinThemeConfig(theme) {
+    const fallback = window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {};
+    const value = theme && typeof theme === "object" ? theme : fallback;
+    const colors = value.colors && typeof value.colors === "object" ? value.colors : fallback.colors || {};
+    return {
+      schemaVersion: value.schemaVersion === 1 ? 1 : 1,
+      id: String(value.id || fallback.id || "custom"),
+      name: String(value.name || fallback.name || "Dream Skin"),
+      stylePreset: dreamSkinStylePreset(
+        value.id || fallback.id,
+        value.stylePreset || fallback.stylePreset,
+      ),
+      brandSubtitle: String(value.brandSubtitle || fallback.brandSubtitle || "CODEX DREAM SKIN"),
+      statusText: String(value.statusText || fallback.statusText || "DREAM SKIN ONLINE"),
+      quote: String(value.quote || fallback.quote || "MAKE SOMETHING WONDERFUL"),
+      tagline: String(value.tagline || fallback.tagline || "把喜欢的画面变成可交互的 Codex 工作台。"),
+      projectPrefix: String(value.projectPrefix || fallback.projectPrefix || "选择项目 · "),
+      projectLabel: String(value.projectLabel || fallback.projectLabel || "◉  选择项目"),
+      colors: { ...(fallback.colors || {}), ...colors },
+    };
+  }
+
+  function dreamSkinCssString(value) {
+    return JSON.stringify(String(value ?? ""));
+  }
+
+  function dreamSkinParseRgb(value) {
+    if (!value || value === "transparent") return null;
+    const text = String(value).trim();
+    const hex = text.match(/^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i)?.[1];
+    if (hex) {
+      const normalized = hex.length === 3
+        ? hex.split("").map((part) => `${part}${part}`).join("")
+        : hex.slice(0, 6);
+      return {
+        r: Number.parseInt(normalized.slice(0, 2), 16),
+        g: Number.parseInt(normalized.slice(2, 4), 16),
+        b: Number.parseInt(normalized.slice(4, 6), 16),
+      };
+    }
+    const match = text.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+    if (!match) return null;
+    return { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) };
+  }
+
+  function dreamSkinLuminance({ r, g, b }) {
+    const linear = [r, g, b].map((color) => {
+      const value = color / 255;
+      return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  }
+
+  const codexPlusDreamSkinMainSurfaceMarker = "data-codex-plus-dream-skin-main-surface";
+
+  function ensureDreamSkinMainSurface() {
+    const existing = document.querySelector("main.main-surface");
+    if (existing) return existing;
+
+    const modularSurface = document.querySelector('main[class*="_MainContentSurface_"]');
+    const mainCandidates = modularSurface ? [] : [...document.querySelectorAll("main")];
+    const shellMain = modularSurface || (mainCandidates.length === 1 ? mainCandidates[0] : null);
+    if (!shellMain) return null;
+
+    shellMain.classList.add("main-surface");
+    shellMain.setAttribute(codexPlusDreamSkinMainSurfaceMarker, "true");
+    return shellMain;
+  }
+
+  function clearDreamSkinMainSurfaceCompatibility() {
+    document.querySelectorAll(`main[${codexPlusDreamSkinMainSurfaceMarker}="true"]`).forEach((node) => {
+      node.classList.remove("main-surface");
+      node.removeAttribute(codexPlusDreamSkinMainSurfaceMarker);
+    });
+  }
+
+  function detectDreamSkinShellMode() {
+    const root = document.documentElement;
+    const body = document.body;
+    const classText = `${root?.className || ""} ${body?.className || ""}`.toLowerCase();
+
+    if (/\b(dark|theme-dark|appearance-dark)\b/.test(classText)) return "dark";
+    if (/\b(light|theme-light|appearance-light)\b/.test(classText)) return "light";
+
+    const dataTheme = (
+      root?.getAttribute("data-theme") ||
+      root?.getAttribute("data-appearance") ||
+      root?.getAttribute("data-color-mode") ||
+      body?.getAttribute("data-theme") ||
+      body?.getAttribute("data-appearance") ||
+      ""
+    ).toLowerCase();
+    if (dataTheme.includes("dark")) return "dark";
+    if (dataTheme.includes("light")) return "light";
+
+    const checked = document.querySelector('input[name="appearance-theme"]:checked');
+    if (checked) {
+      const label = (checked.getAttribute("aria-label") || checked.value || "").toLowerCase();
+      if (label.includes("暗") || label.includes("dark")) return "dark";
+      if (label.includes("浅") || label.includes("light")) return "light";
+      if (label.includes("系统") || label.includes("system")) {
+        return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+      }
+    }
+
+    try {
+      const colorScheme = getComputedStyle(root).colorScheme || "";
+      if (colorScheme.includes("dark") && !colorScheme.includes("light")) return "dark";
+      if (colorScheme.includes("light") && !colorScheme.includes("dark")) return "light";
+    } catch {
+    }
+
+    const samples = [
+      body,
+      ensureDreamSkinMainSurface(),
+      document.querySelector("aside.app-shell-left-panel"),
+    ].filter(Boolean);
+    let lightVotes = 0;
+    let darkVotes = 0;
+    for (const element of samples) {
+      try {
+        const rgb = dreamSkinParseRgb(getComputedStyle(element).backgroundColor);
+        if (!rgb) continue;
+        const luminance = dreamSkinLuminance(rgb);
+        if (luminance >= 0.55) lightVotes += 1;
+        else if (luminance <= 0.25) darkVotes += 1;
+      } catch {
+      }
+    }
+    if (lightVotes > darkVotes) return "light";
+    if (darkVotes > lightVotes) return "dark";
+
+    try {
+      if (window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+    } catch {
+    }
+    return "light";
+  }
+
+  function dreamSkinThemeShellMode(theme) {
+    const background = dreamSkinParseRgb(theme?.colors?.background);
+    if (background) return dreamSkinLuminance(background) < 0.36 ? "dark" : "light";
+    return detectDreamSkinShellMode();
+  }
+
+  function dreamSkinArtBlobUrl(artDataUrl) {
+    if (!artDataUrl || !artDataUrl.startsWith("data:")) return "";
+    const comma = artDataUrl.indexOf(",");
+    if (comma < 0) return "";
+    const mime = /^data:([^;,]+)/.exec(artDataUrl)?.[1] || "image/png";
+    const binary = atob(artDataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return URL.createObjectURL(new Blob([bytes], { type: mime }));
+  }
+
+  function independentThemeDescriptor(stylePreset) {
+    const custom = (name, chromeMarkup) => ({
+      rootClass: `codex-theme-${name}`,
+      homeClass: `theme-${name}-home`,
+      shellClass: `theme-${name}-home-shell`,
+      chromeId: "codex-theme-chrome",
+      chromeClass: `theme-chrome-${name}`,
+      chromeMarkup,
+    });
+    const descriptors = {
+      "caishen-lite": custom("caishen-lite", `
+        <div class="csl-caption" data-theme-field="name"></div><div class="csl-seal">吉</div>`),
+      "caishen-max": custom("caishen-max", `
+        <div class="csm-banner" data-theme-field="name"></div><div class="csm-coins">◇ ◇ ◇</div>`),
+      "caishen-readable": custom("caishen-readable", ""),
+      "export-night": custom("export-night", `
+        <div class="exn-titlebar"><span data-theme-field="name"></span><span class="exn-cursor">█</span></div>`),
+      "global-founder-bright": custom("global-founder-bright", `
+        <div class="gfb-masthead"><span data-theme-field="name"></span><small data-theme-field="status"></small></div>`),
+      "mythic-guardian-noir": custom("mythic-guardian-noir", `
+        <div class="mgn-sigil"></div><div class="mgn-line"></div>`),
+      "midnight-aurora": custom("midnight-aurora", `
+        <div class="mda-arc"></div><div class="mda-star">✦</div>`),
+      "amber-dusk": custom("amber-dusk", `
+        <div class="abd-sun"></div><div class="abd-horizon"></div>`),
+      "forest-mist": custom("forest-mist", `
+        <div class="fm-branch"></div><div class="fm-leaf">⌁</div>`),
+      "cyber-neon": custom("cyber-neon", `
+        <div class="cn-index" data-theme-field="status"></div><div class="cn-scan"></div>`),
+      "sakura-dawn": custom("sakura-dawn", `
+        <div class="sd-petal">✿</div><div class="sd-rule"></div>`),
+      "codex-snow": {
+        rootClass: "codex-dream-skin",
+        homeClass: "dream-home",
+        shellClass: "dream-home-shell",
+        chromeId: "codex-dream-skin-chrome",
+        chromeClass: "",
+        chromeMarkup: `
+          <div class="dream-brand"><span class="dream-note">SKI</span><span><b>Snowline Codex</b><small>ice-blue training mode</small></span></div>
+          <div class="dream-signature">Freeski focus</div>
+          <div class="dream-sparkles"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="dream-ribbon"><span>slopestyle</span><strong>double cork energy</strong><span>halfpipe</span></div>
+          <div class="dream-polaroid"></div>`,
+      },
+      "glass-vision": {
+        rootClass: "codex-glass-vision-skin",
+        homeClass: "glass-vision-home",
+        shellClass: "glass-vision-home-shell",
+        taskShellClass: "glass-vision-task-shell",
+        chromeId: "codex-glass-vision-skin-chrome",
+        chromeClass: "",
+        chromeMarkup: `
+          <div class="glass-vision-brand"><span class="glass-vision-orbit-mark"><i></i></span><span><b>GLASS VISION</b><small>SILVER BLUE · CELESTIAL</small></span></div>
+          <div class="glass-vision-status"><i></i><span>CRYSTAL FIELD</span></div>
+          <div class="glass-vision-atmosphere"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="glass-vision-orbit-lines"><i></i><i></i><i></i></div><div class="glass-vision-prism"></div>`,
+      },
+    };
+    if (descriptors[stylePreset]) return descriptors[stylePreset];
+    if (codexPlusDreamSkinPlatform === "windows") {
+      return {
+        rootClass: "codex-dream-skin",
+        homeClass: "dream-home",
+        shellClass: "dream-home-shell",
+        taskClass: "dream-task",
+        chromeId: "codex-dream-skin-chrome",
+        chromeClass: "",
+        chromeMarkup: "",
+      };
+    }
+    return {
+      rootClass: "codex-dream-skin",
+      homeClass: "dream-skin-home",
+      shellClass: "dream-skin-home-shell",
+      chromeId: "codex-dream-skin-chrome",
+      chromeClass: "",
+      chromeMarkup: `
+        <div class="dream-skin-brand"><span class="dream-skin-portal-mark">◉</span><span><b data-theme-field="name"></b><small data-theme-field="subtitle"></small></span></div>
+        <div class="dream-skin-status"><i></i><span data-theme-field="status"></span></div>
+        <div class="dream-skin-quote" data-theme-field="quote"></div>
+        <div class="dream-skin-particles"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="dream-skin-orbit"></div>`,
+    };
+  }
+
+  const dreamSkinCompanionId = "codex-dream-skin-companion";
+  const dreamSkinCompanionDataUrlPrefixes = [
+    "data:image/png;base64,",
+    "data:image/jpeg;base64,",
+    "data:image/webp;base64,",
+    "data:image/gif;base64,",
+  ];
+  const dreamSkinCompanionBase64Pattern = /^[a-z0-9+/=\s]+$/i;
+
+  function removeDreamSkinCompanion() {
+    document.getElementById(dreamSkinCompanionId)?.remove();
+  }
+
+  function dreamSkinCompanionConfig(theme) {
+    const companion = theme && theme.companion;
+    if (!companion || typeof companion !== "object" || companion.enabled === false) return null;
+    const dataUrl = typeof companion.dataUrl === "string" ? companion.dataUrl.trim() : "";
+    const prefix = dreamSkinCompanionDataUrlPrefixes.find((candidate) =>
+      dataUrl.toLowerCase().startsWith(candidate));
+    if (
+      !dataUrl
+      || dataUrl.length > 240_000
+      || !prefix
+      || !dreamSkinCompanionBase64Pattern.test(dataUrl.slice(prefix.length))
+    ) {
+      return null;
+    }
+    const width = Math.max(48, Math.min(Number(companion.width) || 96, 160));
+    const side = ["left", "right"].includes(companion.side) ? companion.side : "auto";
+    const offsetX = Math.max(-48, Math.min(Number(companion.offsetX) || 0, 48));
+    const offsetY = Math.max(-160, Math.min(Number(companion.offsetY) || 0, 160));
+    return { dataUrl, width, side, offsetX, offsetY };
+  }
+
+  function visibleDreamSkinComposer() {
+    return [...document.querySelectorAll(".composer-footer, .composer-surface-chrome")]
+      .map((node) => ({ node, rect: node.getBoundingClientRect?.() }))
+      .filter(({ rect }) => rect && rect.width > 200 && rect.height > 0)
+      .sort((left, right) => right.rect.bottom - left.rect.bottom)[0] || null;
+  }
+
+  function ensureDreamSkinCompanion(theme) {
+    const config = dreamSkinCompanionConfig(theme);
+    const composer = visibleDreamSkinComposer();
+    if (!config || !composer) {
+      removeDreamSkinCompanion();
+      return;
+    }
+
+    let companion = document.getElementById(dreamSkinCompanionId);
+    if (!companion) {
+      companion = document.createElement("img");
+      companion.id = dreamSkinCompanionId;
+      companion.alt = "";
+      companion.setAttribute("aria-hidden", "true");
+      Object.assign(companion.style, {
+        position: "fixed",
+        zIndex: "39",
+        height: "auto",
+        maxHeight: "160px",
+        objectFit: "contain",
+        pointerEvents: "none",
+        userSelect: "none",
+        filter: "drop-shadow(0 8px 14px rgba(0, 0, 0, .18))",
+        transition: "left 160ms ease, top 160ms ease, opacity 160ms ease",
+      });
+      document.body.appendChild(companion);
+    }
+    if (companion.src !== config.dataUrl) {
+      companion.onload = () => ensureDreamSkinCompanion(theme);
+      companion.src = config.dataUrl;
+    }
+
+    const renderedHeight = companion.naturalWidth > 0 && companion.naturalHeight > 0
+      ? Math.min(160, config.width * companion.naturalHeight / companion.naturalWidth)
+      : config.width;
+
+    const gap = 12;
+    const edge = 8;
+    const right = composer.rect.right + gap + config.offsetX;
+    const left = composer.rect.left - config.width - gap + config.offsetX;
+    const fitsRight = right + config.width <= window.innerWidth - edge;
+    const fitsLeft = left >= edge;
+    const useRight = config.side === "right"
+      ? fitsRight
+      : config.side === "left"
+        ? !fitsLeft && fitsRight
+        : fitsRight || !fitsLeft;
+
+    if (!fitsRight && !fitsLeft) {
+      companion.style.opacity = "0";
+      return;
+    }
+
+    const top = Math.max(
+      edge,
+      Math.min(
+        composer.rect.bottom - renderedHeight + config.offsetY,
+        window.innerHeight - renderedHeight - edge,
+      ),
+    );
+    companion.style.width = `${config.width}px`;
+    companion.style.left = `${Math.round(useRight ? right : left)}px`;
+    companion.style.top = `${Math.round(top)}px`;
+    companion.style.opacity = "1";
+  }
+
+  function clearDreamSkinPresentation() {
+    const root = document.documentElement;
+    for (const className of [...(root?.classList || [])]) {
+      if (
+        className === "codex-dream-skin"
+        || className === "codex-glass-vision-skin"
+        || className.startsWith("codex-theme-")
+      ) {
+        root?.classList.remove(className);
+      }
+    }
+    root?.removeAttribute("data-dream-shell");
+    root?.removeAttribute("data-codex-plus-dream-skin");
+    root?.style.removeProperty("--dream-art");
+    root?.style.removeProperty("--dream-skin-art");
+    [
+      "--ds-bg",
+      "--ds-panel",
+      "--ds-panel-2",
+      "--ds-green",
+      "--ds-lime",
+      "--ds-cyan",
+      "--ds-purple",
+      "--ds-text",
+      "--ds-muted",
+      "--ds-line",
+      "--dream-ink",
+      "--dream-purple",
+      "--dream-violet",
+      "--dream-pink",
+      "--dream-blush",
+      "--dream-pearl",
+      "--dream-line",
+      "--dream-skin-name",
+      "--dream-skin-tagline",
+      "--dream-skin-project-prefix",
+      "--dream-skin-project-label",
+    ].forEach((name) => root?.style.removeProperty(name));
+    document.querySelectorAll(".dream-home").forEach((node) => node.classList.remove("dream-home"));
+    document.querySelectorAll('[role="main"][data-dream-home-layout]').forEach((node) => {
+      node.removeAttribute("data-dream-home-layout");
+    });
+    document.querySelectorAll(".dream-home-shell").forEach((node) => node.classList.remove("dream-home-shell"));
+    document.querySelectorAll(".dream-skin-home").forEach((node) => node.classList.remove("dream-skin-home"));
+    document.querySelectorAll(".dream-skin-home-shell").forEach((node) => node.classList.remove("dream-skin-home-shell"));
+    document.querySelectorAll("[class]").forEach((node) => {
+      for (const className of [...node.classList]) {
+        if (
+          /^theme-[a-z0-9-]+-(?:home|home-shell|task|task-shell)$/.test(className)
+          || /^glass-vision-(?:home|home-shell|task|task-shell)$/.test(className)
+        ) {
+          node.classList.remove(className);
+        }
+      }
+    });
+    document.getElementById(codexPlusDreamSkinStyleId)?.remove();
+    document.getElementById("codex-plus-dream-skin-style")?.remove();
+    document.getElementById("codex-dream-skin-chrome")?.remove();
+    document.getElementById("codex-glass-vision-skin-chrome")?.remove();
+    document.getElementById("codex-theme-chrome")?.remove();
+    removeDreamSkinCompanion();
+    clearDreamSkinMainSurfaceCompatibility();
+    const state = window.__CODEX_DREAM_SKIN_STATE__;
+    const descriptor = state?.descriptor;
+    if (descriptor) {
+      root?.classList.remove(descriptor.rootClass);
+      for (const className of [descriptor.homeClass, descriptor.shellClass, descriptor.taskClass, descriptor.taskShellClass]) {
+        if (!className) continue;
+        document.querySelectorAll(`.${className}`).forEach((node) => node.classList.remove(className));
+      }
+      document.getElementById(descriptor.chromeId)?.remove();
+    }
+    root?.classList.remove("dream-theme-dark", "dream-theme-light");
+    root?.removeAttribute("data-codex-theme");
+    root?.removeAttribute("data-codex-theme-root");
+    [
+      "--theme-bg", "--theme-panel", "--theme-panel-alt", "--theme-accent",
+      "--theme-accent-alt", "--theme-secondary", "--theme-highlight", "--theme-text",
+      "--theme-muted", "--theme-line", "--theme-art", "--glass-vision-art",
+      "--dream-accent", "--dream-accent-ink",
+    ].forEach((name) => root?.style.removeProperty(name));
+  }
+
+  function cleanupDreamSkin() {
+    window.__CODEX_DREAM_SKIN_DISABLED__ = true;
+    const state = window.__CODEX_DREAM_SKIN_STATE__;
+    if (typeof state?.cleanup === "function" && state.cleanup !== cleanupDreamSkin) {
+      try {
+        state.cleanup();
+      } catch {
+      }
+    }
+    const remainingState = window.__CODEX_DREAM_SKIN_STATE__;
+    remainingState?.observer?.disconnect();
+    if (remainingState?.timer) clearInterval(remainingState.timer);
+    if (remainingState?.scheduler?.timeout) clearTimeout(remainingState.scheduler.timeout);
+    if (remainingState?.resizeHandler) window.removeEventListener("resize", remainingState.resizeHandler);
+    if (remainingState?.mediaHandler && remainingState?.mediaQuery) {
+      try {
+        remainingState.mediaQuery.removeEventListener("change", remainingState.mediaHandler);
+      } catch {
+      }
+    }
+    if (remainingState?.artUrl) URL.revokeObjectURL(remainingState.artUrl);
+    delete window.__CODEX_DREAM_SKIN_STATE__;
+    window.__CODEX_GLASS_VISION_SKIN_DISABLED__ = true;
+    const glassState = window.__CODEX_GLASS_VISION_SKIN_STATE__;
+    try {
+      glassState?.cleanup?.();
+    } catch {
+    }
+    delete window.__CODEX_GLASS_VISION_SKIN_STATE__;
+    clearDreamSkinPresentation();
+  }
+
+  window.__CODEX_PLUS_CLEAR_DREAM_SKIN__ = cleanupDreamSkin;
+
+  function dreamSkinContentSignature(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${text.length}-${(hash >>> 0).toString(16)}`;
+  }
+
+  function applyIndependentThemeVariables(root, shell, theme, descriptor, artSource) {
+    const colors = theme.colors || {};
+    const accent = colors.accent || (shell === "light" ? "#d85c6c" : "#76e6cc");
+    const accentAlt = colors.accentAlt || accent;
+    const secondary = colors.secondary || (shell === "light" ? "#e7a3ad" : "#65bde8");
+    const variables = {
+      "--theme-bg": colors.background || (shell === "light" ? "#f6f3f4" : "#071116"),
+      "--theme-panel": colors.panel || (shell === "light" ? "#ffffff" : "#0b1a20"),
+      "--theme-panel-alt": colors.panelAlt || (shell === "light" ? "#fff8f9" : "#10272c"),
+      "--theme-accent": accent,
+      "--theme-accent-alt": accentAlt,
+      "--theme-secondary": secondary,
+      "--theme-highlight": colors.highlight || accentAlt,
+      "--theme-text": colors.text || (shell === "light" ? "#201b1c" : "#edf7f3"),
+      "--theme-muted": colors.muted || (shell === "light" ? "#6c6062" : "#9db7ae"),
+      "--theme-line": colors.line || (shell === "light" ? "rgba(90, 64, 68, .18)" : "rgba(150, 220, 200, .24)"),
+      "--theme-art": artSource,
+      "--dream-art": artSource,
+      "--dream-skin-art": artSource,
+      "--glass-vision-art": artSource,
+      "--dream-accent": accent,
+      "--dream-accent-ink": colors.panel || "#ffffff",
+    };
+    for (const [name, value] of Object.entries(variables)) {
+      if (typeof value === "string" && value) root.style.setProperty(name, value);
+    }
+    root.style.setProperty("--dream-skin-name", dreamSkinCssString(theme.name || "Codex Dream Skin"));
+    root.style.setProperty("--dream-skin-tagline", dreamSkinCssString(theme.tagline || "把喜欢的画面变成可交互的 Codex 工作台。"));
+    root.style.setProperty("--dream-skin-project-prefix", dreamSkinCssString(theme.projectPrefix || "选择项目 · "));
+    root.style.setProperty("--dream-skin-project-label", dreamSkinCssString(theme.projectLabel || "◉  选择项目"));
+    root.classList.toggle("dream-theme-dark", shell === "dark");
+    root.classList.toggle("dream-theme-light", shell === "light");
+    const preset = theme.stylePreset || "dream-original";
+    if (root.getAttribute("data-codex-theme") !== preset) root.setAttribute("data-codex-theme", preset);
+    if (root.getAttribute("data-codex-theme-root") !== descriptor.rootClass) {
+      root.setAttribute("data-codex-theme-root", descriptor.rootClass);
+    }
+  }
+
+  function installDreamSkin(settings) {
+    const theme = dreamSkinThemeConfig(settings.dreamSkinThemeConfig);
+    const styles = window.__CODEX_PLUS_DREAM_SKIN_STYLES__ || {};
+    const descriptor = independentThemeDescriptor(theme.stylePreset);
+    const cssText = String(styles[theme.stylePreset] || styles["dream-original"] || "");
+    const artDataUrl = String(window.__CODEX_PLUS_DREAM_SKIN_ART__ || "");
+    const themeSignature = dreamSkinContentSignature(JSON.stringify(theme));
+    const artSignature = String(window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ || dreamSkinContentSignature(artDataUrl));
+    const version = `codex-plus:independent:${codexPlusDreamSkinPlatform}:r${codexPlusDreamSkinRevision}:${theme.stylePreset}:${themeSignature}:${artSignature}:${cssText.length}`;
+    const existingState = window.__CODEX_DREAM_SKIN_STATE__;
+    if (existingState?.version === version && typeof existingState.ensure === "function") {
+      window.__CODEX_DREAM_SKIN_DISABLED__ = false;
+      existingState.ensure();
+      return;
+    }
+
+    cleanupDreamSkin();
+    window.__CODEX_DREAM_SKIN_DISABLED__ = false;
+    const artUrl = dreamSkinArtBlobUrl(artDataUrl);
+    const artSource = artUrl ? `url("${artUrl}")` : "none";
+
+    const ensureStyle = (root) => {
+      let style = document.getElementById(codexPlusDreamSkinStyleId);
+      if (!style) {
+        style = document.createElement("style");
+        style.id = codexPlusDreamSkinStyleId;
+        (document.head || root).appendChild(style);
+      }
+      if (style.dataset.independentThemeVersion !== version) {
+        style.textContent = cssText;
+        style.dataset.independentThemeVersion = version;
+      }
+    };
+
+    const ensure = () => {
+      if (window.__CODEX_DREAM_SKIN_DISABLED__) return;
+      const root = document.documentElement;
+      if (!root || !document.body) return;
+      const shellMain = ensureDreamSkinMainSurface();
+      if (!shellMain) {
+        clearDreamSkinPresentation();
+        return;
+      }
+
+      root.classList.add(descriptor.rootClass);
+      root.setAttribute("data-codex-plus-dream-skin", "true");
+      const shell = dreamSkinThemeShellMode(theme);
+      root.setAttribute("data-dream-shell", shell);
+      applyIndependentThemeVariables(root, shell, theme, descriptor, artSource);
+      ensureStyle(root);
+      ensureDreamSkinCompanion(theme);
+
+      const homeIndicator = document.querySelector('[data-testid="home-icon"]');
+      const homeCandidate = homeIndicator?.closest('[role="main"]')
+        || [...document.querySelectorAll('[role="main"]')].find((candidate) =>
+          candidate.querySelector('[data-feature="game-source"]')
+          && candidate.querySelector('.group\\/home-suggestions'))
+        || null;
+      const homeHasClassicChrome = !!(
+        homeCandidate
+        && homeCandidate.querySelector('[data-feature="game-source"]')
+        && (
+          homeCandidate.querySelector('.group\\/home-suggestions')
+          || homeCandidate.querySelector('[class*="home-suggestions"]')
+          || homeCandidate.querySelector('[class*="_homeUtilityBar_"]')
+        )
+      );
+      const home = homeHasClassicChrome ? homeCandidate : null;
+      for (const candidate of document.querySelectorAll(`[role="main"].${descriptor.homeClass}`)) {
+        if (candidate !== home && candidate !== homeCandidate) candidate.classList.remove(descriptor.homeClass);
+      }
+      if (home) home.classList.add(descriptor.homeClass);
+      else if (homeCandidate && descriptor.homeClass) homeCandidate.classList.add(descriptor.homeClass);
+      if (descriptor.taskClass) {
+        for (const candidate of document.querySelectorAll('[role="main"]')) {
+          candidate.classList.toggle(descriptor.taskClass, candidate !== home && candidate !== homeCandidate);
+        }
+      }
+      for (const candidate of document.querySelectorAll('[role="main"]')) {
+        if (candidate === home) {
+          const hero = candidate.querySelector(':scope > div > div > div');
+          const structured = !!(hero && hero.querySelector('[data-feature="game-source"], [data-testid="home-icon"]'));
+          candidate.setAttribute('data-dream-home-layout', structured ? 'structured' : 'soft');
+        } else {
+          candidate.setAttribute('data-dream-home-layout', 'soft');
+        }
+      }
+      shellMain.classList.toggle(descriptor.shellClass, Boolean(homeCandidate));
+      if (descriptor.taskShellClass) shellMain.classList.toggle(descriptor.taskShellClass, !home);
+
+      let chrome = document.getElementById(descriptor.chromeId);
+      if (!chrome || chrome.parentElement !== document.body) {
+        chrome?.remove();
+        chrome = document.createElement("div");
+        chrome.id = descriptor.chromeId;
+        chrome.setAttribute("aria-hidden", "true");
+        chrome.innerHTML = descriptor.chromeMarkup;
+        document.body.appendChild(chrome);
+      }
+      if (chrome.className !== descriptor.chromeClass) chrome.className = descriptor.chromeClass;
+      const fields = {
+        name: theme.name || "Codex Dream Skin",
+        subtitle: theme.brandSubtitle || "CODEX DREAM SKIN",
+        status: theme.statusText || "THEME ONLINE",
+        quote: theme.quote || "MAKE SOMETHING WONDERFUL",
+      };
+      for (const [field, value] of Object.entries(fields)) {
+        const target = chrome.querySelector(`[data-theme-field="${field}"]`);
+        if (target && target.textContent !== value) target.textContent = value;
+      }
+      const shellBox = shellMain.getBoundingClientRect();
+      chrome.style.left = `${Math.round(shellBox.left)}px`;
+      chrome.style.top = `${Math.round(shellBox.top)}px`;
+      chrome.style.width = `${Math.round(shellBox.width)}px`;
+      chrome.style.height = `${Math.round(shellBox.height)}px`;
+      chrome.classList.toggle(descriptor.shellClass, Boolean(home));
+      if (descriptor.taskShellClass) chrome.classList.toggle(descriptor.taskShellClass, !home);
+      chrome.dataset.dreamShell = shell;
+    };
+
+    const scheduler = { timeout: null };
+    const scheduleEnsure = () => {
+      if (scheduler.timeout) clearTimeout(scheduler.timeout);
+      scheduler.timeout = setTimeout(() => {
+        scheduler.timeout = null;
+        ensure();
+      }, 180);
+    };
+    const observer = new MutationObserver(scheduleEnsure);
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "data-theme", "data-appearance", "data-color-mode"],
+    });
+    const timer = setInterval(ensure, 4000);
+    const resizeHandler = scheduleEnsure;
+    window.addEventListener("resize", resizeHandler, { passive: true });
+
+    let mediaQuery = null;
+    let mediaHandler = null;
+    try {
+      mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+      mediaHandler = scheduleEnsure;
+      mediaQuery.addEventListener("change", mediaHandler);
+    } catch {
+    }
+
+    window.__CODEX_DREAM_SKIN_STATE__ = {
+      ensure,
+      cleanup: cleanupDreamSkin,
+      observer,
+      timer,
+      scheduler,
+      resizeHandler,
+      mediaQuery,
+      mediaHandler,
+      artUrl,
+      version,
+      descriptor,
+      themeId: theme.id || "custom",
+      detectShellMode: detectDreamSkinShellMode,
+    };
+    ensure();
+  }
+
+  function refreshDreamSkin() {
+    const settings = codexPlusSettings();
+    if (settings.dreamSkinEnabled && !settings.dreamSkinPaused) ensureDreamSkinMainSurface();
+    if (window.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__) {
+      if (codexPlusBackendSettingsLoaded && (!settings.dreamSkinEnabled || settings.dreamSkinPaused)) {
+        cleanupDreamSkin();
+      } else {
+        const state = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;
+        state?.ensure?.();
+        ensureDreamSkinCompanion(
+          window.__CODEX_PLUS_DREAM_SKIN_THEME__ || settings.dreamSkinThemeConfig,
+        );
+      }
+      return;
+    }
+    if (!settings.dreamSkinEnabled || settings.dreamSkinPaused) {
+      cleanupDreamSkin();
+      return;
+    }
+    installDreamSkin(settings);
+  }
+
+  function applyDreamSkinLiveUpdate(payload) {
+    if (!payload || String(payload.revision || "") !== codexPlusDreamSkinRevision) return false;
+    if (typeof payload.artDataUrl === "string" && payload.artDataUrl) {
+      window.__CODEX_PLUS_DREAM_SKIN_ART__ = payload.artDataUrl;
+    }
+    window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = String(payload.artSignature || "");
+    window.__CODEX_PLUS_DREAM_SKIN_THEME__ = payload.theme && typeof payload.theme === "object" ? payload.theme : {};
+    codexPlusBackendSettings.codexAppDreamSkinEnabled = true;
+    codexPlusBackendSettings.codexAppDreamSkinPaused = false;
+    codexPlusBackendSettings.codexAppDreamSkinThemeConfig = window.__CODEX_PLUS_DREAM_SKIN_THEME__;
+    refreshDreamSkin();
+    return true;
+  }
+
+  window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = codexPlusDreamSkinRevision;
+  window.__CODEX_PLUS_APPLY_DREAM_SKIN__ = applyDreamSkinLiveUpdate;
 
   function setCodexPlusSetting(key, value) {
     const backendKey = codexPlusBackendSettingMap[key];
@@ -1268,12 +2071,6 @@
         removeCodexServiceTierBadges();
         refreshCodexServiceTierControls();
       }
-    }
-    if (key === "pluginAutoExpand" && !value) {
-      clearTimeout(window.__codexPluginAutoExpandTimer);
-      window.__codexPluginAutoExpandTimer = null;
-      window.__codexPluginAutoExpandRunning = false;
-      window.__codexPluginAutoExpandLastSignature = "";
     }
     if (key === "stepwise") syncStepwisePanel(value);
     renderCodexPlusMenu();
@@ -1337,6 +2134,7 @@
   let codexPlusBackendSettingsSeq = 0;
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
+  const codexPluginBroadCatalogKindsFromVersion = "26.803.0";
 
   function parseCodexVersionParts(version) {
     const raw = String(version || "").trim();
@@ -1389,10 +2187,18 @@
     return comparison >= 0 ? "bridge" : "client";
   }
 
+  function codexPluginUsesBroadCatalogKinds() {
+    const version = String(codexPlusBackendSettings.codexAppVersion || "").trim();
+    const comparison = compareCodexVersions(version, codexPluginBroadCatalogKindsFromVersion);
+    return comparison != null && comparison >= 0;
+  }
+
   let codexPlusBackendSettingsLoaded = false;
   let codexServiceTierState = {
     status: "loading",
     serviceTier: null,
+    configServiceTier: null,
+    serviceTierSource: null,
     message: "正在读取…",
     fastTierValue: "priority",
     controlMode: "inherit",
@@ -1410,26 +2216,43 @@
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
+  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
-  function codexAppAssetUrl(namePart) {
-    const urls = [
+  function uniqueCodexAppAssetUrls(urls) {
+    return Array.from(new Set((urls || []).filter((url) => typeof url === "string" && url.includes("/assets/") && url.split("?")[0].endsWith(".js"))));
+  }
+
+  function codexAppAssetCandidateUrls() {
+    return uniqueCodexAppAssetUrls([
       ...Array.from(document.scripts || []).map((script) => script.src),
       ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
       ...performance.getEntriesByType("resource").map((entry) => entry.name),
-    ].filter(Boolean);
-    return urls.find((url) => url.includes("/assets/") && url.includes(namePart) && url.split("?")[0].endsWith(".js")) || "";
+    ]);
+  }
+
+  function codexAppAssetUrl(namePart) {
+    if (!namePart) return "";
+    return codexAppAssetCandidateUrls().find((url) => url.includes(namePart)) || "";
   }
 
   async function codexAppAssetUrlFromScriptText(namePart) {
-    const scripts = Array.from(document.scripts || []).map((script) => script.src).filter(Boolean);
+    if (!namePart) return "";
+    const scripts = codexAppAssetCandidateUrls();
+    const escaped = String(namePart).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      new RegExp(`["'](\\./(?:assets/)?${escaped}[^"']+\\.js)["']`),
+      new RegExp(`["'](\\.?/assets/${escaped}[^"']+\\.js)["']`),
+      new RegExp(`["']([^"']*/assets/${escaped}[^"']+\\.js)["']`),
+    ];
     for (const src of scripts) {
-      if (!src.includes("/assets/") || !src.split("?")[0].endsWith(".js")) continue;
       try {
         const text = await fetch(src).then((response) => response.ok ? response.text() : "");
-        const escaped = namePart.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const match = text.match(new RegExp(`["'](\\./assets/${escaped}[^"']+\\.js)["']`));
-        if (!match) continue;
-        return new URL(match[1], src).href;
+        if (!text) continue;
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+          if (!match) continue;
+          return new URL(match[1], src).href;
+        }
       } catch {
       }
     }
@@ -1469,12 +2292,152 @@
     return await codexServiceTierModulePromises.get(namePart);
   }
 
-  async function codexSettingStorageModule() {
-    const module = await loadCodexAppModule("setting-storage-");
-    if (typeof module.n !== "function" || typeof module.s !== "function") {
-      throw new Error("Codex setting-storage 接口不可用");
+  async function loadOptionalCodexAppModule(namePart) {
+    try {
+      return await loadCodexAppModule(namePart);
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (message.includes(`未找到 Codex App asset: ${namePart}`)) return null;
+      throw error;
     }
-    return module;
+  }
+
+  function appServerFallbackAssetUrls() {
+    const urls = codexAppAssetCandidateUrls();
+    const preferred = urls.filter((url) => {
+      const name = (url.split("/").pop() || "").toLowerCase();
+      return /use-host-config|app-server-manager-signals|app-initial|app-main|page-|chatg|signals|server-manager|gwqc41kz|c1urrgy0|hsvsqcnf/.test(name);
+    });
+    // Prefer known request-client modules, then the larger application bundles.
+    preferred.sort((left, right) => {
+      const score = (url) => {
+        const name = (url.split("/").pop() || "").toLowerCase();
+        if (name.includes("use-host-config")) return 0;
+        if (name.includes("app-server-manager-signals")) return 1;
+        if (name.includes("gwqc41kz") || name.includes("c1urrgy0") || name.includes("hsvsqcnf")) return 2;
+        if (name.includes("app-initial") && name.includes("app-main")) return 3;
+        if (name.includes("app-main")) return 4;
+        return 5;
+      };
+      return score(left) - score(right) || right.length - left.length;
+    });
+    return preferred.slice(0, 16);
+  }
+
+  function collectAppServerRequestCandidatesFromModule(module) {
+    const candidates = [];
+    const seen = new Set();
+    const push = (value) => {
+      if (!value || typeof value !== "object" || seen.has(value)) return;
+      seen.add(value);
+      candidates.push(value);
+    };
+    for (const value of Object.values(module || {})) {
+      push(value);
+      if (!value || typeof value !== "object") continue;
+      if (typeof value.get === "function") {
+        try { push(value.get()); } catch {}
+        try { push(value.get("local")); } catch {}
+      }
+      try {
+        for (const nested of Object.values(value).slice(0, 100)) push(nested);
+      } catch {}
+    }
+    return candidates;
+  }
+
+  async function loadAppServerRequestModules() {
+    const modules = [];
+    const sources = [];
+    const seenModules = new Set();
+    const seenUrls = new Set();
+    const pushModule = (module, source) => {
+      if (!module || typeof module !== "object" || seenModules.has(module)) return;
+      seenModules.add(module);
+      modules.push(module);
+      sources.push(source);
+    };
+    for (const assetPrefix of ["use-host-config-", "app-server-manager-signals-"]) {
+      try {
+        const module = await loadOptionalCodexAppModule(assetPrefix);
+        if (module) pushModule(module, assetPrefix);
+      } catch {
+      }
+    }
+    for (const url of appServerFallbackAssetUrls()) {
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      try {
+        pushModule(await import(url), url);
+      } catch {
+      }
+    }
+    return { modules, sources };
+  }
+
+  async function loadAppServerRequestCandidates() {
+    const { modules, sources } = await loadAppServerRequestModules();
+    const candidates = [];
+    const seen = new Set();
+    for (const module of modules) {
+      for (const candidate of collectAppServerRequestCandidatesFromModule(module)) {
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+        candidates.push(candidate);
+      }
+    }
+    const usedFallback = sources.some((source) => !source.endsWith("-"));
+    return { modules, candidates, sources, discovery: usedFallback ? "fallback" : "named-assets" };
+  }
+
+  function codexSettingStorageFromModule(module, assetPrefix = "") {
+    const values = module && typeof module === "object" ? Object.values(module) : [];
+    const functionSource = (candidate) => {
+      if (typeof candidate !== "function") return "";
+      try {
+        return String(candidate);
+      } catch (_) {
+        return "";
+      }
+    };
+    const getSettingByCapability = () => values.find((candidate) => {
+      const source = functionSource(candidate);
+      return source.includes("get-setting") && source.includes("params") && source.includes("key");
+    });
+    const setSettingByCapability = () => values.find((candidate) => {
+      const source = functionSource(candidate);
+      return source.includes("set-setting") && source.includes("params") && source.includes("key");
+    });
+    let getSetting = null;
+    let setSetting = null;
+    if (assetPrefix.startsWith("setting-storage-")) {
+      getSetting = typeof module?.n === "function" ? module.n : getSettingByCapability();
+      setSetting = typeof module?.s === "function" ? module.s : setSettingByCapability();
+    } else if (assetPrefix.startsWith("app-initial-")) {
+      getSetting = typeof module?.jut === "function" ? module.jut : getSettingByCapability();
+      setSetting = typeof module?.Put === "function" ? module.Put : setSettingByCapability();
+    } else {
+      getSetting = getSettingByCapability();
+      setSetting = setSettingByCapability();
+    }
+    return typeof getSetting === "function" && typeof setSetting === "function"
+      ? { n: getSetting, s: setSetting, assetPrefix }
+      : null;
+  }
+
+  async function codexSettingStorageModule() {
+    const errors = [];
+    for (const assetPrefix of ["setting-storage-", "app-initial-"]) {
+      try {
+        const module = await loadCodexAppModule(assetPrefix);
+        const settingStorage = codexSettingStorageFromModule(module, assetPrefix);
+        if (settingStorage) return settingStorage;
+        errors.push(`${assetPrefix}: setting exports unavailable`);
+      } catch (error) {
+        errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
+      }
+    }
+    throw new Error(`Codex setting-storage 接口不可用 (${errors.join("; ")})`);
   }
 
   async function getCodexServiceTierSetting() {
@@ -1558,10 +2521,15 @@
     };
   }
 
+  function codexServiceTierInheritedValue() {
+    if (codexServiceTierState.serviceTier != null) return codexServiceTierState.serviceTier;
+    return codexServiceTierState.configServiceTier ?? null;
+  }
+
   function codexServiceTierValueForMode(mode) {
     if (mode === "fast") return codexFastServiceTierValue();
     if (mode === "standard") return null;
-    return codexServiceTierState.serviceTier || null;
+    return codexServiceTierInheritedValue();
   }
 
   function codexServiceTierDefaultModeForControlMode(controlMode, fallback = "inherit") {
@@ -1569,12 +2537,6 @@
     if (controlMode === "global-standard") return "standard";
     if (controlMode === "inherit") return "inherit";
     return normalizeCodexThreadServiceTierMode(fallback);
-  }
-
-  function codexServiceTierControlModeForDefaultMode(defaultMode) {
-    if (defaultMode === "fast") return "global-fast";
-    if (defaultMode === "standard") return "global-standard";
-    return "inherit";
   }
 
   function codexServiceTierEffectiveThreadMode(threadMode = "inherit", defaultMode = "inherit") {
@@ -1587,7 +2549,7 @@
     if (controlMode === "global-fast") return codexFastServiceTierValue();
     if (controlMode === "global-standard") return null;
     if (controlMode === "custom") return codexServiceTierValueForMode(codexServiceTierEffectiveThreadMode(threadMode, defaultMode));
-    return codexServiceTierState.serviceTier || null;
+    return codexServiceTierInheritedValue();
   }
 
   function codexServiceTierEffectiveMode(value) {
@@ -1610,15 +2572,25 @@
     return `当前：${serviceTier}`;
   }
 
+  function serviceTierInheritSourceLabel(serviceTierSource) {
+    if (serviceTierSource === "config-toml") return "继承 config.toml";
+    return "继承 Codex 默认设置";
+  }
+
   function serviceTierStatusMessage(
     controlMode = codexServiceTierState.controlMode || "inherit",
     threadMode = codexServiceTierState.threadMode || "inherit",
     effectiveMode = codexServiceTierState.effectiveMode || "standard",
-    defaultMode = codexServiceTierState.defaultMode || "inherit"
+    defaultMode = codexServiceTierState.defaultMode || "inherit",
+    effectiveServiceTier = codexServiceTierState.effectiveServiceTier,
+    serviceTierSource = codexServiceTierState.serviceTierSource
   ) {
     if (codexServiceTierState.status === "loading") return "正在读取…";
     if (codexServiceTierState.status === "failed") return "读取失败";
-    if (controlMode === "inherit") return `继承 config.toml：${effectiveMode}`;
+    if (controlMode === "inherit") {
+      if (effectiveServiceTier == null) return "继承 Codex 默认设置：默认";
+      return `${serviceTierInheritSourceLabel(serviceTierSource)}：${effectiveMode}`;
+    }
     if (controlMode === "global-standard") return "全局 Standard";
     if (controlMode === "global-fast") return "全局 Fast";
     if (threadMode === "inherit") return `自定义：默认 ${defaultMode}`;
@@ -1766,7 +2738,7 @@
     writeThreadServiceTierState(state);
     refreshCodexServiceTierControls();
     const labels = {
-      inherit: "继承 config.toml",
+      inherit: "继承 Codex 默认设置",
       "global-standard": "全局 Standard",
       "global-fast": "全局 Fast",
       custom: "自定义",
@@ -1798,7 +2770,7 @@
     const fastAvailability = codexServiceTierFastAvailability();
     const message = effectiveMode === "fast" && !fastAvailability.supported
       ? codexServiceTierFastUnsupportedMessage(fastAvailability.modelName)
-      : serviceTierStatusMessage(controlMode, threadMode, effectiveMode, defaultMode);
+      : serviceTierStatusMessage(controlMode, threadMode, effectiveMode, defaultMode, effectiveServiceTier, codexServiceTierState.serviceTierSource);
     codexServiceTierState = {
       ...codexServiceTierState,
       controlMode,
@@ -1820,9 +2792,10 @@
     if (codexServiceTierState.status === "failed") return { tier: "failed", label: "?", title: "服务模式：读取失败" };
     const fastAvailability = codexServiceTierFastAvailability();
     const effectiveMode = codexServiceTierState.effectiveMode || "standard";
+    const inheritedDefault = codexServiceTierState.controlMode === "inherit" && codexServiceTierState.effectiveServiceTier == null;
     const scope = codexServiceTierState.controlMode === "custom" && codexServiceTierState.threadMode !== "inherit"
       ? `当前 thread：${codexServiceTierState.threadMode}`
-      : serviceTierStatusMessage(codexServiceTierState.controlMode, codexServiceTierState.threadMode, effectiveMode, codexServiceTierState.defaultMode);
+      : serviceTierStatusMessage(codexServiceTierState.controlMode, codexServiceTierState.threadMode, effectiveMode, codexServiceTierState.defaultMode, codexServiceTierState.effectiveServiceTier, codexServiceTierState.serviceTierSource);
     const title = [
       `服务模式：${scope}`,
       "Standard：使用标准处理；不在请求上设置 priority。",
@@ -1832,6 +2805,7 @@
       return { tier: "unsupported", label: "不支持", title: `${title}\n${codexServiceTierFastUnsupportedMessage(fastAvailability.modelName)}；当前请求会按 Standard 发送。` };
     }
     if (effectiveMode === "fast") return { tier: "fast", label: "fast", title };
+    if (inheritedDefault) return { tier: "default", label: "默认", title };
     return { tier: "standard", label: "standard", title };
   }
 
@@ -1901,6 +2875,34 @@
     refreshCodexServiceTierBadges();
   }
 
+  async function getConfigTomlServiceTier() {
+    const catalog = await loadCodexModelCatalog();
+    const rawTier = catalog && typeof catalog === "object" ? catalog.service_tier : null;
+    const normalized = String(rawTier || "").trim();
+    return normalized ? normalized : null;
+  }
+
+  async function resolveInheritedServiceTier() {
+    let appSetting = null;
+    let appSettingError = null;
+    try {
+      appSetting = await getCodexServiceTierSetting();
+    } catch (error) {
+      appSettingError = error;
+    }
+    if (appSetting != null && String(appSetting).trim() === "") appSetting = null;
+    let configTier = null;
+    let configError = null;
+    try {
+      configTier = await getConfigTomlServiceTier();
+    } catch (error) {
+      configError = error;
+    }
+    if (appSettingError && configError && appSetting == null && configTier == null) throw appSettingError;
+    const serviceTierSource = appSetting != null ? "codex-app" : (configTier != null ? "config-toml" : null);
+    return { serviceTier: appSetting, configServiceTier: configTier, serviceTierSource };
+  }
+
   async function loadCodexServiceTierState() {
     if (!codexPlusSettings().serviceTierControls) {
       codexServiceTierState = { ...codexServiceTierState, status: "idle", message: "未启用" };
@@ -1910,12 +2912,14 @@
     codexServiceTierState = { ...codexServiceTierState, status: "loading", message: "正在读取…" };
     refreshCodexServiceTierControls();
     try {
-      const serviceTier = await getCodexServiceTierSetting();
+      const { serviceTier, configServiceTier, serviceTierSource } = await resolveInheritedServiceTier();
       codexServiceTierState = {
         ...codexServiceTierState,
         status: "ok",
         serviceTier,
-        message: serviceTierGlobalStatusMessage(serviceTier),
+        configServiceTier,
+        serviceTierSource,
+        message: serviceTierGlobalStatusMessage(serviceTier ?? configServiceTier),
       };
     } catch (error) {
       codexServiceTierState = {
@@ -2007,7 +3011,7 @@
     const controlMode = normalizeCodexServiceTierControlMode(state.mode);
     const defaultMode = normalizeCodexThreadServiceTierMode(state.defaultMode);
     if (controlMode === "inherit") {
-      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierState.serviceTier;
+      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierInheritedValue();
       const override = codexServiceTierOverrideResult(method, params, threadIdHint, "inherit", inheritedServiceTier);
       return override.fastBlocked ? override : null;
     }
@@ -2024,7 +3028,7 @@
     const override = threadId ? codexThreadServiceTierOverride(threadId) : codexThreadServiceTierDraft();
     const mode = codexServiceTierEffectiveThreadMode(override?.mode, defaultMode);
     if (mode === "inherit") {
-      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierState.serviceTier;
+      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierInheritedValue();
       const inheritedOverride = codexServiceTierOverrideResult(method, params, threadIdHint, "inherit", inheritedServiceTier);
       return inheritedOverride.fastBlocked ? { ...inheritedOverride, threadId, mode } : null;
     }
@@ -2036,9 +3040,10 @@
   }
 
   function applyCodexServiceTierRequestOverride(method, params, threadIdHint = "") {
+    const providerParams = applyCodexRemoteSessionProviderOverride(method, params);
     const override = codexServiceTierOverrideForRequest(method, params, threadIdHint);
-    if (!override) return params;
-    const nextParams = { ...(params || {}), serviceTier: override.serviceTier };
+    if (!override) return providerParams;
+    const nextParams = { ...(providerParams || {}), serviceTier: override.serviceTier };
     if (Object.prototype.hasOwnProperty.call(nextParams, "service_tier") || override.fastBlocked) {
       nextParams.service_tier = override.serviceTier;
     }
@@ -2054,9 +3059,297 @@
     return nextParams;
   }
 
-  function codexServiceTierRequestOverride(message) {
-    if (!codexPlusSettings().serviceTierControls) return message;
+  function codexRemoteSessionProviderNormalizationEnabled() {
+    if (!codexPlusBackendSettings.relayProfilesEnabled) return false;
+    const profiles = Array.isArray(codexPlusBackendSettings.relayProfiles)
+      ? codexPlusBackendSettings.relayProfiles
+      : [];
+    const activeId = String(codexPlusBackendSettings.activeRelayId || "");
+    const profile = profiles.find((item) => String(item?.id || "") === activeId);
+    if (!profile) return false;
+    const relayMode = String(profile.relayMode || "");
+    return relayMode === "official" && !!profile.officialMixApiKey;
+  }
+
+  function codexRemoteSessionTargetProvider() {
+    return String(
+      codexModelCatalog?.codex_model_provider
+      || codexModelCatalog?.codexModelProvider
+      || codexModelCatalog?.model_provider
+      || codexModelCatalog?.modelProvider
+      || ""
+    ).trim();
+  }
+
+  function codexRemoteSessionThreadStartMethod(method) {
+    return [
+      "thread/start",
+      "start-conversation",
+      "start-thread-for-host",
+      "thread-prewarm-start",
+      "prewarm-thread-start-for-host",
+    ].includes(String(method || ""));
+  }
+
+  function applyCodexRemoteSessionProviderOverride(method, params) {
+    if (!codexRemoteSessionThreadStartMethod(method)) return params;
+    if (!codexRemoteSessionProviderNormalizationEnabled()) return params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return params;
+    const targetProvider = codexRemoteSessionTargetProvider();
+    if (!targetProvider || targetProvider === "openai") return params;
+    const requestedProvider = String(params.modelProvider || params.model_provider || "").trim();
+    if (requestedProvider && requestedProvider !== "openai" && requestedProvider !== targetProvider) {
+      return params;
+    }
+    if (requestedProvider === targetProvider && !Object.prototype.hasOwnProperty.call(params, "model_provider")) {
+      return params;
+    }
+    const nextParams = { ...params, modelProvider: targetProvider };
+    delete nextParams.model_provider;
+    sendCodexPlusDiagnostic("remote_session_provider_override_applied", {
+      method,
+      from: requestedProvider || "(missing)",
+      to: targetProvider,
+    });
+    return nextParams;
+  }
+
+  function codexRemoteSessionStartedThreadId(value) {
+    const queue = [{ value, depth: 0 }];
+    const seen = new WeakSet();
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const candidate = current?.value;
+      if (!candidate || typeof candidate !== "object") continue;
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      const method = String(candidate.method || candidate.type || "");
+      if (method === "thread/started") {
+        const thread = candidate.params?.thread || candidate.thread || candidate.payload?.thread;
+        const threadId = String(thread?.id || candidate.params?.threadId || candidate.threadId || "").trim();
+        if (threadId) return threadId;
+      }
+      if (method === "browser-use-session-route-capture") {
+        const threadId = String(
+          candidate.params?.conversationId
+          || candidate.params?.conversation_id
+          || candidate.conversationId
+          || candidate.conversation_id
+          || ""
+        ).trim();
+        if (threadId) return threadId;
+      }
+      if (method === "browser-sidebar-browser-use-state") {
+        const isActive = candidate.params?.isActive ?? candidate.params?.is_active
+          ?? candidate.isActive ?? candidate.is_active;
+        if (isActive !== true) continue;
+        const threadId = String(
+          candidate.params?.conversationId
+          || candidate.params?.conversation_id
+          || candidate.conversationId
+          || candidate.conversation_id
+          || ""
+        ).trim();
+        if (threadId) return threadId;
+      }
+      if (current.depth >= 4) continue;
+      for (const key of ["message", "response", "detail", "data", "payload", "params", "request"]) {
+        const nested = candidate[key];
+        if (nested && typeof nested === "object") {
+          queue.push({ value: nested, depth: current.depth + 1 });
+        }
+      }
+    }
+    return "";
+  }
+
+  function requestCodexRemoteSessionRecovery(threadId, attempt) {
+    const payload = { thread_id: threadId };
+    const testHook = window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__;
+    const request = typeof testHook === "function"
+      ? Promise.resolve(testHook(payload, attempt))
+      : postJson("/remote-control-session/recover", payload);
+    return request.then((result) => {
+      if (attempt === 0
+        || result?.message === "Remote Control session recovery complete"
+        || result?.message === "Remote Control session catalog recovery complete") {
+        sendCodexPlusDiagnostic("remote_session_recovery_requested", {
+          threadId,
+          attempt,
+          status: result?.status || "",
+          message: result?.message || "",
+          changedSessionFiles: result?.changed_session_files || 0,
+          catalogRowsInserted: result?.sqlite_catalog_rows_inserted || 0,
+        });
+      }
+      return result;
+    }).catch((error) => {
+      if (attempt === 0) {
+        sendCodexPlusDiagnostic("remote_session_recovery_failed", {
+          threadId,
+          attempt,
+          errorName: error?.name || "",
+          errorMessage: error?.message || String(error),
+        });
+      }
+      return null;
+    });
+  }
+
+  function scheduleCodexRemoteSessionRecovery(threadId) {
+    if (!codexRemoteSessionProviderNormalizationEnabled()) return false;
+    const normalizedThreadId = String(threadId || "").trim();
+    if (!normalizedThreadId || normalizedThreadId.length > 128) return false;
+    window.__codexPlusRemoteSessionRecoveryPending = window.__codexPlusRemoteSessionRecoveryPending || new Map();
+    const pending = window.__codexPlusRemoteSessionRecoveryPending;
+    if (pending.has(normalizedThreadId)) return false;
+    const retryOffsets = [100, 350, 800, 1600, 3000];
+    const state = { timer: 0 };
+    const finish = () => {
+      if (state.timer) window.clearTimeout(state.timer);
+      state.timer = 0;
+      if (pending.get(normalizedThreadId) === state) pending.delete(normalizedThreadId);
+    };
+    const runAttempt = async (attempt) => {
+      state.timer = 0;
+      if (!codexRemoteSessionProviderNormalizationEnabled()) {
+        finish();
+        return;
+      }
+      const result = await requestCodexRemoteSessionRecovery(normalizedThreadId, attempt);
+      const message = String(result?.message || "");
+      if (message === "Remote Control session recovery complete"
+        || message === "Remote Control session catalog recovery complete"
+        || message === "Remote Control session recovery is disabled for the active profile") {
+        finish();
+        return;
+      }
+      const nextAttempt = attempt + 1;
+      if (nextAttempt >= retryOffsets.length) {
+        finish();
+        return;
+      }
+      const nextDelay = retryOffsets[nextAttempt] - retryOffsets[attempt];
+      state.timer = window.setTimeout(() => void runAttempt(nextAttempt), nextDelay);
+    };
+    state.timer = window.setTimeout(() => void runAttempt(0), retryOffsets[0]);
+    pending.set(normalizedThreadId, state);
+    return true;
+  }
+
+  function observeCodexRemoteSessionNotification(value) {
+    const threadId = codexRemoteSessionStartedThreadId(value);
+    return threadId ? scheduleCodexRemoteSessionRecovery(threadId) : false;
+  }
+
+  function installCodexRemoteSessionRecoveryListener() {
+    if (window.__codexPlusRemoteSessionRecoveryInstalled === codexRemoteSessionRecoveryVersion) return true;
+    if (window.__codexPlusRemoteSessionRecoveryMessageHandler) {
+      window.removeEventListener("message", window.__codexPlusRemoteSessionRecoveryMessageHandler, true);
+    }
+    if (window.__codexPlusRemoteSessionRecoveryViewHandler) {
+      window.removeEventListener("codex-message-from-view", window.__codexPlusRemoteSessionRecoveryViewHandler, true);
+    }
+    const messageHandler = (event) => {
+      if (event?.source !== window) return false;
+      const origin = String(event?.origin || "");
+      if (origin && origin !== "null" && origin !== window.location.origin) return false;
+      return observeCodexRemoteSessionNotification(event?.data);
+    };
+    const viewHandler = (event) => observeCodexRemoteSessionNotification(event?.detail);
+    window.__codexPlusRemoteSessionRecoveryMessageHandler = messageHandler;
+    window.__codexPlusRemoteSessionRecoveryViewHandler = viewHandler;
+    window.addEventListener("message", messageHandler, true);
+    window.addEventListener("codex-message-from-view", viewHandler, true);
+    window.__codexPlusRemoteSessionRecoveryInstalled = codexRemoteSessionRecoveryVersion;
+    sendCodexPlusDiagnostic("remote_session_recovery_listener_installed", {
+      version: codexRemoteSessionRecoveryVersion,
+    });
+    return true;
+  }
+
+  function installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix = "") {
+    if (!dispatcher || typeof dispatcher.subscribe !== "function") return false;
+    if (window.__codexPlusRemoteSessionRecoveryDispatcher === dispatcher
+        && window.__codexPlusRemoteSessionRecoveryDispatcherVersion === codexRemoteSessionRecoveryVersion) {
+      return true;
+    }
+    if (typeof window.__codexPlusRemoteSessionRecoveryDispatcherUnsubscribe === "function") {
+      try {
+        window.__codexPlusRemoteSessionRecoveryDispatcherUnsubscribe();
+      } catch {
+      }
+    }
+    const handler = (payload) => {
+      if (observeCodexRemoteSessionNotification(payload)) return true;
+      const params = payload && typeof payload === "object" ? payload : {};
+      if (observeCodexRemoteSessionNotification({
+        method: "thread/started",
+        params,
+      })) return true;
+      return observeCodexRemoteSessionNotification({
+        method: "thread/started",
+        params: { thread: params },
+      });
+    };
+    const browserUseHandler = (payload) => observeCodexRemoteSessionNotification({
+      type: "browser-sidebar-browser-use-state",
+      params: payload && typeof payload === "object" ? payload : {},
+    });
+    const unsubscribers = [
+      dispatcher.subscribe("thread/started", handler),
+      dispatcher.subscribe("browser-sidebar-browser-use-state", browserUseHandler),
+    ];
+    window.__codexPlusRemoteSessionRecoveryDispatcher = dispatcher;
+    window.__codexPlusRemoteSessionRecoveryDispatcherHandler = handler;
+    window.__codexPlusRemoteSessionRecoveryDispatcherUnsubscribe = () => {
+      for (const unsubscribe of unsubscribers) {
+        if (typeof unsubscribe !== "function") continue;
+        try {
+          unsubscribe();
+        } catch {
+        }
+      }
+    };
+    window.__codexPlusRemoteSessionRecoveryDispatcherVersion = codexRemoteSessionRecoveryVersion;
+    sendCodexPlusDiagnostic("remote_session_dispatcher_subscription_installed", { assetPrefix });
+    return true;
+  }
+
+  function codexServiceTierRequestOverride(message, skipFetchEnvelope = false) {
     if (!message || typeof message !== "object") return message;
+    if (!skipFetchEnvelope && message.type === "fetch" && typeof message.url === "string") {
+      const urlPrefix = "vscode://codex/";
+      if (!message.url.startsWith(urlPrefix)) return message;
+      const requestType = message.url.slice(urlPrefix.length).split(/[?#]/, 1)[0];
+      let params = null;
+      let bodyWasString = false;
+      if (typeof message.body === "string") {
+        try {
+          params = JSON.parse(message.body);
+          bodyWasString = true;
+        } catch (_) {
+          return message;
+        }
+      } else if (message.body && typeof message.body === "object") {
+        params = message.body;
+      } else {
+        return message;
+      }
+      if (!params || typeof params !== "object" || Array.isArray(params)) return message;
+      const bodyHadType = Object.prototype.hasOwnProperty.call(params, "type");
+      const originalBodyType = params.type;
+      const logicalMessage = { ...params, type: requestType };
+      const patchedMessage = codexServiceTierRequestOverride(logicalMessage, true);
+      if (patchedMessage === logicalMessage) return message;
+      const nextParams = { ...patchedMessage };
+      delete nextParams.type;
+      if (bodyHadType) nextParams.type = originalBodyType;
+      return {
+        ...message,
+        body: bodyWasString ? JSON.stringify(nextParams) : nextParams,
+      };
+    }
     if (message.type === "send-cli-request-for-host") {
       const method = String(message.method || "");
       const params = applyCodexServiceTierRequestOverride(method, message.params);
@@ -2098,27 +3391,54 @@
     return message;
   }
 
+  function codexServiceTierDispatcherFromModule(module) {
+    const directSingleton = module?.idt;
+    if (directSingleton
+        && typeof directSingleton === "object"
+        && typeof directSingleton.dispatchMessage === "function"
+        && typeof directSingleton.subscribe === "function") {
+      return directSingleton;
+    }
+    const values = module && typeof module === "object" ? Object.values(module) : [];
+    const singleton = values.find((candidate) => candidate
+      && typeof candidate === "object"
+      && typeof candidate.dispatchMessage === "function"
+      && typeof candidate.subscribe === "function");
+    if (singleton) return singleton;
+    const dispatcherClass = values.find((candidate) => typeof candidate === "function"
+      && typeof candidate.getInstance === "function"
+      && typeof candidate.prototype?.dispatchMessage === "function");
+    return dispatcherClass?.getInstance?.() || null;
+  }
+
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
+    const loadDispatcher = async () => {
+      const errors = [];
+      for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-"]) {
+        try {
+          const module = await loadCodexAppModule(assetPrefix);
+          const dispatcher = codexServiceTierDispatcherFromModule(module);
+          if (dispatcher) return { dispatcher, assetPrefix };
+          errors.push(`${assetPrefix}: dispatcher export unavailable`);
+        } catch (error) {
+          errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
+        }
+      }
+      throw new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
+    };
     const patch = async () => {
       try {
-        const module = await loadCodexAppModule("setting-storage-");
-        const dispatcherClass = typeof module.v === "function" && String(module.v).includes("dispatchMessage") ? module.v : null;
-        const dispatcher = dispatcherClass?.getInstance?.();
-        if (!dispatcher || typeof dispatcher.dispatchMessage !== "function") throw new Error("Codex dispatcher unavailable");
-        if (dispatcher.__codexServiceTierOriginalDispatchMessage) {
-          window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
-          return;
+        const { dispatcher, assetPrefix } = await loadDispatcher();
+        if (!dispatcher.__codexServiceTierOriginalDispatchMessage) {
+          dispatcher.__codexServiceTierOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
         }
-        dispatcher.__codexServiceTierOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
         dispatcher.dispatchMessage = (type, payload) => {
-          const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
-          const nextType = message?.type || type;
-          const { type: _type, ...nextPayload } = message || {};
-          return dispatcher.__codexServiceTierOriginalDispatchMessage(nextType, nextPayload);
+          return dispatchCodexPlusMessage(dispatcher, type, payload);
         };
+        installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", {});
+        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
       } catch (error) {
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
           errorName: error?.name || "",
@@ -2141,6 +3461,9 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (codexRemoteSessionProviderNormalizationEnabled()) {
+        void loadCodexModelCatalog();
+      }
       refreshCodexPlusBackendToggles();
       return true;
     } catch (_) {
@@ -2246,6 +3569,10 @@
     const nextStatus = await withBackendTimeout(postJson("/backend/status", {}));
     if (seq !== codexPlusBackendCheckSeq) return;
     codexPlusBackendStatus = nextStatus;
+    if (nextStatus?.status === "ok" && typeof nextStatus.hideOfficialUsageAlert === "boolean") {
+      window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
+      refreshOfficialUsageAlertVisibility();
+    }
     if (nextStatus?.status !== "ok") {
       sendCodexPlusDiagnostic("backend_check_failed", {
         status: nextStatus?.status || "unknown",
@@ -2299,7 +3626,10 @@
   }
 
   async function loadUserScripts(path = "/user-scripts/list", payload = {}) {
-    const result = await postJson(path, payload);
+    const requestPayload = path === "/user-scripts/list"
+      ? { ...payload, runtime_status: window.__codexPlusUserScripts?.scripts || {} }
+      : payload;
+    const result = await postJson(path, requestPayload);
     if (result?.scripts) {
       codexPlusUserScripts = result;
       renderUserScripts();
@@ -2332,6 +3662,11 @@
     }));
   }
 
+  function formatCodexPlusAdTitle(title) {
+    const value = String(title || "");
+    return value.split(/[｜|]/, 1)[0].trim() || value;
+  }
+
   function renderCodexPlusAdGroup(type, emptyText) {
     const ads = codexPlusAds.filter((ad) => ad.type === type);
     if (!ads.length) return `<div class="codex-plus-ad-empty">${escapeHtml(emptyText)}</div>`;
@@ -2339,7 +3674,7 @@
       <article class="codex-plus-ad-card">
         ${ad.image ? `<img class="codex-plus-ad-image" src="${escapeHtml(ad.image)}" alt="">` : ""}
         <div class="codex-plus-ad-content">
-          <h3 class="codex-plus-ad-title">${escapeHtml(ad.title)}</h3>
+          <h3 class="codex-plus-ad-title">${escapeHtml(formatCodexPlusAdTitle(ad.title))}</h3>
           <p class="codex-plus-ad-description">${escapeHtml(ad.description)}</p>
           <div class="codex-plus-ad-highlights">
             ${ad.highlights.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
@@ -2437,7 +3772,6 @@
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="support" data-active="false">请作者喝咖啡</button>
         </div>
         <div class="codex-plus-modal-body">
           <div class="codex-plus-panel" data-codex-plus-panel="home">
@@ -2448,7 +3782,7 @@
               </div>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、移动、插件相关和菜单位置增强。</div></div>
+              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、插件相关和菜单位置增强。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
@@ -2472,7 +3806,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
-              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承使用 config.toml 的 service tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
+              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
               <div class="codex-plus-service-tier-control">
                 <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
                 <div class="codex-plus-service-tier-actions">
@@ -2483,7 +3817,7 @@
                 </div>
                 <div class="codex-plus-service-tier-actions codex-plus-service-tier-thread-actions">
                   <span class="codex-plus-service-tier-thread-label">当前 thread 覆盖</span>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 config.toml">继承</button>
+                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 Codex 默认设置">继承</button>
                   <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-standard="true" title="仅当前 thread 使用 Standard，并切到自定义模式">Standard</button>
                   <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-fast="true" title="仅当前 thread 使用 Fast，并切到自定义模式">Fast</button>
                 </div>
@@ -2500,10 +3834,6 @@
             <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话项目移动</div><div class="codex-plus-row-description">在会话列表悬停显示移动按钮，可移动到普通对话或其他本地项目。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="projectMove"><span></span></button>
             </div>
             <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">会话 ID 标识</div><div class="codex-plus-row-description">在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。</div></div>
@@ -2536,7 +3866,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出、项目移动和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、项目路径移动等全部页面能力。"}</div></div>
+              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户脚本，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
               <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
             </div>
             <div class="codex-plus-row">
@@ -2582,19 +3912,6 @@
             <div class="codex-plus-sponsor-text">推荐内容分为赞助商推荐和普通推荐。赞助商推荐来自支持 Codex++ 继续维护的合作方；普通推荐用于展示适合 Codex 用户的服务与信息。</div>
             <div class="codex-plus-ad-remote">
               ${renderCodexPlusAds()}
-            </div>
-          </div>
-          <div class="codex-plus-panel" data-codex-plus-panel="support" hidden>
-            <div class="codex-plus-sponsor-text">如果 Codex++ 帮到了你，可以请我喝杯咖啡，或者随手赞赏支持一下继续维护。</div>
-            <div class="codex-plus-sponsor-grid">
-              <div class="codex-plus-sponsor-card">
-                <div class="codex-plus-sponsor-card-title">支付宝</div>
-                <img class="codex-plus-sponsor-qr" src="${window.__CODEX_PLUS_SPONSOR_IMAGES__?.alipay || `${helperBase}/assets/sponsor-alipay.jpg`}" alt="支付宝赞赏码">
-              </div>
-              <div class="codex-plus-sponsor-card">
-                <div class="codex-plus-sponsor-card-title">微信</div>
-                <img class="codex-plus-sponsor-qr" src="${window.__CODEX_PLUS_SPONSOR_IMAGES__?.wechat || `${helperBase}/assets/sponsor-wechat.jpg`}" alt="微信赞赏码">
-              </div>
             </div>
           </div>
         </div>
@@ -2841,7 +4158,7 @@
 
   function updateFloatingCodexPlusMenuPosition(menu) {
     if (!menu?.classList?.contains(codexPlusMenuFloatingClass)) return;
-    const header = document.querySelector(selectors.appHeader) || document.querySelector("header");
+    const header = document.querySelector(selectors.appHeader);
     if (!header) return;
     const toolbarButtons = Array.from(header.querySelectorAll("button"))
       .map((button) => ({ button, rect: button.getBoundingClientRect() }))
@@ -2860,8 +4177,9 @@
 
     const headerRect = header.getBoundingClientRect();
     if (headerRect.height) {
-      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${headerRect.top}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${headerRect.height}px`);
+      const isApplicationMenuTopBar = header.matches?.('[class*="ApplicationMenuTopBar"]');
+      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${isApplicationMenuTopBar ? Math.max(4, headerRect.top) : headerRect.top}px`);
+      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${isApplicationMenuTopBar ? 28 : headerRect.height}px`);
     }
     menu.style.removeProperty("--codex-plus-menu-right");
   }
@@ -2918,6 +4236,23 @@
     removeDuplicateCodexPlusMenus(menu);
   }
 
+  const codexPluginRemoteOnlyMarketplaceKinds = new Set(["created-by-me-remote", "shared-with-me"]);
+
+  function pluginMarketplaceRequestProfile(params) {
+    const marketplaceKinds = Array.isArray(params?.marketplaceKinds)
+      ? Array.from(new Set(params.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))))
+      : [];
+    const hasRemoteOnlyKind = marketplaceKinds.some((kind) => codexPluginRemoteOnlyMarketplaceKinds.has(kind));
+    const hasLocalKind = marketplaceKinds.includes("local");
+    const hasOtherKind = marketplaceKinds.some(
+      (kind) => !codexPluginRemoteOnlyMarketplaceKinds.has(kind) && kind !== "vertical"
+    );
+    return {
+      marketplaceKinds,
+      remoteOnly: hasRemoteOnlyKind && !hasLocalKind && !hasOtherKind,
+    };
+  }
+
   function patchPluginMarketplaceRequestParams(method, params) {
     if (method === "list-plugins") {
       if (!params || typeof params !== "object") return params;
@@ -2925,16 +4260,50 @@
       return params;
     }
     const next = { ...params };
+    const requestProfile = pluginMarketplaceRequestProfile(next);
+    const requestCwds = Array.isArray(next.cwds)
+      ? next.cwds.filter((cwd) => typeof cwd === "string" && cwd.trim())
+      : [];
+    if (requestCwds.length > 0) {
+      window.__codexPluginMarketplaceLastCwds = Array.from(new Set(requestCwds));
+    } else if (!requestProfile.remoteOnly && Array.isArray(window.__codexPluginMarketplaceLastCwds) && window.__codexPluginMarketplaceLastCwds.length > 0) {
+      next.cwds = [...window.__codexPluginMarketplaceLastCwds];
+    }
     const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
-    const nextKinds = Array.isArray(next.marketplaceKinds)
+    const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
+      && (!hadMarketplaceKinds || next.marketplaceKinds == null);
+    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
+    if (broadCatalogRequest && !remoteCatalogUnavailable) {
+      sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
+        hadMarketplaceKinds,
+        marketplaceKinds: hadMarketplaceKinds ? next.marketplaceKinds : null,
+        broadCatalogPreserved: true,
+        cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
+        cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
+        remoteCatalogUnavailable,
+        remoteOnly: requestProfile.remoteOnly,
+      });
+      return next;
+    }
+    let nextKinds = Array.isArray(next.marketplaceKinds)
       ? next.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))
       : ["local"];
-    if (!nextKinds.includes("vertical")) nextKinds.push("vertical");
+    if (!requestProfile.remoteOnly && remoteCatalogUnavailable) {
+      nextKinds = nextKinds.filter((kind) => kind !== "created-by-me-remote" && kind !== "shared-with-me");
+    }
+    if (!requestProfile.remoteOnly) {
+      if (!nextKinds.includes("local")) nextKinds.push("local");
+      if (!nextKinds.includes("vertical")) nextKinds.push("vertical");
+    }
     next.marketplaceKinds = Array.from(new Set(nextKinds));
     sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
       hadMarketplaceKinds,
       marketplaceKinds: next.marketplaceKinds,
+      broadCatalogPreserved: false,
       cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
+      cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
+      remoteCatalogUnavailable,
+      remoteOnly: requestProfile.remoteOnly,
     });
     return next;
   }
@@ -3079,7 +4448,8 @@
       return false;
     }
     const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n");
+      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
+      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
     if (!isKnownFilterSource) return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin));
@@ -3153,13 +4523,14 @@
     return next;
   }
 
-  function patchPluginMarketplaceResult(method, result) {
+  function patchPluginMarketplaceResult(method, result, options = {}) {
     if (method !== "list-plugins") return result;
+    const mergeLocal = options.mergeLocal !== false;
     let patchedCount = 0;
     try {
       const pluginMarketplaceCounts = {};
       if (Array.isArray(result?.marketplaces)) {
-        mergeLocalPluginMarketplaces(result);
+        if (mergeLocal) mergeLocalPluginMarketplaces(result);
         result.marketplaces.forEach((marketplace) => {
           if (Array.isArray(marketplace?.plugins)) {
             marketplace.plugins.forEach((plugin) => {
@@ -3178,6 +4549,7 @@
             remoteMarketplaceName: marketplace?.remoteMarketplaceName || null,
           })),
           pluginMarketplaceCounts,
+          mergeLocal,
         });
       }
       if (patchedCount > 0) {
@@ -3192,99 +4564,47 @@
     return result;
   }
 
-  function pluginAutoExpandVisibleElement(el) {
-    if (!(el instanceof HTMLElement) || !el.isConnected) return false;
-    const style = getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-
-  function pluginAutoExpandPageLooksRelevant() {
-    const text = String(document.body?.innerText || "");
-    return /插件|Plugins?|Marketplace|市场/i.test(text) && !!document.querySelector('button, [role="button"]');
-  }
-
-  function pluginAutoExpandButtonLooksScoped(button) {
-    let node = button;
-    for (let depth = 0; node instanceof HTMLElement && node !== document.body && depth < 8; depth += 1, node = node.parentElement) {
-      const text = String(node.innerText || "");
-      if (text.length > 16000) continue;
-      if (/插件|Plugins?|Marketplace|市场/i.test(text)) return true;
+  function pluginMarketplaceErrorText(value, visited = new WeakSet(), depth = 0) {
+    if (typeof value === "string") return value;
+    if (!value || typeof value !== "object" || depth > 4 || visited.has(value)) return "";
+    visited.add(value);
+    const parts = [];
+    for (const key of ["message", "error", "detail", "cause", "data", "response"]) {
+      const text = pluginMarketplaceErrorText(value[key], visited, depth + 1);
+      if (text) parts.push(text);
     }
-    return false;
+    return parts.join(" ");
   }
 
-  function pluginAutoExpandButtonText(button) {
-    return String(button?.textContent || button?.getAttribute?.("aria-label") || button?.getAttribute?.("title") || "")
-      .replace(/\s+/g, " ")
-      .trim();
+  function pluginMarketplaceRemoteAuthError(value) {
+    const text = pluginMarketplaceErrorText(value).toLowerCase();
+    return text.includes("chatgpt authentication required for remote plugin catalog") && text.includes("api key auth is not supported");
   }
 
-  function pluginAutoExpandButtonLooksLikeMore(button) {
-    const text = pluginAutoExpandButtonText(button);
-    if (!text || text.length > 120) return false;
-    if (/^(更多|显示更多|查看更多|加载更多|Show more|Load more|More)$/i.test(text)) return true;
-    if (/^查看\s+.+以及另外\s*\d+\s*个$/i.test(text)) return true;
-    if (/^View\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
-    if (/^Show\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
-    return false;
+  function markPluginMarketplaceRemoteCatalogUnavailable(error) {
+    window.__codexPluginMarketplaceRemoteCatalogUnavailable = true;
+    sendCodexPlusDiagnostic("plugin_marketplace_remote_auth_fallback", {
+      errorMessage: pluginMarketplaceErrorText(error),
+      rememberedCwdCount: Array.isArray(window.__codexPluginMarketplaceLastCwds)
+        ? window.__codexPluginMarketplaceLastCwds.length
+        : 0,
+    });
   }
 
-  function pluginAutoExpandButtonCandidates() {
-    if (!codexPlusSettings().pluginAutoExpand || !pluginAutoExpandPageLooksRelevant()) return [];
-    return Array.from(document.querySelectorAll('button, [role="button"]'))
-      .filter(pluginAutoExpandVisibleElement)
-      .filter((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true")
-      .filter(pluginAutoExpandButtonLooksLikeMore)
-      .filter(pluginAutoExpandButtonLooksScoped)
-      .filter((button) => !button.closest?.(`.${moreMenuClass}, #${codexPlusMenuId}, .codex-plus-modal-overlay`));
+  function pluginMarketplaceFallbackResult(mergeLocal = true) {
+    return patchPluginMarketplaceResult("list-plugins", {
+      marketplaces: [],
+      marketplaceLoadErrors: [],
+      featuredPluginIds: [],
+    }, { mergeLocal });
   }
 
-  function pluginAutoExpandSignature() {
-    return pluginAutoExpandButtonCandidates()
-      .map((button) => {
-        const rect = button.getBoundingClientRect();
-        return `${pluginAutoExpandButtonText(button)}:${Math.round(rect.top)}:${Math.round(rect.left)}`;
-      })
-      .join("|");
+  function localPluginMarketplaceFallbackResult() {
+    return pluginMarketplaceFallbackResult(true);
   }
 
-  function schedulePluginAutoExpand(force = false) {
-    if (!codexPlusSettings().pluginAutoExpand) return;
-    if (window.__codexPluginAutoExpandRunning && !force) return;
-    clearTimeout(window.__codexPluginAutoExpandTimer);
-    window.__codexPluginAutoExpandTimer = setTimeout(() => runPluginAutoExpand(force), force ? 30 : 180);
-  }
-
-  function runPluginAutoExpand(force = false) {
-    if (!codexPlusSettings().pluginAutoExpand) return;
-    const currentSignature = pluginAutoExpandSignature();
-    if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
-    window.__codexPluginAutoExpandLastSignature = currentSignature;
-    window.__codexPluginAutoExpandRunning = true;
-    window.__codexPluginAutoExpandClicks = 0;
-    const clickNext = () => {
-      if (!codexPlusSettings().pluginAutoExpand) {
-        window.__codexPluginAutoExpandRunning = false;
-        return;
-      }
-      const button = pluginAutoExpandButtonCandidates()[0];
-      if (!button || window.__codexPluginAutoExpandClicks >= codexPluginAutoExpandMaxClicks) {
-        window.__codexPluginAutoExpandRunning = false;
-        sendCodexPlusDiagnostic("plugin_auto_expand_finished", {
-          version: codexPluginAutoExpandVersion,
-          clicks: window.__codexPluginAutoExpandClicks || 0,
-          exhausted: !!button,
-        });
-        return;
-      }
-      window.__codexPluginAutoExpandClicks = (window.__codexPluginAutoExpandClicks || 0) + 1;
-      button.dataset.codexPluginAutoExpandClicked = String(Date.now());
-      button.click();
-      setTimeout(clickNext, codexPluginAutoExpandClickDelayMs);
-    };
-    clickNext();
+  function remoteOnlyPluginMarketplaceFallbackResult() {
+    return pluginMarketplaceFallbackResult(false);
   }
 
   function patchPluginMarketplaceRequestClient(client) {
@@ -3294,7 +4614,9 @@
     client.__codexPluginMarketplaceOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPluginMarketplacePatchedSendRequest(method, params, options) {
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
-      const requestParams = patchPluginMarketplaceRequestParams(requestMethod, restorePluginMarketplaceRequestParams(params, requestMethod));
+      const restoredRequestParams = restorePluginMarketplaceRequestParams(params, requestMethod);
+      const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
+      const requestParams = patchPluginMarketplaceRequestParams(requestMethod, restoredRequestParams);
       if (requestMethod === "install-plugin") {
         sendCodexPlusDiagnostic("plugin_install_request_debug", {
           method: String(method || ""),
@@ -3309,8 +4631,14 @@
       }
       try {
         const result = await originalSendRequest(method, requestParams, options);
-        return patchPluginMarketplaceResult(requestMethod, result);
+        return patchPluginMarketplaceResult(requestMethod, result, { mergeLocal: !requestProfile.remoteOnly });
       } catch (error) {
+        if (requestMethod === "list-plugins" && pluginMarketplaceRemoteAuthError(error)) {
+          markPluginMarketplaceRemoteCatalogUnavailable(error);
+          return requestProfile.remoteOnly
+            ? remoteOnlyPluginMarketplaceFallbackResult()
+            : localPluginMarketplaceFallbackResult();
+        }
         if (requestMethod === "install-plugin") {
           sendCodexPlusDiagnostic("plugin_install_request_failed", {
             method: String(method || ""),
@@ -3345,13 +4673,15 @@
       } else if (requestBody && typeof requestBody === "object") {
         params = requestBody;
       }
-      const requestParams = patchPluginMarketplaceRequestParams(
-        requestMethod,
-        restorePluginMarketplaceRequestParams(params, requestMethod)
-      );
+      const restoredRequestParams = restorePluginMarketplaceRequestParams(params, requestMethod);
+      const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
+      const requestParams = patchPluginMarketplaceRequestParams(requestMethod, restoredRequestParams);
       if (requestMethod === "list-plugins" && message.requestId != null) {
         window.__codexPluginMarketplaceFetchRequestIds = window.__codexPluginMarketplaceFetchRequestIds || new Set();
-        window.__codexPluginMarketplaceFetchRequestIds.add(String(message.requestId));
+        const requestId = String(message.requestId);
+        window.__codexPluginMarketplaceFetchRequestIds.add(requestId);
+        window.__codexPluginMarketplaceFetchRequestProfiles = window.__codexPluginMarketplaceFetchRequestProfiles || new Map();
+        window.__codexPluginMarketplaceFetchRequestProfiles.set(requestId, requestProfile);
       }
       if (requestParams === params) return message;
       if (requestMethod === "install-plugin") {
@@ -3374,13 +4704,15 @@
     if (message.type === "mcp-request" && message.request && typeof message.request === "object") {
       const requestMethod = appServerModelRequestMethod(String(message.request.method || ""), message.request.params);
       if (requestMethod !== "list-plugins" && requestMethod !== "install-plugin") return message;
-      const requestParams = patchPluginMarketplaceRequestParams(
-        requestMethod,
-        restorePluginMarketplaceRequestParams(message.request.params, requestMethod)
-      );
+      const restoredRequestParams = restorePluginMarketplaceRequestParams(message.request.params, requestMethod);
+      const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
+      const requestParams = patchPluginMarketplaceRequestParams(requestMethod, restoredRequestParams);
       if (requestMethod === "list-plugins" && message.request.id != null) {
         window.__codexPluginMarketplaceRequestIds = window.__codexPluginMarketplaceRequestIds || new Set();
-        window.__codexPluginMarketplaceRequestIds.add(String(message.request.id));
+        const requestId = String(message.request.id);
+        window.__codexPluginMarketplaceRequestIds.add(requestId);
+        window.__codexPluginMarketplaceRequestProfiles = window.__codexPluginMarketplaceRequestProfiles || new Map();
+        window.__codexPluginMarketplaceRequestProfiles.set(requestId, requestProfile);
       }
       if (requestParams === message.request.params) return message;
       if (requestMethod === "install-plugin") {
@@ -3404,16 +4736,31 @@
     if (data?.type === "fetch-response") {
       const requestId = data.requestId != null ? String(data.requestId) : "";
       const requestIds = window.__codexPluginMarketplaceFetchRequestIds;
+      const requestProfiles = window.__codexPluginMarketplaceFetchRequestProfiles;
+      const requestProfile = requestProfiles instanceof Map ? requestProfiles.get(requestId) : null;
       if (requestIds instanceof Set && requestIds.size > 0) {
         if (!requestIds.has(requestId)) return false;
         requestIds.delete(requestId);
       }
+      if (requestProfiles instanceof Map) requestProfiles.delete(requestId);
       if (typeof data.bodyJsonString !== "string" || !data.bodyJsonString.trim()) return false;
       try {
-        const result = JSON.parse(data.bodyJsonString);
-        if (result && typeof result === "object") {
-          patchPluginMarketplaceResult("list-plugins", result);
-          patchPluginMarketplaceResult("list-plugins", result.data);
+        let result = JSON.parse(data.bodyJsonString);
+        if (pluginMarketplaceRemoteAuthError(result?.error || result)) {
+          markPluginMarketplaceRemoteCatalogUnavailable(result?.error || result);
+          const fallback = requestProfile?.remoteOnly
+            ? remoteOnlyPluginMarketplaceFallbackResult()
+            : localPluginMarketplaceFallbackResult();
+          if (result && typeof result === "object" && Object.prototype.hasOwnProperty.call(result, "id")) {
+            delete result.error;
+            result.result = fallback;
+          } else {
+            result = fallback;
+          }
+        } else if (result && typeof result === "object") {
+          const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
+          patchPluginMarketplaceResult("list-plugins", result, patchOptions);
+          patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
         }
         data.bodyJsonString = JSON.stringify(result);
         return true;
@@ -3433,15 +4780,52 @@
     }
     const requestId = message?.id != null ? String(message.id) : "";
     const requestIds = window.__codexPluginMarketplaceRequestIds;
+    const requestProfiles = window.__codexPluginMarketplaceRequestProfiles;
+    const requestProfile = requestProfiles instanceof Map ? requestProfiles.get(requestId) : null;
     if (requestIds instanceof Set && requestIds.size > 0) {
       if (!requestIds.has(requestId)) return false;
       requestIds.delete(requestId);
     }
+    if (requestProfiles instanceof Map) requestProfiles.delete(requestId);
+    if (pluginMarketplaceRemoteAuthError(message?.error)) {
+      markPluginMarketplaceRemoteCatalogUnavailable(message.error);
+      delete message.error;
+      message.result = requestProfile?.remoteOnly
+        ? remoteOnlyPluginMarketplaceFallbackResult()
+        : localPluginMarketplaceFallbackResult();
+      return true;
+    }
     const result = message?.result;
     if (!result || typeof result !== "object") return false;
-    patchPluginMarketplaceResult("list-plugins", result);
-    patchPluginMarketplaceResult("list-plugins", result.data);
+    const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
+    patchPluginMarketplaceResult("list-plugins", result, patchOptions);
+    patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
     return true;
+  }
+
+  if (window.__CODEX_PLUS_TEST_PLUGIN_MARKETPLACE__) {
+    window.__codexPlusPluginMarketplaceTest = {
+      patchRequestParams: patchPluginMarketplaceRequestParams,
+      patchRequestMessage: patchPluginMarketplaceRequestMessage,
+      patchResponseData: patchPluginMarketplaceResponseData,
+      remoteAuthError: pluginMarketplaceRemoteAuthError,
+      localFallback: localPluginMarketplaceFallbackResult,
+      remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
+      requestProfile: pluginMarketplaceRequestProfile,
+      setCodexAppVersion: (version) => {
+        codexPlusBackendSettings.codexAppVersion = String(version || "");
+      },
+      remoteCatalogUnavailable: () => window.__codexPluginMarketplaceRemoteCatalogUnavailable === true,
+      reset: () => {
+        delete window.__codexPluginMarketplaceLastCwds;
+        delete window.__codexPluginMarketplaceRemoteCatalogUnavailable;
+        window.__codexPluginMarketplaceRequestIds = new Set();
+        window.__codexPluginMarketplaceFetchRequestIds = new Set();
+        window.__codexPluginMarketplaceRequestProfiles = new Map();
+        window.__codexPluginMarketplaceFetchRequestProfiles = new Map();
+      },
+    };
+    return;
   }
 
   function clearPluginMarketplaceQueryCache() {
@@ -3533,28 +4917,26 @@
     if (!codexPlusSettings().pluginMarketplaceUnlock) return;
     const patch = async () => {
       try {
-        const module = await loadCodexAppModule("app-server-manager-signals-");
-        const candidates = Object.values(module).filter((value) => value && typeof value === "object");
+        const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
         let patchedCount = 0;
         for (const candidate of candidates) {
           if (patchPluginMarketplaceRequestClient(candidate)) patchedCount += 1;
-          if (typeof candidate.sendRequest !== "function" && typeof candidate.get === "function") {
-            try {
-              if (patchPluginMarketplaceRequestClient(candidate.get())) patchedCount += 1;
-            } catch {
-            }
-          }
         }
         if (patchedCount > 0) {
           window.__codexPluginMarketplaceUnlockInstalled = codexPluginMarketplaceUnlockVersion;
           sendCodexPlusDiagnostic("plugin_marketplace_request_patch_installed", {
+            moduleCount: modules.length,
             candidateCount: candidates.length,
             patchedCount,
+            sources,
+            discovery,
           });
         } else {
           sendCodexPlusDiagnostic("plugin_marketplace_request_patch_not_found", {
-            exportCount: Object.keys(module || {}).length,
+            moduleCount: modules.length,
             candidateCount: candidates.length,
+            sources,
+            discovery,
           });
         }
       } catch (error) {
@@ -3629,6 +5011,31 @@
     return archivePageHintVisible() && archivedRows().length > 0;
   }
 
+  function isClientNewThreadId(value) {
+    return /^(?:local:)?client-new-thread:/i.test(String(value || "").trim());
+  }
+
+  function normalizedCodexThreadUuid(value) {
+    const id = String(value || "").trim().replace(/^local:/i, "");
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : "";
+  }
+
+  function reactConversationIdFromRow(row) {
+    const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+    let fiber = fiberKey ? row[fiberKey] : null;
+    for (let fiberDepth = 0; fiber && fiberDepth < 16; fiberDepth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps]) {
+        const directId = normalizedCodexThreadUuid(props?.conversationId);
+        if (directId) return directId;
+        const childId = normalizedCodexThreadUuid(
+          props?.children?.props?.conversationId,
+        );
+        if (childId) return childId;
+      }
+    }
+    return "";
+  }
+
   function sessionRefFromRow(row) {
     let href = row.getAttribute("href") || "";
     if (!href) {
@@ -3642,13 +5049,31 @@
     const idMatch = href.match(/(?:session|conversation|thread)[=/:-]([A-Za-z0-9_.-]+)/i) || href.match(/([A-Za-z0-9_-]{8,})$/);
     const codexThreadId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
     const fallbackId = row.getAttribute("data-session-id") || row.getAttribute("data-testid") || "";
-    const sessionId = codexThreadId || (idMatch && idMatch[1]) || fallbackId;
+    const placeholderThreadId = isClientNewThreadId(codexThreadId);
+    const hrefId = idMatch && idMatch[1];
+    const canonicalHrefId = normalizedCodexThreadUuid(hrefId);
+    const hrefIsTemporary = isClientNewThreadId(href)
+      || isClientNewThreadId(hrefId)
+      || /(?:^|[=/])(?:local:)?client-new-thread:/i.test(href);
+    const sessionId = placeholderThreadId
+      ? canonicalHrefId || (!hrefIsTemporary ? reactConversationIdFromRow(row) : "")
+      : normalizedCodexThreadUuid(codexThreadId)
+        || canonicalHrefId
+        || codexThreadId
+        || hrefId
+        || fallbackId;
     const explicitTitle = (row.getAttribute("data-app-action-sidebar-thread-title") || row.getAttribute("data-session-title") || "").trim();
     const titleNode = row.querySelector(`${selectors.threadTitle}, .truncate.select-none, .truncate.text-base`);
     const rawTitle = explicitTitle || titleNode?.textContent || (titleNode ? "" : (row.textContent || "Untitled session"));
     const titleNeedsCleanup = !explicitTitle && !titleNode;
     const title = (titleNeedsCleanup ? rawTitle.replace(/\s*(导出|删除|移动|移出项目)(\s*(导出|删除|移动|移出项目))*$/g, "") : rawTitle).trim().slice(0, 160);
     return { session_id: sessionId, title };
+  }
+
+  if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
+    window.__codexPlusSessionRefTest = {
+      fromRow: sessionRefFromRow,
+    };
   }
 
   function threadIdBadgeTitleNode(row) {
@@ -3673,7 +5098,7 @@
   }
 
   function threadIdBadgeMeta(sessionId) {
-    const id = projectMoveSessionKey(sessionId);
+    const id = sessionKey(sessionId);
     const compact = id.replaceAll("-", "");
     const shortId = compact.slice(0, 8);
     const createdAt = threadIdBadgeCreatedAt(sessionId);
@@ -3819,7 +5244,7 @@
   }
 
   function validThreadScrollSessionKey(sessionId) {
-    const key = projectMoveSessionKey(sessionId);
+    const key = sessionKey(sessionId);
     if (!key || key === "__proto__" || key === "prototype" || key === "constructor") return "";
     return /^[A-Za-z0-9_.-]{8,128}$/.test(key) ? key : "";
   }
@@ -4551,11 +5976,32 @@
   let chatsSortSignature = "";
   let chatsSortLastFetchAt = 0;
 
+  function codexStateApiFromModule(module, assetPrefix = "") {
+    if (assetPrefix.startsWith("vscode-api-")) {
+      return typeof module?.n === "function" ? module.n : null;
+    }
+    if (assetPrefix.startsWith("app-initial-")) {
+      return typeof module?.qut === "function" ? module.qut : null;
+    }
+    return null;
+  }
+
   async function codexStateApi() {
-    codexStateApiPromise = codexStateApiPromise || loadCodexAppModule("vscode-api-");
-    const api = await codexStateApiPromise;
-    if (typeof api.n !== "function") throw new Error("Codex 状态 API 不可用");
-    return api.n;
+    codexStateApiPromise = codexStateApiPromise || (async () => {
+      const errors = [];
+      for (const assetPrefix of ["vscode-api-", "app-initial-"]) {
+        try {
+          const api = await loadCodexAppModule(assetPrefix);
+          const call = codexStateApiFromModule(api, assetPrefix);
+          if (typeof call === "function") return call;
+          errors.push(`${assetPrefix}: state export unavailable`);
+        } catch (error) {
+          errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
+        }
+      }
+      throw new Error(`Codex 状态 API 不可用 (${errors.join("; ")})`);
+    })();
+    return await codexStateApiPromise;
   }
 
   async function codexStateCall(method, params) {
@@ -4572,6 +6018,16 @@
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
 
+  function dispatchCodexPlusMessage(dispatcher, type, payload) {
+    const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
+    const nextType = message?.type || type;
+    const { type: _type, ...nextPayload } = message || {};
+    if (nextType === "browser-use-session-route-capture") {
+      observeCodexRemoteSessionNotification({ type: nextType, params: nextPayload });
+    }
+    return dispatcher.__codexServiceTierOriginalDispatchMessage(nextType, nextPayload);
+  }
+
   function objectGlobalState(value) {
     return value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
   }
@@ -4580,7 +6036,7 @@
     return Array.from(new Set(values.filter((value) => typeof value === "string" && value.trim().length > 0)));
   }
 
-  let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+  let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
   let codexModelWhitelistRefreshTimer = 0;
@@ -4590,14 +6046,36 @@
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
       applyServiceTierOverride: (method, params, threadIdHint = "") => applyCodexServiceTierRequestOverride(method, params, threadIdHint),
+      applyProviderOverride: (method, params) => applyCodexRemoteSessionProviderOverride(method, params),
+      remoteSessionStartedThreadId: (value) => codexRemoteSessionStartedThreadId(value),
+      observeRemoteSessionNotification: (value) => observeCodexRemoteSessionNotification(value),
+      installRemoteSessionRecoveryListener: () => installCodexRemoteSessionRecoveryListener(),
+      installRemoteSessionDispatcherSubscription: (dispatcher, assetPrefix = "test") => installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix),
+      dispatchMessage: (dispatcher, type, payload) => dispatchCodexPlusMessage(dispatcher, type, payload),
       requestOverride: (message) => codexServiceTierRequestOverride(message),
       diagnostics: () => [...(window.__codexPlusServiceTierTestDiagnostics || [])],
+      statusSummary: (state = {}) => {
+        const summaryState = { ...codexServiceTierState, ...state };
+        return serviceTierStatusMessage(
+          summaryState.controlMode,
+          summaryState.threadMode,
+          summaryState.effectiveMode,
+          summaryState.defaultMode,
+          summaryState.effectiveServiceTier,
+          summaryState.serviceTierSource
+        );
+      },
+      resolveInheritedServiceTier: () => resolveInheritedServiceTier(),
+      currentModelName: () => codexServiceTierCurrentModelName(),
+      fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
+      modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
           status: "ok",
           model: "",
           default_model: "",
           model_provider: "",
+          codex_model_provider: "",
           provider_name: "",
           models: [],
           sources: [],
@@ -4606,6 +6084,10 @@
         };
         codexModelCatalogLoadedAt = Date.now();
         codexModelCatalogPromise = null;
+      },
+      setBackendSettings: (settings = {}) => {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        codexPlusBackendSettingsLoaded = true;
       },
       setServiceTierState: (state = {}) => {
         codexServiceTierState = { ...codexServiceTierState, ...state };
@@ -4619,6 +6101,10 @@
           ...state,
         }));
       },
+      settingStorageFromModule: codexSettingStorageFromModule,
+      stateApiFromModule: codexStateApiFromModule,
+      dispatcherFromModule: codexServiceTierDispatcherFromModule,
+      patchAppServerClient: patchAppServerModelRequestClient,
     };
     return;
   }
@@ -4640,7 +6126,7 @@
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
     codexModelCatalogPromise = postJson("/codex-model-catalog", {})
       .then(async (result) => {
-        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
         if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
           try {
             const settingsPromise = postJson("/settings/get", {});
@@ -4648,7 +6134,7 @@
             const settingsResp = await Promise.race([settingsPromise, timeoutPromise]);
             if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
               const activeId = settingsResp.activeRelayId || "";
-              const profile = settingsResp.relayProfiles.find(p => p.id === activeId) || settingsResp.relayProfiles[0];
+              const profile = settingsResp.relayProfiles.find(p => p.id === activeId);
               if (profile && profile.modelList) {
                 const extraModels = profile.modelList.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
                 if (extraModels.length > 0) {
@@ -4668,7 +6154,7 @@
         return codexModelCatalog;
       })
       .catch((error) => {
-        codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
         codexModelCatalogLoadedAt = Date.now();
         return codexModelCatalog;
       })
@@ -4678,22 +6164,58 @@
     return codexModelCatalogPromise;
   }
 
-  function modelReasoningEfforts() {
-    return ["minimal", "low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+  function codexPlusModelMetadata(modelName) {
+    const metadata = codexModelCatalog.modelMetadata || codexModelCatalog.model_metadata;
+    const normalizedName = codexServiceTierModelFromValue(modelName);
+    const exact = metadata && typeof metadata === "object" ? metadata[normalizedName] : null;
+    const matchedKey = !exact && metadata && typeof metadata === "object"
+      ? Object.keys(metadata).find((key) => key.toLowerCase() === normalizedName.toLowerCase())
+      : null;
+    const value = exact || (matchedKey ? metadata[matchedKey] : null);
+    return value && typeof value === "object" ? value : null;
+  }
+
+  function modelReasoningEfforts(modelName) {
+    const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
+    if (Array.isArray(supported) && supported.length > 0) {
+      return supported.map((entry) => ({ ...entry }));
+    }
+    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+  }
+
+  function applyCodexPlusModelMetadata(descriptor, modelName) {
+    const metadata = codexPlusModelMetadata(modelName);
+    if (!descriptor || !metadata) return false;
+    let changed = false;
+    for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
+      if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
+        descriptor[key] = metadata[key];
+        changed = true;
+      }
+    }
+    if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
+      const nextEfforts = modelReasoningEfforts(modelName);
+      if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
+        descriptor.supportedReasoningEfforts = nextEfforts;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   function codexPlusModelDescriptor(modelName) {
+    const metadata = codexPlusModelMetadata(modelName);
     return {
       model: modelName,
       id: modelName,
       slug: modelName,
       name: modelName,
-      displayName: modelName,
-      description: codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
+      displayName: metadata?.displayName || modelName,
+      description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
       hidden: false,
       isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,
-      defaultReasoningEffort: "medium",
-      supportedReasoningEfforts: modelReasoningEfforts(),
+      defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
+      supportedReasoningEfforts: modelReasoningEfforts(modelName),
     };
   }
 
@@ -4728,9 +6250,12 @@
     let changed = false;
     const existing = new Map(models.map((item) => [item.model, item]));
     models.forEach((item) => {
-      if (customModels.includes(item.model) && item.hidden !== false) {
-        item.hidden = false;
-        changed = true;
+      if (customModels.includes(item.model)) {
+        if (item.hidden !== false) {
+          item.hidden = false;
+          changed = true;
+        }
+        if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
       }
     });
     customModels.forEach((modelName) => {
@@ -4807,13 +6332,37 @@
     return changed;
   }
 
+  function modelJsonResponseLooksPatchable(payload) {
+    if (!payload || typeof payload !== "object") return false;
+    const descriptorArrays = [
+      payload.models,
+      payload.data,
+      payload.result,
+      payload.pages?.[0]?.data,
+      payload.result?.data,
+      payload.result?.models,
+      payload.message?.result?.data,
+      payload.message?.result?.models,
+    ];
+    if (descriptorArrays.some((value) => modelArrayLooksPatchable(value))) return true;
+    const hasModelContainerSignal = "defaultModel" in payload
+      || "default_model" in payload
+      || "availableModels" in payload
+      || "available_models" in payload
+      || "hiddenModels" in payload
+      || "hidden_models" in payload
+      || "modelMetadata" in payload
+      || "model_metadata" in payload;
+    return hasModelContainerSignal && Array.isArray(payload.models)
+      && payload.models.every((value) => typeof value === "string");
+  }
+
   async function patchModelJsonResponse(payload) {
     if (!codexPlusModelUnlockEnabled()) return payload;
     if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-    if (!payload || typeof payload !== "object") return payload;
+    if (!modelJsonResponseLooksPatchable(payload)) return payload;
     try {
       patchModelContainer(payload);
-      patchObjectGraphForModels(payload, new WeakSet(), 0);
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
       window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
@@ -4875,7 +6424,7 @@
         const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
         client.getDynamicConfig = (name, options) => {
           const result = originalGetDynamicConfig(name, options);
-          return patchStatsigModelDynamicConfig(result);
+          return String(name) === "107580212" ? patchStatsigModelDynamicConfig(result) : result;
         };
         client.__codexPlusModelWhitelistPatched = true;
       }
@@ -4886,111 +6435,29 @@
     });
   }
 
-  function patchStatsigClientInstance(obj) {
-    if (obj && typeof obj.getDynamicConfig === "function" && !obj.__codexPlusModelWhitelistPatched) {
-      const originalGetDynamicConfig = obj.getDynamicConfig.bind(obj);
-      obj.getDynamicConfig = (name, options) => {
-        const result = originalGetDynamicConfig(name, options);
-        return patchStatsigModelDynamicConfig(result);
-      };
-      obj.__codexPlusModelWhitelistPatched = true;
-      try {
-        patchStatsigModelDynamicConfig(obj.getDynamicConfig("107580212", { disableExposureLog: true }));
-      } catch {
-      }
-      return true;
-    }
-    return false;
-  }
-
-  function patchObjectGraphForModels(root, visited, depth = 0) {
-    if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
-    visited.add(root);
-    let changed = patchModelContainer(root);
-    if (patchStatsigClientInstance(root)) changed = true;
-    if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
-    for (const key of Object.keys(root)) {
-      if (key === "ownerDocument" || key === "parentElement" || key === "parentNode" || key === "children" || key === "childNodes") continue;
-      let value;
-      try {
-        value = root[key];
-      } catch {
-        continue;
-      }
-      if (value && typeof value === "object" && patchObjectGraphForModels(value, visited, depth + 1)) changed = true;
-    }
-    return changed;
-  }
-
-  function reactFiberKeys(element) {
-    return Object.keys(element).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
-  }
-
-  function isWorkspaceChromeNode(node) {
-    if (!node || node.nodeType !== 1) return false;
-    if (node.closest?.('[data-app-action-sidebar-section-heading="Chats"], [data-app-action-sidebar-section-heading="Projects"], [data-app-action-sidebar-thread-id], [data-app-action-sidebar-project-row], [data-app-action-sidebar-project-id]')) {
-      return false;
-    }
-    return !!node.closest?.("main aside");
-  }
-
-  function patchReactModelStateNodes() {
-    const selector = "[role='menu'], [role='dialog'], [role='listbox'], [data-radix-popper-content-wrapper]";
-    return [document.body, ...document.querySelectorAll(selector)].filter((node) => node && !isWorkspaceChromeNode(node));
-  }
-
-  function shouldScheduleReactModelStatePatch(mutations) {
-    if (!codexPlusModelUnlockEnabled() || !codexPlusModelNames().length) return false;
-    if (!mutations) return false;
-    const selector = "[role='menu'], [role='dialog'], [role='listbox'], [data-radix-popper-content-wrapper]";
-    return mutations.some((mutation) => [...mutation.addedNodes].some((node) => {
-      if (node.nodeType !== 1 || isWorkspaceChromeNode(node)) return false;
-      return !!node.matches?.(selector) || !!node.querySelector?.(selector);
-    }));
-  }
-
-  function schedulePatchReactModelState() {
-    if (window.__codexPlusReactModelStatePatchPending) return;
-    window.__codexPlusReactModelStatePatchPending = true;
-    clearTimeout(window.__codexPlusReactModelStatePatchTimer);
-    window.__codexPlusReactModelStatePatchTimer = setTimeout(() => {
-      window.__codexPlusReactModelStatePatchPending = false;
-      window.__codexPlusReactModelStatePatchTimer = null;
-      patchReactModelState();
-    }, 120);
-  }
-
-  function patchReactModelState() {
-    const visited = new WeakSet();
-    const nodes = patchReactModelStateNodes();
-    let changed = false;
-    for (const node of nodes.slice(0, 220)) {
-      for (const key of reactFiberKeys(node)) {
-        if (patchObjectGraphForModels(node[key], visited)) changed = true;
-      }
-    }
-    return changed;
-  }
-
   function patchAppServerModelMessages() {
     if (window.__codexPlusModelMessagePatchInstalled) return;
     window.__codexPlusModelMessagePatchInstalled = true;
-    const originalDispatchEvent = window.dispatchEvent;
-    window.dispatchEvent = function patchedCodexPlusDispatchEvent(event) {
+    window.addEventListener("codex-message-from-view", (event) => {
       try {
         const detail = event?.detail;
         const request = detail?.request;
-        if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {
+        if (detail?.type === "mcp-request" && request?.method === "model/list") {
           request.params = { ...(request.params || {}), includeHidden: true };
-          if (request.id != null) codexPlusModelListRequestIds.add(String(request.id));
+          if (request.id != null) {
+            const requestId = String(request.id);
+            codexPlusModelListRequestIds.add(requestId);
+            if (codexPlusModelListRequestIds.size > 64) {
+              codexPlusModelListRequestIds.delete(codexPlusModelListRequestIds.values().next().value);
+            }
+            window.setTimeout(() => codexPlusModelListRequestIds.delete(requestId), 30_000);
+          }
         }
-        if (event?.type === "message") patchMcpModelResponseData(event.data);
       } catch (error) {
         window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
         window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
       }
-      return originalDispatchEvent.call(this, event);
-    };
+    }, true);
 
     window.addEventListener("message", (event) => {
       try {
@@ -5003,12 +6470,16 @@
   }
 
   function patchMcpModelResponseData(data) {
+    if (!codexPlusModelUnlockEnabled()) return false;
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;
     const requestId = message?.id != null ? String(message.id) : "";
-    if (codexPlusModelListRequestIds.size > 0 && !codexPlusModelListRequestIds.has(requestId)) return false;
+    if (codexPlusModelListRequestIds.size === 0 || !codexPlusModelListRequestIds.has(requestId)) return false;
     codexPlusModelListRequestIds.delete(requestId);
-    return patchModelContainer(data) || patchModelContainer(message) || patchModelContainer(message?.result) || patchModelContainer(message?.result?.data);
+    let changed = false;
+    if (patchModelArray(message?.result?.data, true)) changed = true;
+    if (patchModelArray(message?.result?.models, true)) changed = true;
+    return changed;
   }
 
   function appServerModelRequestMethod(method, params) {
@@ -5028,8 +6499,6 @@
       if (Array.isArray(result)) patchModelArray(result, true);
       if (Array.isArray(result?.data)) patchModelArray(result.data, true);
       if (Array.isArray(result?.models)) patchModelArray(result.models, true);
-      patchModelContainer(result);
-      patchObjectGraphForModels(result, new WeakSet(), 0);
       sendCodexPlusDiagnostic("model_app_server_result_patched", {
         method,
         modelCount: Array.isArray(result?.data) ? result.data.length : Array.isArray(result?.models) ? result.models.length : Array.isArray(result) ? result.length : null,
@@ -5047,10 +6516,17 @@
     const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
-      const result = await originalSendRequest(method, params, options);
+      const requestMethod = appServerModelRequestMethod(String(method || ""), params);
+      if (codexRemoteSessionThreadStartMethod(requestMethod)
+          && codexRemoteSessionProviderNormalizationEnabled()
+          && !codexRemoteSessionTargetProvider()) {
+        await loadCodexModelCatalog();
+      }
+      const nextParams = applyCodexRemoteSessionProviderOverride(requestMethod, params);
+      const result = await originalSendRequest(method, nextParams, options);
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), params), result);
+      return patchAppServerModelResult(requestMethod, result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
@@ -5059,6 +6535,17 @@
   const appServerModelRequestPatchMaxMisses = 8;
   let appServerModelRequestPatchMissCount = 0;
   let appServerModelRequestPatchDisabled = false;
+  let appServerModelRequestPatchPromise = null;
+  let appServerModelRequestPatchRetryTimer = 0;
+
+  function scheduleAppServerModelRequestPatchRetry() {
+    if (!codexRemoteSessionProviderNormalizationEnabled()) return;
+    if (appServerModelRequestPatchRetryTimer) return;
+    appServerModelRequestPatchRetryTimer = window.setTimeout(() => {
+      appServerModelRequestPatchRetryTimer = 0;
+      installAppServerModelRequestPatch();
+    }, 250);
+  }
 
   function noteAppServerModelRequestPatchMiss(event, detail) {
     appServerModelRequestPatchMissCount += 1;
@@ -5074,6 +6561,10 @@
     if (appServerModelRequestPatchMissCount === 1) {
       sendCodexPlusDiagnostic(event, detail);
     }
+    if (codexRemoteSessionProviderNormalizationEnabled()) {
+      scheduleAppServerModelRequestPatchRetry();
+      return;
+    }
     if (appServerModelRequestPatchMissCount >= appServerModelRequestPatchMaxMisses && !appServerModelRequestPatchDisabled) {
       appServerModelRequestPatchDisabled = true;
       sendCodexPlusDiagnostic("model_app_server_request_patch_skipped", {
@@ -5086,31 +6577,38 @@
   function installAppServerModelRequestPatch() {
     if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion) return;
     if (appServerModelRequestPatchDisabled) return;
+    if (appServerModelRequestPatchPromise) return;
     const patch = async () => {
       try {
-        const module = await loadCodexAppModule("app-server-manager-signals-");
-        const candidates = Object.values(module).filter((value) => value && typeof value === "object");
+        const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
+        if (modules.length === 0) {
+          noteAppServerModelRequestPatchMiss("model_app_server_request_patch_skipped", {
+            reason: "app_server_request_assets_missing",
+          });
+          return;
+        }
         let patchedCount = 0;
         for (const candidate of candidates) {
           if (patchAppServerModelRequestClient(candidate)) patchedCount += 1;
-          if (typeof candidate.sendRequest !== "function" && typeof candidate.get === "function") {
-            try {
-              if (patchAppServerModelRequestClient(candidate.get())) patchedCount += 1;
-            } catch {
-            }
-          }
         }
         if (patchedCount > 0) {
+          clearTimeout(appServerModelRequestPatchRetryTimer);
+          appServerModelRequestPatchRetryTimer = 0;
           appServerModelRequestPatchMissCount = 0;
           window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
           sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
+            moduleCount: modules.length,
             candidateCount: candidates.length,
             patchedCount,
+            sources,
+            discovery,
           });
         } else {
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_not_found", {
-            exportCount: Object.keys(module || {}).length,
+            moduleCount: modules.length,
             candidateCount: candidates.length,
+            sources,
+            discovery,
           });
         }
       } catch (error) {
@@ -5120,28 +6618,32 @@
         });
       }
     };
-    void patch();
+    appServerModelRequestPatchPromise = patch().finally(() => {
+      appServerModelRequestPatchPromise = null;
+    });
+    void appServerModelRequestPatchPromise;
   }
 
   function ensureCodexModelWhitelistInstalls() {
+    if (codexPlusModelUnlockEnabled()
+        || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderNormalizationEnabled())) {
+      installAppServerModelRequestPatch();
+    }
     if (!codexPlusModelUnlockEnabled()) return;
     installModelJsonResponsePatch();
     patchAppServerModelMessages();
-    installAppServerModelRequestPatch();
   }
 
   function runCodexModelWhitelistRefreshPass() {
     if (!codexPlusModelUnlockEnabled() || !codexPlusModelNames().length) return false;
-    let changed = false;
     try {
       patchStatsigModelWhitelist();
-      if (patchReactModelState()) changed = true;
       installAppServerModelRequestPatch();
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
       window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
     }
-    return changed;
+    return false;
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
@@ -5159,26 +6661,13 @@
     tick();
   }
 
-  function patchCodexModelWhitelist() {
-    ensureCodexModelWhitelistInstalls();
-    if (!codexPlusModelNames().length) {
-      loadCodexModelCatalog();
-      return;
-    }
-    runCodexModelWhitelistRefreshPass();
-  }
-
   function refreshCodexModelWhitelistFromScan(mutations) {
     ensureCodexModelWhitelistInstalls();
     if (!codexPlusModelNames().length) {
       loadCodexModelCatalog();
       return;
     }
-    if (shouldScheduleReactModelStatePatch(mutations)) {
-      scheduleCodexModelWhitelistRefresh();
-    } else {
-      runCodexModelWhitelistRefreshPass();
-    }
+    runCodexModelWhitelistRefreshPass();
   }
 
   function threadIdVariants(sessionId) {
@@ -5188,54 +6677,17 @@
     return uniqueValues([id, bareId, `local:${bareId}`]);
   }
 
-  function projectMoveSessionKey(sessionId) {
+  function sessionKey(sessionId) {
     const variants = threadIdVariants(sessionId);
     const bareId = variants.find((id) => !id.startsWith("local:"));
     return bareId || variants[0] || "";
   }
 
   function uuidV7TimestampMs(sessionId) {
-    const id = projectMoveSessionKey(sessionId).replaceAll("-", "");
+    const id = sessionKey(sessionId).replaceAll("-", "");
     if (!/^[0-9a-fA-F]{12}/.test(id)) return 0;
     const timestamp = Number.parseInt(id.slice(0, 12), 16);
     return Number.isFinite(timestamp) ? timestamp : 0;
-  }
-
-  function numericTimestamp(value) {
-    const timestamp = Number(value);
-    return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
-  }
-
-  function timestampValueToMs(value) {
-    const timestamp = numericTimestamp(value);
-    if (!timestamp) return 0;
-    return timestamp < 1000000000000 ? timestamp * 1000 : timestamp;
-  }
-
-  function sortMsForSession(sessionId, preferredValue) {
-    return numericTimestamp(preferredValue) || uuidV7TimestampMs(sessionId);
-  }
-
-  function timestampMsFromPayload(payload) {
-    return numericTimestamp(payload?.updated_at_ms) || timestampValueToMs(payload?.updated_at) || numericTimestamp(payload?.created_at_ms);
-  }
-
-  function relativeTimeLabel(timestampMs, nowMs = Date.now()) {
-    const timestamp = numericTimestamp(timestampMs);
-    if (!timestamp) return "";
-    const elapsedSeconds = Math.max(0, Math.floor((nowMs - timestamp) / 1000));
-    if (elapsedSeconds < 60) return "刚刚";
-    const elapsedMinutes = Math.floor(elapsedSeconds / 60);
-    if (elapsedMinutes < 60) return `${elapsedMinutes} 分`;
-    const elapsedHours = Math.floor(elapsedMinutes / 60);
-    if (elapsedHours < 24) return `${elapsedHours} 小时`;
-    const elapsedDays = Math.floor(elapsedHours / 24);
-    if (elapsedDays < 7) return `${elapsedDays} 天`;
-    const elapsedWeeks = Math.floor(elapsedDays / 7);
-    if (elapsedWeeks < 5) return `${elapsedWeeks} 周`;
-    const elapsedMonths = Math.floor(elapsedDays / 30);
-    if (elapsedMonths < 12) return `${Math.max(1, elapsedMonths)} 月`;
-    return `${Math.floor(elapsedDays / 365)} 年`;
   }
 
   function normalizeWorkspacePath(path) {
@@ -5262,733 +6714,26 @@
     return document.querySelector('[data-app-action-sidebar-section-heading="Projects"]');
   }
 
-  function chatsSection() {
-    return document.querySelector('[data-app-action-sidebar-section-heading="Chats"]');
-  }
-
-  function projectRowListItem(projectRow) {
-    return projectRow.closest?.('[role="listitem"][aria-label]') || projectRow.closest?.('[role="listitem"]') || projectRow;
-  }
-
-  function nativeProjectTargets() {
-    const section = projectsSection();
-    const seen = new Set();
-    const targets = [];
-    Array.from(document.querySelectorAll('[data-app-action-sidebar-project-row]')).forEach((row) => {
-      if (section && !section.contains(row)) return;
-      const path = row.getAttribute("data-app-action-sidebar-project-id") || "";
-      const normalizedPath = normalizeWorkspacePath(path);
-      if (!normalizedPath || seen.has(normalizedPath)) return;
-      const label = row.getAttribute("data-app-action-sidebar-project-label") || row.getAttribute("aria-label") || displayProjectName(path);
-      seen.add(normalizedPath);
-      targets.push({ kind: "project", label: String(label || displayProjectName(path)), description: path, path, normalizedPath, row, listItem: projectRowListItem(row) });
-    });
-    return targets;
-  }
-
-  function serializableProjectTarget(target) {
-    return { kind: target.kind, label: target.label, description: target.description, path: target.path, normalizedPath: target.normalizedPath || normalizeWorkspacePath(target.path) };
-  }
-
-  function projectMoveTargets() {
-    return [
-      { kind: "projectless", label: "普通对话", description: "不属于任何项目", path: "", normalizedPath: "" },
-      ...nativeProjectTargets().map(serializableProjectTarget),
-    ];
-  }
-
-  function readLegacyProjectMoveProjection() {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(legacyProjectMoveOverridesKey) || "{}");
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-      const now = Date.now();
-      const next = {};
-      for (const [key, value] of Object.entries(parsed)) {
-        if (!value || typeof value !== "object" || !value.targetCwd) continue;
-        const sessionId = projectMoveSessionKey(value.sessionId || key);
-        if (!sessionId) continue;
-        next[sessionId] = {
-          sessionId,
-          targetKind: "project",
-          targetCwd: String(value.targetCwd),
-          targetLabel: String(value.targetLabel || displayProjectName(value.targetCwd)),
-          title: String(value.title || ""),
-          sortMs: sortMsForSession(sessionId, value.sortMs || value.updatedAtMs || value.updated_at_ms),
-          sortMsTrusted: false,
-          at: typeof value.at === "number" ? value.at : now,
-        };
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  }
-
-  function readProjectMoveProjection() {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(projectMoveProjectionKey) || "{}");
-      const raw = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-      const merged = { ...readLegacyProjectMoveProjection(), ...raw };
-      const now = Date.now();
-      const projection = {};
-      for (const [key, value] of Object.entries(merged)) {
-        if (!value || typeof value !== "object") continue;
-        const sessionId = projectMoveSessionKey(value.sessionId || key);
-        if (!sessionId) continue;
-        if (typeof value.at === "number" && now - value.at > projectMoveProjectionTtlMs) continue;
-        const targetKind = value.targetKind === "projectless" ? "projectless" : "project";
-        const targetCwd = String(value.targetCwd || value.path || "");
-        if (targetKind === "project" && !targetCwd) continue;
-        projection[sessionId] = {
-          sessionId,
-          targetKind,
-          targetCwd,
-          targetLabel: String(value.targetLabel || value.label || (targetKind === "projectless" ? "普通对话" : displayProjectName(targetCwd))),
-          title: String(value.title || ""),
-          sortMs: sortMsForSession(sessionId, value.sortMs || value.updatedAtMs || value.updated_at_ms),
-          sortMsTrusted: value.sortMsTrusted === true,
-          at: typeof value.at === "number" ? value.at : now,
-        };
-      }
-      return projection;
-    } catch {
-      return readLegacyProjectMoveProjection();
-    }
-  }
-
-  function writeProjectMoveProjection(projection) {
-    try {
-      localStorage.setItem(projectMoveProjectionKey, JSON.stringify(projection || {}));
-      localStorage.removeItem(legacyProjectMoveOverridesKey);
-    } catch (error) {
-      window.__codexProjectMoveProjectionFailures = window.__codexProjectMoveProjectionFailures || [];
-      window.__codexProjectMoveProjectionFailures.push(String(error?.stack || error));
-    }
-  }
-
-  function saveProjectMoveProjection(ref, target, sortMs) {
-    const id = projectMoveSessionKey(ref.session_id);
-    if (!id || !target) return;
-    const projection = readProjectMoveProjection();
-    projection[id] = {
-      sessionId: id,
-      targetKind: target.kind === "projectless" ? "projectless" : "project",
-      targetCwd: target.path || "",
-      targetLabel: target.label || (target.kind === "projectless" ? "普通对话" : displayProjectName(target.path)),
-      title: ref.title || "",
-      sortMs: sortMsForSession(ref.session_id, sortMs || target.sortMs),
-      sortMsTrusted: target.sortMsTrusted === true,
-      at: Date.now(),
-    };
-    writeProjectMoveProjection(projection);
-  }
-
-  function clearProjectMoveProjection(ref) {
-    const projection = readProjectMoveProjection();
-    const keys = threadIdVariants(ref.session_id).map(projectMoveSessionKey).filter(Boolean);
-    let changed = false;
-    keys.forEach((key) => {
-      if (Object.prototype.hasOwnProperty.call(projection, key)) {
-        delete projection[key];
-        changed = true;
-      }
-    });
-    if (changed) writeProjectMoveProjection(projection);
-  }
-
-  function projectionForSessionId(sessionId, projection = readProjectMoveProjection()) {
-    const key = projectMoveSessionKey(sessionId);
-    return key ? projection[key] || null : null;
-  }
-
-  function projectRowFromListItem(projectItem) {
-    if (!projectItem) return null;
-    if (projectItem.matches?.("[data-app-action-sidebar-project-row]")) return projectItem;
-    return projectItem.querySelector?.("[data-app-action-sidebar-project-row]") || null;
-  }
-
-  function targetPath(target) {
-    return target?.path || target?.targetCwd || "";
-  }
-
-  function targetLabel(target) {
-    return target?.label || target?.targetLabel || displayProjectName(targetPath(target));
-  }
-
-  function projectItemMatchesTarget(projectItem, target) {
-    const projectRow = projectRowFromListItem(projectItem);
-    const projectPath = projectRow?.getAttribute?.("data-app-action-sidebar-project-id") || "";
-    if (projectPath && sameWorkspacePath(projectPath, targetPath(target))) return true;
-    const actual = normalizeProjectLabel(projectRow?.getAttribute?.("data-app-action-sidebar-project-label") || projectItem?.getAttribute?.("aria-label"));
-    const labels = uniqueValues([targetLabel(target), displayProjectName(targetPath(target))]).map(normalizeProjectLabel).filter(Boolean);
-    return !!actual && labels.includes(actual);
-  }
-
-  function findProjectListItem(target) {
-    const nativeTarget = nativeProjectTargets().find((project) => sameWorkspacePath(project.path, targetPath(target)));
-    if (nativeTarget?.listItem) return nativeTarget.listItem;
-    const section = projectsSection();
-    if (!section) return null;
-    return Array.from(section.querySelectorAll('[role="listitem"][aria-label]')).find((item) => projectItemMatchesTarget(item, target)) || null;
-  }
-
-  function closestProjectListItem(row) {
-    const item = row.closest?.('[role="listitem"][aria-label]');
-    return item?.closest?.('[data-app-action-sidebar-section-heading="Projects"]') ? item : null;
-  }
-
-  function rowIsInChats(row) {
-    return !!row.closest?.('[data-app-action-sidebar-section-heading="Chats"]');
-  }
-
-  function chatsThreadList() {
-    return chatsSection()?.querySelector?.('[role="list"][aria-label="对话"], [role="list"]') || null;
-  }
-
-  function rowIsUnderTargetProject(row, target) {
-    const item = closestProjectListItem(row);
-    return !!item && projectItemMatchesTarget(item, target);
-  }
-
-  function rowIsUnderTarget(row, target) {
-    return target?.targetKind === "projectless" || target?.kind === "projectless" ? rowIsInChats(row) : rowIsUnderTargetProject(row, target);
-  }
-
-  function rowListItem(row) {
-    return row.closest?.('[role="listitem"]') || row;
-  }
-
-  function rowContentRoot(row) {
-    return Array.from(row?.children || []).find((child) => String(child.className || "").includes("h-full w-full items-center")) || null;
-  }
-
-  function normalizedText(node) {
-    return String(node?.textContent || "").replace(/\s+/g, " ").trim();
-  }
-
-  function classNameText(node) {
-    return String(node?.className || "");
-  }
-
-  function isRelativeTimeText(text) {
-    const value = String(text || "").replace(/\s+/g, " ").trim();
-    return /^(刚刚|just now|\d+\s*(秒|秒钟|分|分钟|小时|天|日|周|星期|个月|月|年|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|mo|mos|month|months|y|yr|yrs|year|years))$/i.test(value);
-  }
-
-  function nodeIsThreadTitle(row, node) {
-    return Array.from(row?.querySelectorAll?.('[data-thread-title], .truncate.select-none, .truncate.text-base') || [])
-      .some((titleNode) => titleNode === node || titleNode.contains(node));
-  }
-
-  function closestTimeWrapper(row, node) {
-    const root = rowContentRoot(row) || row;
-    let current = node?.parentElement || null;
-    while (current && current !== root && current !== row) {
-      const className = classNameText(current);
-      if (current.dataset?.codexProjectMoveTimeWrapper === "true" || (className.includes("ml-[3px]") && className.includes("min-w-[26px]"))) return current;
-      current = current.parentElement;
-    }
-    return null;
-  }
-
-  function nodeInsideStatusIcon(row, node) {
-    const stop = closestTimeWrapper(row, node) || rowContentRoot(row) || row;
-    let current = node || null;
-    while (current && current !== stop && current !== row) {
-      const className = classNameText(current);
-      if (className.includes("animate-spin")) return true;
-      if (className.includes("size-5") && className.includes("shrink-0")) return true;
-      if (className.includes("contain-paint") && className.includes("contain-layout")) return true;
-      current = current.parentElement;
-    }
-    return false;
-  }
-
-  function cleanupManagedStatusIconTimeNodes(row) {
-    Array.from(row?.querySelectorAll?.('[data-codex-project-move-time="true"]') || []).forEach((node) => {
-      if (!nodeInsideStatusIcon(row, node)) return;
-      const text = normalizedText(node);
-      delete node.dataset.codexProjectMoveTime;
-      delete node.dataset.codexProjectMoveTimeMs;
-      if (node.children.length === 0 && isRelativeTimeText(text)) node.textContent = "";
-    });
-  }
-
-  function nodeLooksLikeTimeLabel(row, node) {
-    if (nodeInsideStatusIcon(row, node)) return false;
-    if (node?.dataset?.codexProjectMoveTime === "true") return true;
-    if (node.children.length > 0) return false;
-    const text = normalizedText(node);
-    const className = classNameText(node);
-    if ((className.includes("tabular-nums") || className.includes("text-token-description-foreground")) && text.length <= 24) return true;
-    if (!isRelativeTimeText(text)) return false;
-    const rowRect = row?.getBoundingClientRect?.();
-    const nodeRect = node?.getBoundingClientRect?.();
-    if (!rowRect || !nodeRect || rowRect.width <= 0 || nodeRect.width <= 0) return false;
-    return nodeRect.left >= rowRect.left + rowRect.width * 0.45 || nodeRect.right >= rowRect.right - 96;
-  }
-
-  function rowTimeLabelCandidates(row) {
-    cleanupManagedStatusIconTimeNodes(row);
-    const root = rowContentRoot(row) || row;
-    const raw = Array.from(root?.querySelectorAll?.("div, span, time, small") || []).filter((node) => {
-      if (nodeIsThreadTitle(row, node)) return false;
-      return nodeLooksLikeTimeLabel(row, node);
-    });
-    return raw.filter((node) => !raw.some((other) => other !== node && node.contains(other)));
-  }
-
-  function rowTimeLabelNode(row) {
-    const candidates = rowTimeLabelCandidates(row);
-    return candidates.find((node) => node.dataset?.codexProjectMoveTime !== "true" && !node.closest?.('[data-codex-project-move-time-wrapper="true"]')) || candidates[0] || null;
-  }
-
-  function removeTimeLabelNode(row, node) {
-    if (!node || !row?.contains?.(node)) return;
-    const wrapper = node.closest?.('[data-codex-project-move-time-wrapper="true"]') || closestTimeWrapper(row, node);
-    if (wrapper && wrapper !== row && row.contains(wrapper)) {
-      wrapper.remove();
-      return;
-    }
-    node.remove();
-  }
-
-  function cleanupRowTimeLabels(row, keepNode) {
-    if (!keepNode) return;
-    rowTimeLabelCandidates(row).forEach((node) => {
-      if (node === keepNode) return;
-      if (node.dataset?.codexProjectMoveTime === "true" || node.closest?.('[data-codex-project-move-time-wrapper="true"]')) removeTimeLabelNode(row, node);
-    });
-  }
-
-  function ensureRowTimeLabelNode(row) {
-    const existing = rowTimeLabelNode(row);
-    if (existing) {
-      cleanupRowTimeLabels(row, existing);
-      return existing;
-    }
-    const root = rowContentRoot(row);
-    if (!root) return null;
-    const wrapper = document.createElement("div");
-    wrapper.className = "ml-[3px] flex items-center justify-end gap-1 min-w-[26px]";
-    wrapper.dataset.codexProjectMoveTimeWrapper = "true";
-    const inner = document.createElement("div");
-    const label = document.createElement("div");
-    label.className = "text-token-description-foreground text-sm leading-4 empty:hidden tabular-nums overflow-visible truncate text-right group-focus-within:opacity-0 group-hover:opacity-0";
-    label.dataset.codexProjectMoveTime = "true";
-    inner.appendChild(label);
-    wrapper.appendChild(inner);
-    root.appendChild(wrapper);
-    return label;
-  }
-
-  function updateRowTimeLabel(row, sortMs) {
-    const label = ensureRowTimeLabelNode(row);
-    if (!label) return;
-    const timestamp = numericTimestamp(sortMs);
-    const text = relativeTimeLabel(timestamp);
-    label.dataset.codexProjectMoveTime = "true";
-    label.dataset.codexProjectMoveTimeMs = String(timestamp || 0);
-    if (text && label.textContent !== text) label.textContent = text;
-    cleanupRowTimeLabels(row, label);
-  }
-
-  function rowProjectionKind(row) {
-    return row?.dataset?.codexProjectMoveTargetKind || rowListItem(row)?.dataset?.codexProjectMoveTargetKind || "";
-  }
-
-  function rowSortMs(row, ref = sessionRefFromRow(row), target = null) {
-    return sortMsForSession(ref.session_id, target?.sortMs || row?.dataset?.codexProjectMoveSortMs || rowListItem(row)?.dataset?.codexProjectMoveSortMs);
-  }
-
-  function threadRowFromListItem(item) {
-    if (!item) return null;
-    if (item.matches?.("[data-app-action-sidebar-thread-id]")) return item;
-    return item.querySelector?.("[data-app-action-sidebar-thread-id]") || null;
-  }
-
-  function rowPinned(row) {
-    return row?.getAttribute?.("data-app-action-sidebar-thread-pinned") === "true" || rowListItem(row)?.getAttribute?.("data-app-action-sidebar-thread-pinned") === "true";
-  }
-
-  function insertRowItemByTime(list, item, row, target) {
-    const ref = sessionRefFromRow(row);
-    const sortMs = rowSortMs(row, ref, target);
-    item.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-    row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-    if (target?.sortMsTrusted) updateRowTimeLabel(row, sortMs);
-    const pinned = rowPinned(row);
-    const sessionKey = projectMoveSessionKey(ref.session_id);
-    const existingItems = Array.from(list.children).filter((child) => child !== item);
-    let firstNonThreadItem = null;
-    for (const child of existingItems) {
-      const childRow = threadRowFromListItem(child);
-      if (!childRow) {
-        firstNonThreadItem = firstNonThreadItem || child;
-        continue;
-      }
-      const childPinned = rowPinned(childRow);
-      if (childPinned && !pinned) continue;
-      if (!childPinned && pinned) {
-        list.insertBefore(item, child);
-        return;
-      }
-      const childRef = sessionRefFromRow(childRow);
-      const childSortMs = rowSortMs(childRow, childRef);
-      const childKey = projectMoveSessionKey(childRef.session_id);
-      if (sortMs > childSortMs || (sortMs === childSortMs && sessionKey > childKey)) {
-        list.insertBefore(item, child);
-        return;
-      }
-    }
-    if (firstNonThreadItem) {
-      list.insertBefore(item, firstNonThreadItem);
-      return;
-    }
-    list.appendChild(item);
-  }
-
-  function projectMoveInjectedList(projectItem) {
-    let list = projectItem.querySelector('[data-codex-project-move-injected-list="true"]');
-    if (!list) {
-      const body = Array.from(projectItem.children).find((child) => child.classList?.contains("overflow-hidden")) || projectItem;
-      list = document.createElement("div");
-      list.setAttribute("role", "list");
-      list.setAttribute("data-codex-project-move-injected-list", "true");
-      list.className = "flex flex-col";
-      body.appendChild(list);
-    }
-    return list;
-  }
-
-  function projectThreadList(projectItem, target) {
-    const targetCwd = targetPath(target);
-    const projectLists = Array.from(projectItem.querySelectorAll("[data-app-action-sidebar-project-list-id]"));
-    return projectLists.find((list) => sameWorkspacePath(list.getAttribute("data-app-action-sidebar-project-list-id"), targetCwd))
-      || projectLists[0]
-      || projectMoveInjectedList(projectItem);
-  }
-
-  function projectEmptyStateNodes(projectItem) {
-    const emptyLabels = new Set(["暂无对话", "No conversations"]);
-    return Array.from(projectItem.querySelectorAll("div, span")).filter((node) => {
-      if (node.classList?.contains("overflow-hidden")) return false;
-      if (node.closest('[data-app-action-sidebar-thread-id], [data-codex-project-move-injected-list="true"]')) return false;
-      return emptyLabels.has(normalizeProjectLabel(node.textContent));
-    });
-  }
-
-  function setProjectEmptyStateHidden(projectItem, hidden) {
-    projectEmptyStateNodes(projectItem).forEach((node) => {
-      if (hidden) {
-        node.dataset.codexProjectMoveEmptyHidden = "true";
-        node.classList.add("codex-project-move-hidden");
-      } else if (node.dataset.codexProjectMoveEmptyHidden === "true") {
-        delete node.dataset.codexProjectMoveEmptyHidden;
-        node.classList.remove("codex-project-move-hidden");
-      }
-    });
-  }
-
-  function updateProjectMoveEmptyStates() {
-    document.querySelectorAll('[data-codex-project-move-injected-list="true"]').forEach((list) => {
-      const projectItem = list.closest('[role="listitem"][aria-label]');
-      const hasRows = Array.from(list.children).some((child) => child.querySelector?.("[data-app-action-sidebar-thread-id]") || child.matches?.("[data-app-action-sidebar-thread-id]"));
-      if (!hasRows) list.remove();
-      if (projectItem) setProjectEmptyStateHidden(projectItem, hasRows);
-    });
-    document.querySelectorAll('[data-codex-project-move-empty-hidden="true"]').forEach((node) => {
-      const projectItem = node.closest('[role="listitem"][aria-label]');
-      const list = projectItem?.querySelector?.('[data-codex-project-move-injected-list="true"]');
-      if (!list || list.children.length === 0) {
-        delete node.dataset.codexProjectMoveEmptyHidden;
-        node.classList.remove("codex-project-move-hidden");
-      }
-    });
-  }
-
-  function moveRowToProjectList(row, target) {
-    const projectItem = findProjectListItem(target);
-    if (!projectItem) return false;
-    const list = projectThreadList(projectItem, target);
-    const item = rowListItem(row);
-    if (!list) return false;
-    insertRowItemByTime(list, item, row, target);
-    cachedSessionRowsAt = 0;
-    item.dataset.codexProjectMoveTargetKind = "project";
-    item.dataset.codexProjectMoveTargetCwd = targetPath(target);
-    row.dataset.codexProjectMoveTargetKind = "project";
-    row.dataset.codexProjectMoveTargetCwd = targetPath(target);
-    setProjectEmptyStateHidden(projectItem, true);
-    return true;
-  }
-
-  function moveRowToChats(row, target = null) {
-    const list = chatsThreadList();
-    if (!list) return false;
-    const item = rowListItem(row);
-    insertRowItemByTime(list, item, row, target);
-    cachedSessionRowsAt = 0;
-    item.dataset.codexProjectMoveTargetKind = "projectless";
-    row.dataset.codexProjectMoveTargetKind = "projectless";
-    delete item.dataset.codexProjectMoveTargetCwd;
-    delete row.dataset.codexProjectMoveTargetCwd;
-    updateProjectMoveEmptyStates();
-    return true;
-  }
-
-  function applyProjectMoveProjection() {
-    if (!codexPlusSettings().projectMove) return;
-    const projection = readProjectMoveProjection();
-    const targetRowsById = new Map();
-    const settledRefs = [];
-    const now = Date.now();
-    const rows = sessionRows(true);
-    rows.forEach((row) => {
-      const ref = sessionRefFromRow(row);
-      const target = projectionForSessionId(ref.session_id, projection);
-      if (target && rowIsUnderTarget(row, target)) {
-        const rowId = projectMoveSessionKey(ref.session_id);
-        const hadProjectionKind = !!rowProjectionKind(row);
-        const existingRow = targetRowsById.get(rowId);
-        if (existingRow && existingRow !== row) {
-          const existingIsProjection = !!rowProjectionKind(existingRow);
-          const currentIsProjection = !!rowProjectionKind(row);
-          const rowToRemove = existingIsProjection && !currentIsProjection ? existingRow : row;
-          rowListItem(rowToRemove).remove();
-          if (rowToRemove === existingRow) targetRowsById.set(rowId, row);
-          if (rowToRemove === row) return;
-        } else {
-          targetRowsById.set(rowId, row);
-        }
-        if (!hadProjectionKind && typeof target.at === "number" && now - target.at > projectMoveProjectionSettleMs) settledRefs.push(ref);
-        const moved = target.targetKind === "projectless" ? moveRowToChats(row, target) : moveRowToProjectList(row, target);
-        if (moved) targetRowsById.set(rowId, row);
-        const projectItem = closestProjectListItem(row);
-        if (projectItem) setProjectEmptyStateHidden(projectItem, true);
-      }
-    });
-    rows.forEach((row) => {
-      const ref = sessionRefFromRow(row);
-      const rowId = projectMoveSessionKey(ref.session_id);
-      const target = projectionForSessionId(ref.session_id, projection);
-      if (!target) {
-        const item = rowListItem(row);
-        delete row.dataset.codexProjectMoveTargetKind;
-        delete row.dataset.codexProjectMoveTargetCwd;
-        delete item.dataset.codexProjectMoveTargetKind;
-        delete item.dataset.codexProjectMoveTargetCwd;
-        return;
-      }
-      if (rowIsUnderTarget(row, target)) return;
-      if (targetRowsById.has(rowId)) {
-        rowListItem(row).remove();
-        return;
-      }
-      const moved = target.targetKind === "projectless" ? moveRowToChats(row, target) : moveRowToProjectList(row, target);
-      if (moved) targetRowsById.set(rowId, row);
-    });
-    settledRefs.forEach(clearProjectMoveProjection);
-    updateProjectMoveEmptyStates();
-  }
-
-  function scheduleProjectMoveProjection() {
-    if (!codexPlusSettings().projectMove || window.__codexProjectMoveProjectionTimer) return;
-    window.__codexProjectMoveProjectionTimer = setTimeout(() => {
-      if (window.__codexProjectMoveRuntimeId !== codexProjectMoveRuntimeId) return;
-      window.__codexProjectMoveProjectionTimer = null;
-      applyProjectMoveProjection();
-    }, 80);
-  }
-
   async function refreshRecentConversationsForHost() {
     try {
-      const signals = await import("./assets/app-server-manager-signals-C1h8B-R-.js");
-      if (typeof signals.rn === "function") await signals.rn("refresh-recent-conversations-for-host", { hostId: "local", sortKey: "updated_at" });
-    } catch (error) {
-      window.__codexProjectMoveRefreshFailures = window.__codexProjectMoveRefreshFailures || [];
-      window.__codexProjectMoveRefreshFailures.push(String(error?.stack || error));
-    }
-  }
-
-  function refreshAfterProjectMove() {
-    const refreshVisibleSidebar = () => {
-      applyProjectMoveProjection();
-      scheduleChatsSortCorrection(0);
-    };
-    refreshVisibleSidebar();
-    refreshRecentConversationsForHost().finally(() => {
-      projectMoveRefreshDelaysMs.forEach((delay) => setTimeout(refreshVisibleSidebar, delay));
-    });
-  }
-
-  function visibleChatsRows() {
-    const list = chatsThreadList();
-    if (!list) return [];
-    return Array.from(list.children).map(threadRowFromListItem).filter(Boolean).filter((row) => rowIsInChats(row));
-  }
-
-  function chatsSortNeedsCorrection(rows) {
-    let previousPinned = true;
-    let previousSortMs = Infinity;
-    let previousKey = "\uffff";
-    for (const row of rows) {
-      const pinned = rowPinned(row);
-      const ref = sessionRefFromRow(row);
-      const sortMs = rowSortMs(row, ref);
-      const key = projectMoveSessionKey(ref.session_id);
-      if (previousPinned && !pinned) {
-        previousPinned = false;
-        previousSortMs = sortMs;
-        previousKey = key;
-        continue;
-      }
-      if (!previousPinned && pinned) return true;
-      if (sortMs > previousSortMs || (sortMs === previousSortMs && key > previousKey)) return true;
-      previousSortMs = sortMs;
-      previousKey = key;
-    }
-    return false;
-  }
-
-  function reorderChatsRows(rows) {
-    const list = chatsThreadList();
-    if (!list || rows.length < 2) return;
-    const rowItems = new Set(rows.map(rowListItem));
-    const firstNonThreadItem = Array.from(list.children).find((child) => !rowItems.has(child) && !threadRowFromListItem(child));
-    const orderedRows = [...rows].sort((left, right) => {
-      const leftPinned = rowPinned(left);
-      const rightPinned = rowPinned(right);
-      if (leftPinned !== rightPinned) return leftPinned ? -1 : 1;
-      const leftRef = sessionRefFromRow(left);
-      const rightRef = sessionRefFromRow(right);
-      const leftSortMs = rowSortMs(left, leftRef);
-      const rightSortMs = rowSortMs(right, rightRef);
-      if (leftSortMs !== rightSortMs) return rightSortMs - leftSortMs;
-      return projectMoveSessionKey(rightRef.session_id).localeCompare(projectMoveSessionKey(leftRef.session_id));
-    });
-    orderedRows.forEach((row) => list.insertBefore(rowListItem(row), firstNonThreadItem || null));
-    cachedSessionRowsAt = 0;
-  }
-
-  async function applyChatsSortCorrection() {
-    if (!codexPlusSettings().projectMove || chatsSortInFlight) return;
-    const rows = visibleChatsRows();
-    if (rows.length < 2) return;
-    const refs = rows.map(sessionRefFromRow).filter((ref) => ref.session_id);
-    const signature = refs.map((ref) => projectMoveSessionKey(ref.session_id)).join("|");
-    const allRowsHaveSortMs = rows.every((row) => numericTimestamp(row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs));
-    const shouldRefreshSortKeys = signature !== chatsSortSignature || !allRowsHaveSortMs || Date.now() - chatsSortLastFetchAt > chatsSortDbRefreshIntervalMs;
-    if (!shouldRefreshSortKeys && !chatsSortNeedsCorrection(rows)) return;
-    chatsSortInFlight = true;
-    try {
-      if (shouldRefreshSortKeys) {
-        const result = await postJson("/thread-sort-keys", { sessions: refs }).catch(() => ({ status: "failed", sort_keys: [] }));
-        chatsSortLastFetchAt = Date.now();
-        const byId = new Map();
-        if (result?.status === "ok" && Array.isArray(result?.sort_keys)) {
-          result.sort_keys.forEach((item) => {
-            const key = projectMoveSessionKey(String(item?.session_id || ""));
-            if (key) byId.set(key, item);
-          });
+      const signals = await loadOptionalCodexAppModule("app-server-manager-signals-");
+      const sendRequest = Object.values(signals || {}).find((candidate) => {
+        if (typeof candidate !== "function") return false;
+        try {
+          const source = Function.prototype.toString.call(candidate).replace(/\s+/g, "");
+          return /^function[$\w]+\(e,t\)\{return[$\w]+\.sendRequest\(e,t\)\}$/.test(source);
+        } catch {
+          return false;
         }
-        rows.forEach((row) => {
-          const ref = sessionRefFromRow(row);
-          const payload = byId.get(projectMoveSessionKey(ref.session_id));
-          const trustedSortMs = timestampMsFromPayload(payload);
-          const sortMs = trustedSortMs || sortMsForSession(ref.session_id, row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs);
-          row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-          rowListItem(row).dataset.codexProjectMoveSortMs = String(sortMs || 0);
-          if (trustedSortMs) updateRowTimeLabel(row, trustedSortMs);
-        });
-      }
-      if (chatsSortNeedsCorrection(rows)) reorderChatsRows(rows);
-      chatsSortSignature = visibleChatsRows().map((row) => projectMoveSessionKey(sessionRefFromRow(row).session_id)).join("|");
-    } finally {
-      chatsSortInFlight = false;
-    }
-  }
-
-  function scheduleChatsSortCorrection(delay = chatsSortRefreshIntervalMs) {
-    if (!codexPlusSettings().projectMove || window.__codexProjectMoveChatsSortTimer) return;
-    window.__codexProjectMoveChatsSortTimer = setTimeout(() => {
-      if (window.__codexProjectMoveRuntimeId !== codexProjectMoveRuntimeId) return;
-      window.__codexProjectMoveChatsSortTimer = null;
-      applyChatsSortCorrection().catch((error) => {
-        window.__codexProjectMoveSortFailures = window.__codexProjectMoveSortFailures || [];
-        window.__codexProjectMoveSortFailures.push(String(error?.stack || error));
-      }).finally(() => {
-        if (codexPlusSettings().projectMove) scheduleChatsSortCorrection();
       });
-    }, delay);
-  }
-
-  async function setProjectlessThreadIds(ref, mode) {
-    const variants = threadIdVariants(ref.session_id);
-    if (variants.length === 0) throw new Error("未找到会话 ID");
-    const existingIds = await getCodexGlobalState("projectless-thread-ids").catch(() => []);
-    const ids = Array.isArray(existingIds) ? existingIds : [];
-    const variantSet = new Set(variants);
-    const nextIds = mode === "add" ? uniqueValues([...ids, ...variants]) : ids.filter((id) => !variantSet.has(id));
-    if (nextIds.length !== ids.length || nextIds.some((id, index) => id !== ids[index])) await setCodexGlobalState("projectless-thread-ids", nextIds);
-  }
-
-  async function clearThreadWorkspaceHints(ref) {
-    const variants = threadIdVariants(ref.session_id);
-    if (variants.length === 0) return;
-    const hints = objectGlobalState(await getCodexGlobalState("thread-workspace-root-hints").catch(() => ({})));
-    const hintKeys = variants.filter((id) => Object.prototype.hasOwnProperty.call(hints, id));
-    if (hintKeys.length > 0) {
-      hintKeys.forEach((id) => delete hints[id]);
-      await setCodexGlobalState("thread-workspace-root-hints", hints);
+      if (typeof sendRequest !== "function") return false;
+      await sendRequest("refresh-recent-conversations-for-host", { hostId: "local", sortKey: "updated_at" });
+      return true;
+    } catch (error) {
+      window.__codexRecentConversationRefreshFailures = window.__codexRecentConversationRefreshFailures || [];
+      window.__codexRecentConversationRefreshFailures.push(String(error?.stack || error));
+      return false;
     }
-  }
-
-  async function clearThreadWritableRoots(ref) {
-    const variants = threadIdVariants(ref.session_id);
-    if (variants.length === 0) return;
-    const roots = objectGlobalState(await getCodexGlobalState("thread-writable-roots").catch(() => ({})));
-    const rootKeys = variants.filter((id) => Object.prototype.hasOwnProperty.call(roots, id));
-    if (rootKeys.length > 0) {
-      rootKeys.forEach((id) => delete roots[id]);
-      await setCodexGlobalState("thread-writable-roots", roots);
-    }
-  }
-
-  async function clearThreadProjectlessOutputDirectories(ref) {
-    const variants = threadIdVariants(ref.session_id);
-    if (variants.length === 0) return;
-    const dirs = objectGlobalState(await getCodexGlobalState("thread-projectless-output-directories").catch(() => ({})));
-    const dirKeys = variants.filter((id) => Object.prototype.hasOwnProperty.call(dirs, id));
-    if (dirKeys.length > 0) {
-      dirKeys.forEach((id) => delete dirs[id]);
-      await setCodexGlobalState("thread-projectless-output-directories", dirs);
-    }
-  }
-
-  async function moveSessionToProjectless(ref) {
-    if (!ref.session_id) throw new Error("未找到会话 ID");
-    await setProjectlessThreadIds(ref, "add");
-    await clearThreadWorkspaceHints(ref);
-    await clearThreadWritableRoots(ref);
-    await clearThreadProjectlessOutputDirectories(ref);
-    const sortKey = await postJson("/thread-sort-key", ref).catch(() => ({}));
-    return { status: "moved", session_id: ref.session_id, updated_at: sortKey?.updated_at, updated_at_ms: sortKey?.updated_at_ms, created_at_ms: sortKey?.created_at_ms };
-  }
-
-  function isNativeProjectTarget(target) {
-    return target?.kind === "project" && nativeProjectTargets().some((project) => sameWorkspacePath(project.path, target.path));
-  }
-
-  async function moveSessionToProject(ref, target) {
-    if (!ref.session_id) throw new Error("未找到会话 ID");
-    if (!target?.path) throw new Error("目标项目路径为空");
-    if (!isNativeProjectTarget(target)) throw new Error("目标项目不在 Codex 项目列表中");
-    const result = await postJson("/move-thread-workspace", { ...ref, target_cwd: target.path });
-    if (result.status !== "moved") throw new Error(result.message || "移动项目失败");
-    await setProjectlessThreadIds(ref, "remove");
-    await clearThreadWorkspaceHints(ref);
-    return result;
   }
 
   function showToast(message, undoToken) {
@@ -6002,6 +6747,10 @@
       undo.addEventListener("click", async () => {
         const result = await postJson("/undo", { undo_token: undoToken });
         toast.textContent = result.message || "撤销完成";
+        if (result.status === "undone") {
+          const refreshed = await refreshRecentConversationsForHost();
+          if (!refreshed) window.location.reload();
+        }
         setTimeout(() => toast.remove(), 5000);
       });
       toast.appendChild(undo);
@@ -6139,25 +6888,6 @@
     return sidebarProjectRows().filter((row) => visibleElement(row));
   }
 
-  function currentProjectRepoPathFromStartButton() {
-    const startButtons = [...document.querySelectorAll('button[aria-label^="Start new chat in "]')]
-      .filter((button) => visibleElement(button));
-    const bottomHalf = window.innerHeight * 0.5;
-    startButtons.sort((left, right) => {
-      const leftRect = left.getBoundingClientRect();
-      const rightRect = right.getBoundingClientRect();
-      const leftScore = Math.abs(leftRect.y - bottomHalf) + Math.max(0, bottomHalf - leftRect.y) * 0.5;
-      const rightScore = Math.abs(rightRect.y - bottomHalf) + Math.max(0, bottomHalf - rightRect.y) * 0.5;
-      return leftScore - rightScore;
-    });
-    for (const button of startButtons) {
-      const row = button.closest('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]');
-      const path = projectRowPath(row);
-      if (path?.startsWith?.("/")) return path;
-    }
-    return "";
-  }
-
   function currentProjectContextFromStartButton() {
     const startButtons = [...document.querySelectorAll('button[aria-label^="Start new chat in "]')]
       .filter((button) => visibleElement(button));
@@ -6210,10 +6940,6 @@
     return context.projectId ? { ...remoteProjectContextFromGlobalState(context.projectId), label: context.label } : context;
   }
 
-  function repoPathFromProjectLabel(label) {
-    return projectContextFromProjectLabel(label)?.repoPath || "";
-  }
-
   function contextMatchesProjectLabel(context, label) {
     const expected = normalizeProjectLabel(label);
     if (!expected) return true;
@@ -6244,21 +6970,11 @@
       || currentProjectContext();
   }
 
-  function currentProjectRepoPathForBranchMenu(menu, trigger = branchMenuTriggerFromMenu(menu)) {
-    return currentProjectContextForBranchMenu(menu, trigger)?.repoPath || "";
-  }
-
   function currentProjectRepoPathFromExpandedRows() {
     const expandedRows = visibleProjectRows().filter((row) => row.getAttribute("data-app-action-sidebar-project-collapsed") === "false");
     const pathRows = expandedRows.filter((row) => projectRowPath(row).startsWith("/"));
     if (pathRows.length === 1) return projectRowPath(pathRows[0]);
     return "";
-  }
-
-  function currentProjectRepoPath() {
-    return currentProjectRepoPathFromSelectedProjectButton()
-      || currentProjectRepoPathFromStartButton()
-      || currentProjectRepoPathFromExpandedRows();
   }
 
   function currentProjectContext() {
@@ -6509,7 +7225,7 @@
       const trigger = document.getElementById(labelledBy);
       if (trigger instanceof Element) return trigger;
     }
-    return [...document.querySelectorAll('button')]
+    return [...document.querySelectorAll('.composer-footer button, .composer-footer [role="button"]')]
       .filter((button) => (button.innerText || button.textContent || "").trim() === "main")
       .sort((left, right) => right.getBoundingClientRect().x - left.getBoundingClientRect().x)[0] || null;
   }
@@ -6661,13 +7377,23 @@
   }
 
   function installUpstreamBranchDropdownAdapter() {
-    const adapterVersion = "actual-upstream-refs-v16";
+    const adapterVersion = "actual-upstream-refs-v17";
     window.__codexUpstreamBranchDropdownAdapterVersion = adapterVersion;
     if (window.__codexUpstreamBranchDropdownAdapterInstalled === adapterVersion) return;
+    window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
     window.__codexUpstreamBranchDropdownAdapterInstalled = adapterVersion;
+    let upstreamBranchInjectTimer = null;
+    const schedule = () => {
+      clearTimeout(upstreamBranchInjectTimer);
+      upstreamBranchInjectTimer = setTimeout(() => {
+        injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
+      }, 80);
+    };
     document.addEventListener("click", (event) => {
       rememberStartNewChatProjectContext(event);
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const control = target?.closest?.('button, [role="button"]');
+      if (control && branchMenuTriggerIsBranchControl(control)) schedule();
       const option = target?.closest?.(`[${upstreamBranchOptionAttribute}]`);
       if (!option) {
         handleNativeBranchSelection(event);
@@ -6688,14 +7414,16 @@
       syncUpstreamBranchMenuSelection(option.closest?.('[role="menu"], [data-radix-menu-content], [cmdk-list]'));
       showToast(`将从 ${upstreamBranchOptionLabel(option) || "upstream/main"} 创建新 worktree`, null);
     }, true);
-    let upstreamBranchInjectTimer = null;
-    const schedule = () => {
-      clearTimeout(upstreamBranchInjectTimer);
-      upstreamBranchInjectTimer = setTimeout(() => {
-        injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
-      }, 80);
+    const branchMenuSelector = '[role="menu"], [data-radix-menu-content], [cmdk-list]';
+    const addedNodeContainsBranchMenu = (node) => {
+      if (!(node instanceof Element)) return false;
+      return node.matches(branchMenuSelector) || !!node.querySelector(branchMenuSelector);
     };
-    new MutationObserver(schedule).observe(document.body || document.documentElement, { childList: true, subtree: true });
+    const observer = new MutationObserver((records) => {
+      if (records.some((record) => [...record.addedNodes].some(addedNodeContainsBranchMenu))) schedule();
+    });
+    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    window.__codexUpstreamBranchDropdownObserver = observer;
     schedule();
   }
 
@@ -6743,64 +7471,6 @@
       && (left.projectId || "") === (right.projectId || "")
       && (left.remote || "upstream") === (right.remote || "upstream")
       && (left.baseBranch || "main") === (right.baseBranch || "main");
-  }
-
-  function pendingWorktreeRequestMatchesSelection(request, selection) {
-    if (!selection || !request || request.launchMode !== "start-conversation") return false;
-    const sourceRoot = request.sourceWorkspaceRoot || "";
-    if (selection.repoPath && sourceRoot) return sameWorkspacePath(sourceRoot, selection.repoPath);
-    if (selection.projectId) return true;
-    return !selection.repoPath || sameWorkspacePath(sourceRoot, selection.repoPath);
-  }
-
-  function applyUpstreamPendingWorktreeOverride(payload) {
-    const selection = readUpstreamBranchSelection();
-    const request = payload?.request;
-    const sourceRef = upstreamQualifiedSourceRef(selection);
-    if (!codexPlusSettings().upstreamWorktreeCreate || !sourceRef) return payload;
-    if (!pendingWorktreeRequestMatchesSelection(request, selection)) return payload;
-    if (request?.startingState?.type !== "branch") return payload;
-    if (request.startingState.branchName === sourceRef) return payload;
-    const nextRequest = {
-      ...request,
-      startingState: { ...request.startingState, branchName: sourceRef },
-    };
-    prepareUpstreamBranchSelection(selection);
-    sendCodexPlusDiagnostic("upstream_pending_worktree_override_applied", {
-      label: selection.label || "",
-      sourceRef,
-      sourceWorkspaceRoot: request.sourceWorkspaceRoot || "",
-    });
-    return { ...(payload || {}), request: nextRequest };
-  }
-
-  function installUpstreamPendingWorktreeDispatcherPatch() {
-    const patchVersion = "1";
-    if (window.__codexUpstreamPendingWorktreeDispatcherPatch === patchVersion) return;
-    const patch = async () => {
-      try {
-        const module = await loadCodexAppModule("setting-storage-");
-        const dispatcherClass = typeof module.v === "function" && String(module.v).includes("dispatchMessage") ? module.v : null;
-        const dispatcher = dispatcherClass?.getInstance?.();
-        if (!dispatcher || typeof dispatcher.dispatchMessage !== "function") throw new Error("Codex dispatcher unavailable");
-        if (!dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage) {
-          dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
-          dispatcher.dispatchMessage = (type, payload) => {
-            const nextPayload = type === "pending-worktree-create"
-              ? applyUpstreamPendingWorktreeOverride(payload)
-              : payload;
-            return dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage(type, nextPayload);
-          };
-        }
-        window.__codexUpstreamPendingWorktreeDispatcherPatch = patchVersion;
-      } catch (error) {
-        sendCodexPlusDiagnostic("upstream_pending_worktree_patch_failed", {
-          errorName: error?.name || "",
-          errorMessage: error?.message || String(error),
-        });
-      }
-    };
-    void patch();
   }
 
   function upstreamWorktreeNativePayloadFromElement(element) {
@@ -6875,7 +7545,6 @@
 
   function installUpstreamWorktreeNativeAdapter() {
     const adapterVersion = "2";
-    installUpstreamPendingWorktreeDispatcherPatch();
     if (window.__codexUpstreamWorktreeNativeAdapterInstalled === adapterVersion) return;
     window.__codexUpstreamWorktreeNativeAdapterInstalled = adapterVersion;
     document.addEventListener("click", (event) => {
@@ -7051,7 +7720,7 @@
     const shouldReload = isCurrentSessionRow(row, ref);
     row.remove();
     if (shouldReload) {
-      window.location.reload();
+      setTimeout(() => window.location.reload(), 10000);
     }
   }
 
@@ -7100,116 +7769,26 @@
     showToast(result.message || "导出失败", null);
   }
 
-  function sortStateFromMoveResult(result, ref, row) {
-    const trustedSortMs = timestampMsFromPayload(result);
-    return { sortMs: trustedSortMs || rowSortMs(row, ref), sortMsTrusted: !!trustedSortMs };
-  }
-
-  function finishProjectMove(row, button, ref, target, message) {
-    releaseDeleteFocus(row, button);
-    button.disabled = false;
-    button.textContent = "移动";
-    saveProjectMoveProjection(ref, target, target.sortMs || rowSortMs(row, ref, target));
-    if (target.kind === "projectless") moveRowToChats(row, target);
-    refreshAfterProjectMove();
-    showToast(message, null);
-  }
-
-  async function applyProjectMove(row, button, ref, target) {
-    button.disabled = true;
-    button.textContent = "移动中";
-    try {
-      if (target.kind === "projectless") {
-        const result = await moveSessionToProjectless(ref);
-        finishProjectMove(row, button, ref, { ...target, ...sortStateFromMoveResult(result, ref, row) }, `已移动到普通对话：“${ref.title || ref.session_id}”`);
-      } else {
-        const result = await moveSessionToProject(ref, target);
-        finishProjectMove(row, button, ref, { ...target, ...sortStateFromMoveResult(result, ref, row) }, `已移动到“${target.label}”：“${ref.title || ref.session_id}”`);
-      }
-    } catch (error) {
-      button.disabled = false;
-      button.textContent = "移动";
-      showToast(`移动失败：${error?.message || error}`, null);
-    }
-  }
-
-  async function openProjectMoveMenuForRow(row, button, ref, event) {
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-    releaseDeleteFocus(row, button);
-    document.querySelectorAll(`.${projectMoveOverlayClass}`).forEach((node) => node.remove());
-    const overlay = document.createElement("div");
-    overlay.className = projectMoveOverlayClass;
-    overlay.innerHTML = `
-      <div class="codex-project-move-panel" role="dialog" aria-modal="true" aria-label="移动对话">
-        <div class="codex-project-move-header">
-          <div class="codex-project-move-title">移动“${escapeHtml(ref.title || ref.session_id)}”</div>
-        </div>
-        <div class="codex-project-move-list"><div class="codex-project-move-empty">加载项目中...</div></div>
-      </div>
-    `;
-    const panel = overlay.querySelector(".codex-project-move-panel");
-    const rect = button.getBoundingClientRect();
-    const panelWidth = Math.min(360, Math.max(240, window.innerWidth - 32));
-    panel.style.left = `${Math.max(16, Math.min(window.innerWidth - panelWidth - 16, rect.right - panelWidth))}px`;
-    panel.style.top = `${Math.max(16, Math.min(window.innerHeight - 120, rect.bottom + 6))}px`;
-    const close = () => overlay.remove();
-    overlay.addEventListener("click", (clickEvent) => {
-      if (clickEvent.target === overlay) close();
-    }, true);
-    overlay.addEventListener("keydown", (keyEvent) => {
-      if (keyEvent.key === "Escape") {
-        keyEvent.preventDefault();
-        close();
-      }
-    }, true);
-    document.body.appendChild(overlay);
-    try {
-      const targets = projectMoveTargets();
-      const list = overlay.querySelector(".codex-project-move-list");
-      if (!list) return;
-      list.innerHTML = "";
-      if (targets.length === 0) {
-        list.innerHTML = `<div class="codex-project-move-empty">没有可用目标</div>`;
-        return;
-      }
-      for (const target of targets) {
-        const item = document.createElement("button");
-        item.type = "button";
-        item.className = "codex-project-move-item";
-        item.innerHTML = `
-          <div class="codex-project-move-item-title">${escapeHtml(target.label)}</div>
-          <div class="codex-project-move-item-path">${escapeHtml(target.description)}</div>
-        `;
-        item.addEventListener("click", async (selectEvent) => {
-          selectEvent.preventDefault();
-          selectEvent.stopPropagation();
-          close();
-          await applyProjectMove(row, button, ref, target);
-        }, true);
-        list.appendChild(item);
-      }
-      list.querySelector("button")?.focus();
-    } catch (error) {
-      close();
-      showToast(`加载项目失败：${error?.message || error}`, null);
-    }
-  }
-
   function installDeleteButtonEventDelegation() {
-    document.removeEventListener("pointerup", window.__codexSessionDeleteDocumentDeleteHandler, true);
     document.removeEventListener("click", window.__codexSessionDeleteDocumentDeleteHandler, true);
     const handler = (event) => {
       const button = event.target?.closest?.(`.${buttonClass}`);
       const row = button?.closest?.("[data-app-action-sidebar-thread-id]");
       if (!button || !row) return;
       const ref = sessionRefFromRow(row);
-      if (!ref.session_id) return;
+      if (!ref.session_id) {
+        const placeholderId = row.getAttribute("data-app-action-sidebar-thread-id");
+        if (isClientNewThreadId(placeholderId)) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation?.();
+          showToast("会话仍在同步，请稍后重试", null);
+        }
+        return;
+      }
       openDeleteConfirmForRow(row, button, ref, event);
     };
     window.__codexSessionDeleteDocumentDeleteHandler = handler;
-    document.addEventListener("pointerup", handler, true);
     document.addEventListener("click", handler, true);
   }
 
@@ -7289,7 +7868,6 @@
     button.addEventListener("pointerleave", hideActionButtonTooltip);
     button.addEventListener("focus", () => showActionButtonTooltip(button));
     button.addEventListener("blur", hideActionButtonTooltip);
-    button.addEventListener("pointerup", onActivate, true);
     button.addEventListener("click", (event) => {
       hideActionButtonTooltip();
       onActivate(event);
@@ -7435,40 +8013,35 @@
 
   function attachButton(row) {
     const settings = codexPlusSettings();
-    if (!settings.sessionDelete && !settings.markdownExport && !settings.projectMove) {
+    if (!settings.sessionDelete && !settings.markdownExport) {
       removeActionGroups(row);
       row.dataset.codexDeleteRow = "false";
-      row.dataset.codexProjectMoveRow = "false";
       return;
     }
     const existingGroup = actionGroupFromRow(row);
     const existingDeleteButton = existingGroup?.querySelector(`.${buttonClass}`);
     const existingMoreButton = existingGroup?.querySelector(`.${moreButtonClass}`);
     const existingExportButton = existingGroup?.querySelector(`.${exportButtonClass}`);
-    const existingMoveButton = existingGroup?.querySelector(`.${projectMoveButtonClass}`);
-    const needsMoreMenu = settings.markdownExport || settings.projectMove;
+    const needsMoreMenu = settings.markdownExport;
     const hasUnexpectedDelete = !settings.sessionDelete && !!existingDeleteButton;
     const hasUnexpectedMore = !needsMoreMenu && !!existingMoreButton;
     const hasUnexpectedExport = !!existingExportButton;
-    const hasUnexpectedMove = !!existingMoveButton;
     const missingDelete = settings.sessionDelete && !existingDeleteButton;
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !hasUnexpectedMove && !missingDelete && !missingMore) {
+    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
     removeActionGroups(row);
     row.dataset.codexDeleteRow = "false";
-    row.dataset.codexProjectMoveRow = "false";
     const ref = sessionRefFromRow(row);
     if (!ref.session_id) return;
     row.dataset.codexDeleteRow = "true";
-    row.dataset.codexProjectMoveRow = String(!!settings.projectMove);
     const group = document.createElement("div");
     group.className = actionGroupClass;
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
-    if (settings.markdownExport || settings.projectMove) {
+    if (settings.markdownExport) {
       const moreButton = document.createElement("button");
       moreButton.type = "button";
       moreButton.className = `${actionButtonClass} ${moreButtonClass}`;
@@ -7484,13 +8057,6 @@
           stopActionButtonEvent(row, moreButton, event);
           closeSessionMoreMenus();
           exportMarkdown(ref);
-        }));
-      }
-      if (settings.projectMove) {
-        moreMenu.appendChild(createSessionMoreMenuItem("移动", "↗", (event) => {
-          stopActionButtonEvent(row, moreButton, event);
-          closeSessionMoreMenus();
-          openProjectMoveMenuForRow(row, moreButton, ref, event);
         }));
       }
       const openMoreMenu = (event) => {
@@ -7515,7 +8081,7 @@
       deleteButton.className = `${actionButtonClass} ${buttonClass}`;
       deleteButton.dataset.codexDeleteVersion = codexDeleteVersion;
       configureSvgActionButton(deleteButton, "删除", trashIconSvg());
-      const openDeleteConfirm = (event) => openDeleteConfirmForRow(row, deleteButton, ref, event);
+      const openDeleteConfirm = (event) => openDeleteConfirmForRow(row, deleteButton, sessionRefFromRow(row), event);
       installActionButtonEvents(row, deleteButton, openDeleteConfirm);
       group.appendChild(deleteButton);
       setTimeout(() => refreshActionButton(deleteButton, row, openDeleteConfirm), 0);
@@ -7582,18 +8148,6 @@
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation?.();
-  }
-
-  function isArchiveTitleText(value) {
-    return value === "已归档对话" || value === "Archived conversations";
-  }
-
-  function archiveTitleContainer() {
-    const heading = Array.from(document.querySelectorAll("h1, h2, h3"))
-      .find((element) => isArchiveTitleText((element.textContent || "").trim()));
-    if (heading) return heading;
-    return Array.from(document.querySelectorAll("h1, h2, h3, div, span"))
-      .find((element) => isArchiveTitleText((element.textContent || "").trim()) && element.getBoundingClientRect().x > 350);
   }
 
   function attachArchivedPageDeleteButton(row) {
@@ -8104,7 +8658,15 @@
 
   function scanLightweight() {
     installStyle();
+    refreshOfficialUsageAlertVisibility();
     installCodexServiceTierDispatcherPatch();
+    installCodexRemoteSessionRecoveryListener();
+    if (window.__codexPlusRemoteSessionRecoveryDispatcher) {
+      installCodexRemoteSessionDispatcherSubscription(
+        window.__codexPlusRemoteSessionRecoveryDispatcher,
+        "existing-renderer"
+      );
+    }
     installCodexPlusMenu();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
@@ -8239,6 +8801,40 @@
     pill.style.transform = "translateY(0)";
   }
 
+  function officialUsageAlertHidden() {
+    return window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true;
+  }
+
+  function officialUsageAlertCards(scope = document) {
+    const root = scope?.querySelectorAll ? scope : document;
+    return Array.from(root.querySelectorAll('aside.app-shell-left-panel [role="status"][aria-live="polite"]')).filter((card) => {
+      if (!(card instanceof HTMLElement)) return false;
+      const progress = card.querySelector('progress[max="100"]');
+      if (!progress) return false;
+      const dismissButton = Array.from(card.querySelectorAll("button")).find((button) =>
+        /dismiss usage alert|关闭使用量提醒/i.test(button.getAttribute("aria-label") || ""),
+      );
+      return !!dismissButton;
+    });
+  }
+
+  function officialUsageAlertContainer(card) {
+    const parent = card.parentElement;
+    return parent?.children.length === 1 && parent.matches("div.w-full") ? parent : card;
+  }
+
+  function refreshOfficialUsageAlertVisibility() {
+    const hidden = officialUsageAlertHidden();
+    document.querySelectorAll('[data-codex-plus-usage-alert-hidden="true"]').forEach((container) => {
+      delete container.dataset.codexPlusUsageAlertHidden;
+    });
+    if (!hidden) return;
+    officialUsageAlertCards().forEach((card) => {
+      const container = officialUsageAlertContainer(card);
+      container.dataset.codexPlusUsageAlertHidden = "true";
+    });
+  }
+
   let zedRemoteStatusPromise = null;
   const zedRemoteMissingHostMessage = "Cannot determine remote SSH host for this file";
 
@@ -8325,10 +8921,6 @@
     if (remoteWorkspaceRoot) payload.remoteWorkspaceRoot = remoteWorkspaceRoot;
     if (remoteProjectId) payload.remoteProjectId = remoteProjectId;
     return payload;
-  }
-
-  function zedRemoteCurrentThreadId() {
-    return zedRemoteCurrentFallbackPayload().threadId || "";
   }
 
   async function resolveZedRemoteFallbackRequest() {
@@ -8655,31 +9247,6 @@
     }
   }
 
-  async function openBestZedRemoteTarget() {
-    const request = zedRemoteBestOpenRequest(document) || await resolveZedRemoteFallbackRequest();
-    if (!request) {
-      showZedRemoteToast("Cannot find a remote workspace or file for Zed");
-      return;
-    }
-    openZedRemote(request);
-  }
-
-  function attachZedRemoteButton(candidate) {
-    const anchor = candidate.node;
-    if (anchor.dataset.codexZedRemoteVersion === zedRemoteOpenVersion) return;
-    anchor.dataset.codexZedRemoteVersion = zedRemoteOpenVersion;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = zedRemoteButtonClass;
-    button.textContent = "Open in Zed Remote";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openZedRemote(candidate.request);
-    }, true);
-    anchor.insertAdjacentElement("afterend", button);
-  }
-
   function removeZedRemoteButtons() {
     document.querySelectorAll(`[data-codex-zed-remote-version]`).forEach((node) => {
       delete node.dataset.codexZedRemoteVersion;
@@ -8848,17 +9415,15 @@
         }
       }
     }
+    refreshDreamSkin();
     refreshThreadIdBadges();
     sessionRows().forEach(tryAttachButton);
     updateDeleteButtonOffsets();
-    scheduleProjectMoveProjection();
-    scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     installCodexServiceTierBadge();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
-    schedulePluginAutoExpand();
   }
 
   function runScanStep(step) {
@@ -8876,15 +9441,15 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexServiceTierBadgeClass}, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
   }
 
   function scanRelevantSelector() {
     return [
       selectors.sidebarThread,
+      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
       '[data-app-action-sidebar-section-heading="Chats"]',
       '[data-app-action-sidebar-section-heading="Projects"]',
-      '[data-codex-project-move-row="true"]',
       '[data-codex-archive-page-row="true"]',
       "[data-codex-archive-delete-all]",
       '[data-message-author-role]',
@@ -8951,14 +9516,9 @@
   }
 
   void loadBackendSettingsForStartup();
-  void loadCodexServiceTierState();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
-  window.__codexProjectMoveApplyProjection = applyProjectMoveProjection;
-  window.__codexProjectMoveReadProjection = readProjectMoveProjection;
-  window.__codexProjectMoveTargets = projectMoveTargets;
-  window.__codexProjectMoveSortChats = applyChatsSortCorrection;
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
@@ -8976,7 +9536,15 @@
   window.addEventListener("resize", window.__codexPlusResizeHandler);
   window.__codexSessionDeleteObserver?.disconnect();
   window.__codexSessionDeleteObserver = new MutationObserver(scheduleScan);
-  window.__codexSessionDeleteObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  window.__codexSessionDeleteObserver.observe(document.body || document.documentElement, {
+    childList: true,
+    subtree: true,
+    // Codex may promote a newly-created row from a temporary client ID to its
+    // persisted UUID without replacing the DOM node. Re-scan those rows so the
+    // action button and its delete reference are rebuilt from the canonical ID.
+    attributes: true,
+    attributeFilter: ["data-app-action-sidebar-thread-id", "href"],
+  });
 })();
 
 // === 粘贴修复 (CodexPlusPlus 页面增强) ===

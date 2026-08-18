@@ -1,18 +1,21 @@
 use codex_plus_core::protocol_proxy::{
     AnthropicToOpenAiSseTranslator, ChatSseToResponsesConverter, anthropic_to_openai_response,
-    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
-    chat_completions_url_for_relay, chat_sse_to_responses_sse,
-    chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path, is_joycode_model,
-    is_joycode_responses_model, is_models_proxy_path, is_responses_proxy_path, models_url,
+    audio_transcriptions_url, chat_completion_to_response,
+    chat_completion_to_response_with_request, chat_completions_url, chat_completions_url_for_relay,
+    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_joycode_model,
+    is_joycode_responses_model, is_models_proxy_path, is_responses_compact_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
     open_chat_completions_proxy_request, open_models_proxy_request, open_responses_proxy_request,
-    open_responses_proxy_request_with_settings, openai_to_anthropic_request,
-    register_joycode_model_metadata, responses_error_from_upstream, responses_to_chat_completions,
-    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
-    upstream_stream_header_timeout,
+    open_responses_proxy_request_with_settings,
+    open_responses_proxy_request_with_settings_for_path, openai_to_anthropic_request,
+    register_joycode_model_metadata, responses_compact_url, responses_error_from_upstream,
+    responses_to_chat_completions, send_upstream_request_with_header_timeout,
+    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayProfile, RelayProtocol,
+    RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -122,6 +125,8 @@ fn proxy_route_matchers_accept_ccswitch_codex_aliases() {
     ] {
         assert!(is_responses_proxy_path(path), "{path}");
     }
+    assert!(is_responses_compact_proxy_path("/v1/responses/compact"));
+    assert!(!is_responses_compact_proxy_path("/v1/responses"));
 
     for path in [
         "/chat/completions",
@@ -135,6 +140,83 @@ fn proxy_route_matchers_accept_ccswitch_codex_aliases() {
     for path in ["/models", "/v1/models", "/v1/v1/models", "/codex/v1/models"] {
         assert!(is_models_proxy_path(path), "{path}");
     }
+
+    for path in [
+        "/audio/transcriptions",
+        "/v1/audio/transcriptions",
+        "/v1/v1/audio/transcriptions",
+        "/codex/v1/audio/transcriptions",
+    ] {
+        assert!(is_audio_transcriptions_proxy_path(path), "{path}");
+    }
+}
+
+#[test]
+fn responses_compact_url_preserves_compact_endpoint() {
+    assert_eq!(
+        responses_compact_url("https://api.example.test/v1"),
+        "https://api.example.test/v1/responses/compact"
+    );
+    assert_eq!(
+        responses_compact_url("https://api.example.test/v1/responses"),
+        "https://api.example.test/v1/responses/compact"
+    );
+    assert_eq!(
+        responses_compact_url("https://api.example.test/v1/responses/compact"),
+        "https://api.example.test/v1/responses/compact"
+    );
+}
+
+#[tokio::test]
+async fn responses_compact_request_keeps_compact_path_upstream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 4096];
+        let read = stream.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+            )
+            .await
+            .unwrap();
+        request
+    });
+    let settings = BackendSettings {
+        active_relay_id: "compact".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "compact".to_string(),
+            name: "compact".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "sk-compact".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+
+    let result = open_responses_proxy_request_with_settings_for_path(
+        r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
+        settings,
+        "/v1/responses/compact",
+    )
+    .await
+    .unwrap();
+    let request = server.await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(request.starts_with("POST /v1/responses/compact HTTP/1.1"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sk-compact")
+    );
 }
 
 #[test]
@@ -207,6 +289,44 @@ fn responses_request_maps_developer_role_to_system_for_chat_upstream() {
         !serde_json::to_string(&converted)
             .unwrap()
             .contains("\"developer\"")
+    );
+}
+
+#[test]
+fn responses_request_skips_additional_tools_without_content() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-chat",
+        "instructions": "You are helpful.",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    { "type": "custom", "name": "exec", "description": "Run a command" }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hello" }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        converted["messages"],
+        json!([
+            { "role": "system", "content": "You are helpful." },
+            { "role": "user", "content": "hello" }
+        ])
+    );
+    assert!(
+        converted["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| !message["content"].is_null())
     );
 }
 
@@ -1270,6 +1390,30 @@ fn chat_completions_url_normalizes_common_base_urls() {
 }
 
 #[test]
+fn audio_transcriptions_url_normalizes_common_base_urls() {
+    assert_eq!(
+        audio_transcriptions_url("https://api.example.test"),
+        "https://api.example.test/v1/audio/transcriptions"
+    );
+    assert_eq!(
+        audio_transcriptions_url("https://api.example.test/v1"),
+        "https://api.example.test/v1/audio/transcriptions"
+    );
+    assert_eq!(
+        audio_transcriptions_url("https://api.example.test/openai"),
+        "https://api.example.test/openai/audio/transcriptions"
+    );
+    assert_eq!(
+        audio_transcriptions_url("https://api.example.test/v1/audio/transcriptions"),
+        "https://api.example.test/v1/audio/transcriptions"
+    );
+    assert_eq!(
+        audio_transcriptions_url("https://api.example.test/openai#"),
+        "https://api.example.test/openai/audio/transcriptions"
+    );
+}
+
+#[test]
 fn models_url_normalizes_common_base_urls() {
     assert_eq!(
         models_url("https://api.example.test"),
@@ -1383,6 +1527,167 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 }
 
 #[tokio::test]
+async fn model_route_uses_target_responses_provider_without_mutating_request() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "instructions": "Use the available tools when needed.",
+        "input": [{ "role": "user", "content": "inspect the workspace" }],
+        "stream": false,
+        "reasoning": { "effort": "high", "summary": "auto" },
+        "service_tier": "priority",
+        "truncation": "disabled",
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [{
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        }],
+        "metadata": { "route_test": true }
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (headers, upstream_body) = target_server.await.unwrap();
+
+    assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sk-target")
+    );
+    assert_eq!(upstream_body, request);
+}
+
+#[tokio::test]
+async fn model_route_can_rewrite_only_the_target_model_name() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": "hello",
+        "stream": false,
+        "tools": [{ "type": "function", "name": "lookup", "parameters": { "type": "object" } }],
+        "truncation": "disabled"
+    });
+    let settings = model_route_settings(
+        "gpt-5.6-luna",
+        "provider-luna-v2",
+        format!("http://{target_addr}/v1"),
+    );
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    let mut expected = request;
+    expected["model"] = json!("provider-luna-v2");
+    assert_eq!(upstream_body, expected);
+}
+
+#[tokio::test]
+async fn model_route_preserves_responses_compact_endpoint() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [{ "role": "user", "content": "compact this conversation" }],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings_for_path(
+        &request.to_string(),
+        settings,
+        "/v1/responses/compact",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (headers, upstream_body) = target_server.await.unwrap();
+
+    assert!(headers.starts_with("POST /v1/responses/compact HTTP/1.1"));
+    assert_eq!(upstream_body, request);
+}
+
+#[tokio::test]
+async fn model_route_uses_exact_match_and_keeps_other_models_on_source_provider() {
+    let source = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let source_addr = source.local_addr().unwrap();
+    let source_server = tokio::spawn(capture_json_request_once(source));
+    let request = json!({
+        "model": "gpt-5.6-luna-preview",
+        "input": "hello",
+        "stream": false,
+        "tools": [{ "type": "function", "name": "lookup", "parameters": { "type": "object" } }]
+    });
+    let mut settings =
+        model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
+    settings.relay_profiles[0].base_url = format!("http://{source_addr}/v1");
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (headers, upstream_body) = source_server.await.unwrap();
+
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sk-source")
+    );
+    assert_eq!(upstream_body, request);
+}
+
+#[tokio::test]
+async fn model_route_rejects_missing_or_non_responses_targets() {
+    let mut missing = model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
+    missing.relay_profiles.pop();
+    let error = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+        missing,
+    )
+    .await
+    .err()
+    .expect("missing target should fail");
+    assert!(error.to_string().contains("模型路由目标供应商不存在"));
+
+    let mut chat = model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
+    chat.relay_profiles[1].protocol = RelayProtocol::ChatCompletions;
+    let error = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+        chat,
+    )
+    .await
+    .err()
+    .expect("chat target should fail");
+    assert!(error.to_string().contains("必须使用 Responses API"));
+}
+
+#[tokio::test]
 async fn aggregate_stream_request_sends_sse_accept_header() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1441,6 +1746,82 @@ async fn respond_once(listener: tokio::net::TcpListener, response: &'static str)
     stream.write_all(response.as_bytes()).await.unwrap();
 }
 
+async fn capture_json_request_once(
+    listener: tokio::net::TcpListener,
+) -> (String, serde_json::Value) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        break (header_end + 4, content_length);
+    };
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before body completed");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let headers = String::from_utf8_lossy(&buffer[..header_end - 4]).to_string();
+    let body = serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap();
+    let response_body = r#"{"id":"resp_model_route","object":"response"}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    (headers, body)
+}
+
+fn model_route_settings(
+    source_model: &str,
+    target_model: &str,
+    target_base_url: String,
+) -> BackendSettings {
+    BackendSettings {
+        active_relay_id: "source".to_string(),
+        relay_profiles: vec![
+            RelayProfile {
+                id: "source".to_string(),
+                name: "source".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                api_key: "sk-source".to_string(),
+                model_routes: vec![RelayModelRoute {
+                    model: source_model.to_string(),
+                    target_relay_id: "target".to_string(),
+                    target_model: target_model.to_string(),
+                }],
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: "target".to_string(),
+                name: "target".to_string(),
+                base_url: target_base_url,
+                api_key: "sk-target".to_string(),
+                protocol: RelayProtocol::Responses,
+                ..RelayProfile::default()
+            },
+        ],
+        ..BackendSettings::default()
+    }
+}
+
 fn aggregate_proxy_settings(
     id_suffix: &str,
     first_base_url: String,
@@ -1492,6 +1873,77 @@ fn aggregate_proxy_settings(
         ..BackendSettings::default()
     }
 }
+#[tokio::test]
+async fn audio_transcriptions_proxy_forwards_multipart_body() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let request = String::from_utf8_lossy(&buffer);
+            let Some((headers, body)) = request.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if body.as_bytes().len() >= content_length {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&buffer).to_string();
+        let body = r#"{"text":"ok"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        request
+    });
+    write_chat_relay_settings(temp.path(), &format!("http://{addr}/v1"), "");
+    let boundary = "codex-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nabc\r\n--{boundary}--\r\n"
+    );
+
+    let upstream = open_audio_transcriptions_proxy_request(
+        body.as_bytes(),
+        &format!("multipart/form-data; boundary={boundary}"),
+        Some("Original-Codex-UA/1.0"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    let request = server.await.unwrap();
+    assert!(request.starts_with("POST /v1/audio/transcriptions HTTP/1.1"));
+    assert!(
+        request.contains("content-type: multipart/form-data; boundary=codex-boundary")
+            || request.contains("Content-Type: multipart/form-data; boundary=codex-boundary")
+    );
+    assert!(request.contains("gpt-4o-mini-transcribe"));
+    assert!(request.contains("abc"));
+}
+
 #[tokio::test]
 async fn chat_completions_proxy_uses_configured_user_agent() {
     let _lock = settings_path_test_lock().lock().unwrap();
